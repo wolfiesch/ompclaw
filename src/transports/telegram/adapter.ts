@@ -229,7 +229,7 @@ function callbackData(id: string, action: string): string {
 export class TelegramTransportAdapter implements TransportAdapter {
   readonly id: string;
   readonly capabilities: TransportCapabilities = {
-    streamingUpdates: false,
+    streamingUpdates: true,
     buttons: true,
     multiSelect: true,
     textInput: true,
