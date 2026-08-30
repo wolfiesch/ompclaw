@@ -21,6 +21,7 @@ import {
   startLockHeartbeat,
   tg,
   webhookConflictHint,
+  withRateLimit,
 } from "./api";
 
 const originalFetch = globalThis.fetch;
@@ -63,6 +64,29 @@ describe("Telegram Bot API transport", () => {
       expect((error as TgError).retryAfter).toBe(3);
       expect((error as TgError).message).toBe("Too Many Requests");
     }
+  });
+
+  test("aborts a rate-limit wait before retrying", async () => {
+    const controller = new AbortController();
+    const sleeping = Promise.withResolvers<void>();
+    let attempts = 0;
+    const operation = withRateLimit(
+      async () => {
+        attempts++;
+        throw new TgError("rate limited", 429, 30);
+      },
+      {
+        signal: controller.signal,
+        sleep: () => {
+          sleeping.resolve();
+          return new Promise<void>(() => {});
+        },
+      },
+    );
+    await sleeping.promise;
+    controller.abort(new Error("cancelled"));
+    await expect(operation).rejects.toThrow("cancelled");
+    expect(attempts).toBe(1);
   });
 
   test("downloads exact file bytes and rejects HTTP failures", async () => {

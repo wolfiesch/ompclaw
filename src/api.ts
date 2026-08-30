@@ -63,17 +63,26 @@ const MAX_RETRY_WAIT_MS = 30_000;
  */
 export async function withRateLimit<T>(
   op: () => Promise<T>,
-  options: { sleep?: (ms: number) => Promise<void>; log?: Logger } = {},
+  options: { sleep?: (ms: number) => Promise<void>; log?: Logger; signal?: AbortSignal } = {},
 ): Promise<T> {
   const pause = options.sleep ?? sleep;
   for (let attempt = 0; ; attempt++) {
+    options.signal?.throwIfAborted();
     try {
       return await op();
     } catch (err) {
+      options.signal?.throwIfAborted();
       const retryAfter = err instanceof TgError && (err.retryAfter != null || err.code === 429) ? (err.retryAfter ?? 1) : undefined;
       if (retryAfter == null || attempt >= RATE_LIMIT_RETRIES) throw err;
       options.log?.debug(`[telegram] rate limited — retrying in ${retryAfter}s`);
-      await pause(Math.min(retryAfter * 1000 + 250, MAX_RETRY_WAIT_MS));
+      const wait = pause(Math.min(retryAfter * 1000 + 250, MAX_RETRY_WAIT_MS));
+      if (!options.signal) await wait;
+      else {
+        await Promise.race([
+          wait,
+          new Promise<never>((_, reject) => options.signal!.addEventListener("abort", () => reject(options.signal!.reason), { once: true })),
+        ]);
+      }
     }
   }
 }
@@ -209,17 +218,22 @@ export async function tgUpload<T>(
   fields: Record<string, string | number | undefined>,
   file: { field: string; path: string; filename?: string },
   timeoutMs = 120_000,
+  callerSignal?: AbortSignal,
 ): Promise<T> {
+  callerSignal?.throwIfAborted();
   const form = new FormData();
   for (const [k, v] of Object.entries(fields)) {
     if (v !== undefined) form.append(k, String(v));
   }
   const bytes = await readFile(file.path);
+  callerSignal?.throwIfAborted();
   form.append(file.field, new Blob([bytes]), file.filename ?? basename(file.path));
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = callerSignal ? AbortSignal.any([timeout, callerSignal]) : timeout;
   const res = await fetch(`${API_BASE}${token}/${method}`, {
     method: "POST",
     body: form,
-    signal: AbortSignal.timeout(timeoutMs),
+    signal,
   });
   const data = (await res.json()) as TgResponse<T>;
   if (!data.ok) {

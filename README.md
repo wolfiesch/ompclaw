@@ -6,6 +6,19 @@ Each top-level omp session gets its own Telegram topic; task subagents stay in
 their parent session's topic. A separate **omp control** topic is where you run
 commands like `/spawn`, `/sessions`, `/cleanup`, and `/status`.
 
+## Choose a runtime
+
+`omp-telegram` has two supported runtime shapes:
+
+| Runtime | Best for |
+| --- | --- |
+| OMP extension | Mirroring terminal sessions, one Telegram topic per session, and herdr fleet control |
+| Standalone RPC service | One persistent, fully remote OMP session with approvals, input, commands, files, and exact-session resume |
+
+The extension setup follows below. For a Hermes-style personal agent that stays
+online without a terminal, jump to [Standalone OMP RPC service](#standalone-omp-rpc-service).
+
+
 ## What you need
 
 - [omp](https://github.com/can1357/oh-my-pi) 17.0.0 or newer
@@ -127,6 +140,67 @@ Inside an omp session topic:
 
 Replies stream back while omp is working (unless the host is configured as a
 headless daemon — see below).
+
+## Standalone OMP RPC service
+
+The standalone service owns one persistent OMP process through its versioned
+JSONL RPC interface. It streams assistant replies, presents OMP confirmations
+and questions as authenticated Telegram controls, resumes the exact session
+after a restart, exposes session/model/queue/subagent commands, and supervises
+the child process.
+
+Install the command:
+
+```bash
+bun add --global omp-telegram
+```
+
+Create a mode-`0600` environment file containing the bot token and your immutable
+numeric Telegram user ID:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123456:replace-me
+TELEGRAM_ALLOWED_USERS=123456789
+```
+
+Validate both Telegram and OMP RPC without invoking a model:
+
+```bash
+omp-telegram-rpc doctor \
+  --env-file ~/.config/omp-telegram/rpc.env \
+  --cwd ~/Projects \
+  --profile telegram \
+  --inherit-harness
+```
+
+Then install a launchd user agent on macOS or a systemd user service on Linux:
+
+```bash
+omp-telegram-rpc service-install \
+  --env-file ~/.config/omp-telegram/rpc.env \
+  --cwd ~/Projects \
+  --profile telegram \
+  --inherit-harness
+```
+
+`--inherit-harness` seeds the isolated profile with the default profile's
+skills, rules, agents, commands, documentation, helper binaries, configuration,
+and MCP definitions. It does not inherit hooks or extensions, and it never
+copies `.env`, credentials, runtime databases, sessions, or blobs. Omit it for a
+blank profile, then configure only the capabilities the remote session should
+have.
+
+If the copied OMP configuration uses an auth broker, add
+`--auth-broker-token-file ~/.omp/auth-broker.token`. The bridge reads that
+owner-only file directly into the OMP child environment without copying it into
+the Telegram profile or service definition.
+
+Use a separate Telegram bot token for every poller. Stop the extension daemon,
+Hermes gateway, or any other `getUpdates` consumer before starting the RPC
+service with the same token. Telegram permits only one long poller per bot.
+
+See [the standalone RPC guide](docs/rpc-service.md) for the complete command
+surface, security model, state layout, supervision details, and manual run mode.
 
 ## Away mode (answer local runs from your phone)
 

@@ -220,7 +220,11 @@ export class Outbound {
   // ---- model-tool helpers ------------------------------------------------
 
   /** Send text to a chat, chunked + MarkdownV2 (plain fallback on parse error). Returns message ids. */
-  async send(chatId: string, text: string, opts?: { replyTo?: number; format?: "text" | "markdown"; threadId?: number }): Promise<number[]> {
+  async send(
+    chatId: string,
+    text: string,
+    opts?: { replyTo?: number; format?: "text" | "markdown"; threadId?: number; signal?: AbortSignal },
+  ): Promise<number[]> {
     const access = this.#getAccess();
     const budget = messageLimit(access) - MARKDOWN_HEADROOM;
     const parts = chunkLabeled(text, budget, access.chunkMode ?? "newline");
@@ -231,28 +235,30 @@ export class Outbound {
     let threadId = opts?.threadId;
     let recovered = false;
     for (let i = 0; i < parts.length; i++) {
+      opts?.signal?.throwIfAborted();
       const replyTo = this.#threadTarget(opts?.replyTo, replyMode, i);
       try {
-        ids.push(await this.#sendOne(chatId, parts[i], useMd, replyTo, threadId));
+        ids.push(await this.#sendOne(chatId, parts[i], useMd, replyTo, threadId, opts?.signal));
       } catch (err) {
         if (recovered || threadId == null || !isMissingThreadError(err)) throw err;
         const replacement = await this.#recoverMissingThread(chatId, threadId);
         if (replacement == null) throw err;
         recovered = true;
         threadId = replacement;
-        ids.push(await this.#sendOne(chatId, parts[i], useMd, replyTo, threadId));
+        ids.push(await this.#sendOne(chatId, parts[i], useMd, replyTo, threadId, opts?.signal));
       }
     }
     return ids;
   }
 
   /** Attach files: images as photos, others as documents. Guards state-dir files and 50MB cap. */
-  async sendFiles(chatId: string, files: string[], replyTo?: number, threadId?: number): Promise<number[]> {
+  async sendFiles(chatId: string, files: string[], replyTo?: number, threadId?: number, signal?: AbortSignal): Promise<number[]> {
     const replyMode = this.#getAccess().replyToMode ?? "first";
     const ids: number[] = [];
     let targetThreadId = threadId;
     let recovered = false;
     for (let i = 0; i < files.length; i++) {
+      signal?.throwIfAborted();
       const file = files[i];
       assertSendable(file);
       const info = await stat(file);
@@ -271,7 +277,10 @@ export class Outbound {
             isPhoto ? "sendPhoto" : "sendDocument",
             fields,
             { field: isPhoto ? "photo" : "document", path: file },
+            120_000,
+            signal,
           ),
+          signal,
         );
       };
       try {
@@ -288,12 +297,18 @@ export class Outbound {
     return ids;
   }
 
-  async react(chatId: string, messageId: number, emoji: string): Promise<void> {
-    await tg(this.#token, "setMessageReaction", {
-      chat_id: chatId,
-      message_id: messageId,
-      reaction: [{ type: "emoji", emoji }],
-    });
+  async react(chatId: string, messageId: number, emoji: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await tg(
+      this.#token,
+      "setMessageReaction",
+      {
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: [{ type: "emoji", emoji }],
+      },
+      { signal },
+    );
   }
 
   // ---- streaming internals -----------------------------------------------
@@ -495,34 +510,45 @@ export class Outbound {
     return replacement;
   }
 
-  async #sendOne(chatId: string, text: string, useMd: boolean, replyTo: number | undefined, threadId?: number): Promise<number> {
+  async #sendOne(
+    chatId: string,
+    text: string,
+    useMd: boolean,
+    replyTo: number | undefined,
+    threadId: number | undefined,
+    signal?: AbortSignal,
+  ): Promise<number> {
     const reply = replyTo != null ? { reply_parameters: { message_id: replyTo } } : {};
     const thread = threadId != null ? { message_thread_id: threadId } : {};
+    signal?.throwIfAborted();
     if (useMd) {
       try {
-        const sent = await this.#rateLimited(() =>
-          tg<{ message_id: number }>(this.#token, "sendMessage", {
-            chat_id: chatId,
-            text: mdToMarkdownV2(text),
-            parse_mode: "MarkdownV2",
-            ...thread,
-            ...reply,
-          }),
+        const sent = await this.#rateLimited(
+          () =>
+            tg<{ message_id: number }>(
+              this.#token,
+              "sendMessage",
+              { chat_id: chatId, text: mdToMarkdownV2(text), parse_mode: "MarkdownV2", ...thread, ...reply },
+              { signal },
+            ),
+          signal,
         );
         return sent.message_id;
       } catch (err) {
+        signal?.throwIfAborted();
         if (isMissingThreadError(err) || !(err instanceof TgError && err.code === 400)) throw err;
       }
     }
-    const sent = await this.#rateLimited(() =>
-      tg<{ message_id: number }>(this.#token, "sendMessage", { chat_id: chatId, text, ...thread, ...reply }),
+    const sent = await this.#rateLimited(
+      () => tg<{ message_id: number }>(this.#token, "sendMessage", { chat_id: chatId, text, ...thread, ...reply }, { signal }),
+      signal,
     );
     return sent.message_id;
   }
 
   /** Run a Telegram delivery with the shared rate-limit retry (and this instance's test seam). */
-  #rateLimited<T>(op: () => Promise<T>): Promise<T> {
-    return withRateLimit(op, { sleep: this.#sleep, log: this.#log });
+  #rateLimited<T>(op: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return withRateLimit(op, { sleep: this.#sleep, log: this.#log, signal });
   }
 
   #onStreamError(st: ChatState, err: unknown): void {

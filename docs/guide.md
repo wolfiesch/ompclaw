@@ -2,6 +2,11 @@
 
 [Back to the quick start](../README.md)
 
+This guide covers extension mode, session topics, and the herdr control plane.
+For one persistent headless OMP session driven through the complete RPC UI, see
+[Standalone OMP RPC service](rpc-service.md).
+
+
 Run a Telegram bot **inside** an omp coding session. Incoming DMs and configured
 group @-mentions are injected as user messages; assistant replies stream back to
 Telegram in real time. One paired DM owner controls the bridge; optional group

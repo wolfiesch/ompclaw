@@ -12,6 +12,9 @@
   "bugs": {
     "url": "https://github.com/TerrifiedBug/omp-telegram/issues"
   },
+  "bin": {
+    "omp-telegram-rpc": "./src/rpc-cli.ts"
+  },
   "keywords": [
     "omp",
     "telegram",
@@ -32,6 +35,15 @@
     "src/outbound.ts",
     "src/prompts.ts",
     "src/topics.ts",
+    "src/rpc-cli.ts",
+    "src/rpc-client.ts",
+    "src/rpc-config.ts",
+    "src/rpc-protocol.ts",
+    "src/rpc-profile.ts",
+    "src/rpc-runtime.ts",
+    "src/rpc-service.ts",
+    "src/rpc-ui.ts",
+    "src/type-guards.ts",
     "README.md",
     "SECURITY.md",
     "docs",
@@ -40,7 +52,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "check": "bun run typecheck && bun run test"
+    "check": "bun run typecheck && bun run test",
+    "rpc": "bun ./src/rpc-cli.ts"
   },
   "omp": {
     "extensions": [
