@@ -169,6 +169,24 @@ function callbackData(payload: Record<string, unknown>): string {
   return firstButton.callback_data;
 }
 
+describe("TelegramTransportAdapter outbound delivery", () => {
+  test("advertises and performs streaming message updates", async () => {
+    const { adapter, calls } = await fixture();
+    expect(adapter.capabilities.streamingUpdates).toBe(true);
+
+    const receipt = await adapter.send(privateAddress, { text: "GATE", format: "text" }, delivery(privateAddress));
+    await adapter.update(
+      privateAddress,
+      receipt,
+      { text: "GATEWAY_E2E_0830", format: "text" },
+      delivery(privateAddress),
+    );
+
+    expect(calls.map(({ method }) => method)).toEqual(["sendMessage", "editMessageText"]);
+    expect(calls[1]?.payload).toMatchObject({ chat_id: "42", message_id: 100, text: "GATEWAY_E2E_0830" });
+  });
+});
+
 describe("TelegramTransportAdapter inbound conversion", () => {
   test("converts private and topic messages into principal-free envelopes", async () => {
     const { adapter, received } = await fixture();
