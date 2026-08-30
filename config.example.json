@@ -29,5 +29,17 @@
         }
       ]
     }
+  },
+  "automation": {
+    "enabled": false,
+    "pollIntervalMs": 1000,
+    "retryDelayMs": 15000,
+    "maxAttempts": 3
+  },
+  "learning": {
+    "enabled": false,
+    "autoCapture": false,
+    "minToolCalls": 5,
+    "memoryModel": "online"
   }
 }

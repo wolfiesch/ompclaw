@@ -47,7 +47,7 @@ beforeEach(() => {
   };
 });
 
-function broker(): RpcGatewayUiBroker {
+function broker(hasTarget = true, warnings: string[] = []): RpcGatewayUiBroker {
   const delivery: GatewayDelivery = {
     send: async () => ({ transport: "test", messageId: "send" }),
     update: async (_address, receipt) => receipt,
@@ -65,8 +65,8 @@ function broker(): RpcGatewayUiBroker {
   return new RpcGatewayUiBroker({
     delivery,
     sendResponse: (response) => responses.push(response),
-    getTarget: () => ({ address, deliveryContext }),
-    log: { warn: () => {} },
+    getTarget: () => hasTarget ? { address, deliveryContext } : undefined,
+    log: { warn: (message) => warnings.push(message) },
   });
 }
 
@@ -143,4 +143,20 @@ describe("RpcGatewayUiBroker", () => {
     expect(presentationSignal?.aborted).toBe(true);
     expect(responses).toEqual([{ type: "extension_ui_response", id: "pending", cancelled: true }]);
   });
+  test("retains display state quietly and cancels interactive requests without an active delivery", async () => {
+    const warnings: string[] = [];
+    const ui = broker(false, warnings);
+
+    await ui.handle({ type: "extension_ui_request", id: "widget", method: "setWidget", widgetKey: "queue", widgetLines: ["one"] });
+    await ui.handle({ type: "extension_ui_request", id: "confirm", method: "confirm", title: "Continue", message: "Proceed?" });
+    await ui.handle({ type: "extension_ui_request", id: "notify", method: "notify", message: "Saved" });
+
+    expect(ui.statusText()).toContain("queue: one");
+    expect(responses).toEqual([{ type: "extension_ui_response", id: "confirm", cancelled: true }]);
+    expect(warnings).toEqual([
+      "[gateway rpc] Cannot present confirm: no active delivery context",
+      "[gateway rpc] Cannot present notify: no active delivery context",
+    ]);
+  });
+
 });

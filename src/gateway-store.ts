@@ -22,6 +22,31 @@ export interface PendingInteraction {
   readonly expiresAt?: number;
 }
 
+export type ScheduledJobSchedule =
+  | { readonly kind: "at"; readonly at: number }
+  | { readonly kind: "cron"; readonly expression: string; readonly timezone?: string | undefined };
+
+export interface ScheduledJob {
+  readonly id: string;
+  readonly principalId: string;
+  readonly identity: TransportIdentity;
+  readonly address: ConversationAddress;
+  readonly name: string;
+  readonly prompt: string;
+  readonly schedule: ScheduledJobSchedule;
+  readonly enabled: boolean;
+  readonly nextRunAt?: number | undefined;
+  readonly retryAt?: number | undefined;
+  readonly attemptCount: number;
+  readonly successCount: number;
+  readonly failureCount: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly lastRunAt?: number | undefined;
+  readonly lastSuccessAt?: number | undefined;
+  readonly lastError?: string | undefined;
+}
+
 export interface LegacyTelegramStateImportOptions {
   readonly accessPath: string;
   readonly rpcStatePath: string;
@@ -165,6 +190,146 @@ function decodePendingInteraction(row: SqlRow): PendingInteraction {
   };
 }
 
+function optionalStoredTimestamp(row: SqlRow, column: string, context: string): number | undefined {
+  const value = row[column];
+  if (value === null) return undefined;
+  return storedTimestamp(row, column, context);
+}
+
+function storedCount(row: SqlRow, column: string, context: string): number {
+  const value = storedTimestamp(row, column, context);
+  if (value < 0) throw new Error(`corrupt stored ${context}: ${column} is negative`);
+  return value;
+}
+
+function decodeScheduledJob(row: SqlRow): ScheduledJob {
+  const context = "scheduled job";
+  const thread = storedString(row, "thread", context);
+  const schedule = decodeJson(row.schedule_json, `${context} schedule`);
+  if (!isRecord(schedule) || (schedule.kind !== "at" && schedule.kind !== "cron")) {
+    throw new Error("corrupt JSON stored for scheduled job schedule");
+  }
+  if (schedule.kind === "at") {
+    if (typeof schedule.at !== "number" || !Number.isSafeInteger(schedule.at)) {
+      throw new Error("corrupt JSON stored for scheduled job schedule");
+    }
+  } else if (
+    typeof schedule.expression !== "string" ||
+    schedule.expression.length === 0 ||
+    (schedule.timezone !== undefined && typeof schedule.timezone !== "string")
+  ) {
+    throw new Error("corrupt JSON stored for scheduled job schedule");
+  }
+
+  const enabled = row.enabled;
+  if (enabled !== 0 && enabled !== 1) throw new Error("corrupt stored scheduled job: enabled is not boolean");
+  const lastError = row.last_error;
+  if (lastError !== null && typeof lastError !== "string") {
+    throw new Error("corrupt stored scheduled job: last_error is not text");
+  }
+
+  return {
+    id: storedString(row, "id", context),
+    principalId: storedString(row, "principal_id", context),
+    identity: {
+      transport: storedString(row, "transport", context),
+      account: storedString(row, "account", context),
+      subject: storedString(row, "subject", context),
+    },
+    address: {
+      transport: storedString(row, "transport", context),
+      account: storedString(row, "account", context),
+      channel: storedString(row, "channel", context),
+      ...(thread === "" ? {} : { thread }),
+    },
+    name: storedString(row, "name", context),
+    prompt: storedString(row, "prompt", context),
+    schedule: schedule as unknown as ScheduledJobSchedule,
+    enabled: enabled === 1,
+    ...(optionalStoredTimestamp(row, "next_run_at", context) === undefined
+      ? {}
+      : { nextRunAt: optionalStoredTimestamp(row, "next_run_at", context) }),
+    ...(optionalStoredTimestamp(row, "retry_at", context) === undefined
+      ? {}
+      : { retryAt: optionalStoredTimestamp(row, "retry_at", context) }),
+    attemptCount: storedCount(row, "attempt_count", context),
+    successCount: storedCount(row, "success_count", context),
+    failureCount: storedCount(row, "failure_count", context),
+    createdAt: storedTimestamp(row, "created_at", context),
+    updatedAt: storedTimestamp(row, "updated_at", context),
+    ...(optionalStoredTimestamp(row, "last_run_at", context) === undefined
+      ? {}
+      : { lastRunAt: optionalStoredTimestamp(row, "last_run_at", context) }),
+    ...(optionalStoredTimestamp(row, "last_success_at", context) === undefined
+      ? {}
+      : { lastSuccessAt: optionalStoredTimestamp(row, "last_success_at", context) }),
+    ...(lastError === null ? {} : { lastError }),
+  };
+}
+
+const SCHEDULED_JOB_FIELDS = [
+  "id",
+  "principal_id",
+  "transport",
+  "account",
+  "subject",
+  "channel",
+  "thread",
+  "name",
+  "prompt",
+  "schedule_json",
+  "enabled",
+  "next_run_at",
+  "retry_at",
+  "attempt_count",
+  "success_count",
+  "failure_count",
+  "created_at",
+  "updated_at",
+  "last_run_at",
+  "last_success_at",
+  "last_error",
+].join(", ");
+
+function validateScheduledJob(job: ScheduledJob): void {
+  requiredText(job.id, "scheduled job id");
+  requiredText(job.principalId, "scheduled job principal");
+  validateIdentity(job.identity);
+  validateAddress(job.address);
+  if (job.identity.transport !== job.address.transport || job.identity.account !== job.address.account) {
+    throw new Error("scheduled job identity and address must use the same transport account");
+  }
+  requiredText(job.name, "scheduled job name");
+  requiredText(job.prompt, "scheduled job prompt");
+  if (job.schedule.kind === "at") {
+    if (!Number.isSafeInteger(job.schedule.at)) throw new Error("scheduled job time must be an integer timestamp");
+  } else {
+    requiredText(job.schedule.expression, "scheduled job cron expression");
+    if (job.schedule.timezone !== undefined) requiredText(job.schedule.timezone, "scheduled job timezone");
+  }
+
+  for (const [label, value] of [
+    ["next run", job.nextRunAt],
+    ["retry", job.retryAt],
+    ["created", job.createdAt],
+    ["updated", job.updatedAt],
+    ["last run", job.lastRunAt],
+    ["last success", job.lastSuccessAt],
+  ] as const) {
+    if (value !== undefined && !Number.isSafeInteger(value)) {
+      throw new Error(`scheduled job ${label} must be an integer timestamp`);
+    }
+  }
+  for (const [label, value] of [
+    ["attempt count", job.attemptCount],
+    ["success count", job.successCount],
+    ["failure count", job.failureCount],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`scheduled job ${label} must be a non-negative integer`);
+  }
+  if (job.lastError !== undefined) requiredText(job.lastError, "scheduled job last error");
+}
+
 function parseLegacyState(path: string, label: string): Record<string, unknown> {
   let raw: string;
   try {
@@ -284,6 +449,33 @@ export class GatewayStore {
 
       CREATE INDEX IF NOT EXISTS inbound_messages_received_at
         ON inbound_messages (received_at);
+
+      CREATE TABLE IF NOT EXISTS scheduled_jobs (
+        id TEXT PRIMARY KEY NOT NULL,
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+        transport TEXT NOT NULL,
+        account TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        name TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        schedule_json TEXT NOT NULL,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        next_run_at INTEGER,
+        retry_at INTEGER,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        success_count INTEGER NOT NULL DEFAULT 0,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_run_at INTEGER,
+        last_success_at INTEGER,
+        last_error TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS scheduled_jobs_due
+        ON scheduled_jobs (enabled, retry_at, next_run_at);
 
       CREATE TABLE IF NOT EXISTS migration_markers (
         marker TEXT PRIMARY KEY NOT NULL,
@@ -564,6 +756,127 @@ export class GatewayStore {
     return this.#database
       .query("DELETE FROM pending_ui_interactions WHERE expires_at IS NOT NULL AND expires_at <= ?")
       .run(now).changes;
+  }
+
+  createScheduledJob(job: ScheduledJob): void {
+    validateScheduledJob(job);
+    this.#database
+      .query(
+        `INSERT INTO scheduled_jobs (
+          id, principal_id, transport, account, subject, channel, thread,
+          name, prompt, schedule_json, enabled, next_run_at, retry_at,
+          attempt_count, success_count, failure_count, created_at, updated_at,
+          last_run_at, last_success_at, last_error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        job.id,
+        job.principalId,
+        job.identity.transport,
+        job.identity.account,
+        job.identity.subject,
+        job.address.channel,
+        job.address.thread ?? "",
+        job.name,
+        job.prompt,
+        encodeJson(job.schedule, "scheduled job schedule"),
+        job.enabled ? 1 : 0,
+        job.nextRunAt ?? null,
+        job.retryAt ?? null,
+        job.attemptCount,
+        job.successCount,
+        job.failureCount,
+        job.createdAt,
+        job.updatedAt,
+        job.lastRunAt ?? null,
+        job.lastSuccessAt ?? null,
+        job.lastError ?? null,
+      );
+  }
+
+  updateScheduledJob(job: ScheduledJob): boolean {
+    validateScheduledJob(job);
+    const result = this.#database
+      .query(
+        `UPDATE scheduled_jobs SET
+          transport = ?, account = ?, subject = ?, channel = ?, thread = ?,
+          name = ?, prompt = ?, schedule_json = ?, enabled = ?,
+          next_run_at = ?, retry_at = ?, attempt_count = ?,
+          success_count = ?, failure_count = ?, updated_at = ?,
+          last_run_at = ?, last_success_at = ?, last_error = ?
+         WHERE id = ? AND principal_id = ?`,
+      )
+      .run(
+        job.identity.transport,
+        job.identity.account,
+        job.identity.subject,
+        job.address.channel,
+        job.address.thread ?? "",
+        job.name,
+        job.prompt,
+        encodeJson(job.schedule, "scheduled job schedule"),
+        job.enabled ? 1 : 0,
+        job.nextRunAt ?? null,
+        job.retryAt ?? null,
+        job.attemptCount,
+        job.successCount,
+        job.failureCount,
+        job.updatedAt,
+        job.lastRunAt ?? null,
+        job.lastSuccessAt ?? null,
+        job.lastError ?? null,
+        job.id,
+        job.principalId,
+      );
+    return result.changes > 0;
+  }
+
+  getScheduledJob(id: string, principalId?: string): ScheduledJob | undefined {
+    requiredText(id, "scheduled job id");
+    if (principalId !== undefined) requiredText(principalId, "scheduled job principal");
+    const row = principalId === undefined
+      ? this.#database.query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE id = ?`).get(id)
+      : this.#database
+        .query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE id = ? AND principal_id = ?`)
+        .get(id, principalId);
+    return row === null ? undefined : decodeScheduledJob(row as SqlRow);
+  }
+
+  listScheduledJobs(principalId?: string): ScheduledJob[] {
+    if (principalId !== undefined) requiredText(principalId, "scheduled job principal");
+    const rows = principalId === undefined
+      ? this.#database.query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs ORDER BY created_at ASC, id ASC`).all()
+      : this.#database
+        .query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE principal_id = ? ORDER BY created_at ASC, id ASC`)
+        .all(principalId);
+    return (rows as SqlRow[]).map(decodeScheduledJob);
+  }
+
+  listDueScheduledJobs(now: number, limit = 16): ScheduledJob[] {
+    if (!Number.isSafeInteger(now)) throw new Error("scheduled job due time must be an integer timestamp");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) {
+      throw new Error("scheduled job due limit must be an integer between 1 and 128");
+    }
+    const rows = this.#database
+      .query(
+        `SELECT ${SCHEDULED_JOB_FIELDS}
+         FROM scheduled_jobs
+         WHERE enabled = 1
+           AND next_run_at IS NOT NULL
+           AND COALESCE(retry_at, next_run_at) <= ?
+         ORDER BY COALESCE(retry_at, next_run_at) ASC, created_at ASC
+         LIMIT ?`,
+      )
+      .all(now, limit) as SqlRow[];
+    return rows.map(decodeScheduledJob);
+  }
+
+  deleteScheduledJob(id: string, principalId: string): boolean {
+    requiredText(id, "scheduled job id");
+    requiredText(principalId, "scheduled job principal");
+    return this.#database
+      .query("DELETE FROM scheduled_jobs WHERE id = ? AND principal_id = ?")
+      .run(id, principalId).changes > 0;
   }
 
   importLegacyTelegramState(options: LegacyTelegramStateImportOptions): LegacyTelegramStateImportResult {

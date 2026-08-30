@@ -1,5 +1,10 @@
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  formatScheduledJob,
+  type GatewayAutomationControl,
+  type ScheduledJobContext,
+} from "./gateway-scheduler";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -7,6 +12,7 @@ import type {
   OutboundContent,
   OutboundReceipt,
   Reaction,
+  TransportIdentity,
   UiRequest,
   UiResponseFor,
 } from "./gateway-types";
@@ -46,6 +52,8 @@ export interface GatewayHostToolContext {
   readonly delivery: GatewayDelivery;
   readonly address: ConversationAddress;
   readonly deliveryContext: DeliveryContext;
+  readonly identity: TransportIdentity;
+  readonly automation?: GatewayAutomationControl;
 }
 
 const gatewayHostTools: readonly RpcHostToolDefinition[] = [
@@ -106,8 +114,96 @@ const gatewayHostTools: readonly RpcHostToolDefinition[] = [
   },
 ];
 
-export function gatewayHostToolDefinitions(): RpcHostToolDefinition[] {
-  return gatewayHostTools.map((tool) => ({ ...tool }));
+const automationHostTools: readonly RpcHostToolDefinition[] = [
+  {
+    name: "gateway_schedule_job",
+    label: "Schedule unattended job",
+    description: "Create a durable one-shot or cron job that runs in this gateway and reports to the active conversation.",
+    loadMode: "essential",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", minLength: 1, maxLength: 120 },
+        prompt: { type: "string", minLength: 1, maxLength: 16_000 },
+        at: { type: "string", minLength: 1, description: "ISO 8601 date-time for a one-shot job." },
+        cron: { type: "string", minLength: 1, maxLength: 256, description: "Cron expression for a recurring job." },
+        timezone: { type: "string", minLength: 1, maxLength: 128, description: "IANA timezone for a cron job." },
+      },
+      required: ["name", "prompt"],
+      oneOf: [{ required: ["at"], not: { required: ["cron"] } }, { required: ["cron"], not: { required: ["at"] } }],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "gateway_update_job",
+    label: "Update scheduled job",
+    description: "Update a durable job owned by the active principal. Supplying at or cron replaces its schedule.",
+    loadMode: "discoverable",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", minLength: 1, maxLength: 128 },
+        name: { type: "string", minLength: 1, maxLength: 120 },
+        prompt: { type: "string", minLength: 1, maxLength: 16_000 },
+        at: { type: "string", minLength: 1 },
+        cron: { type: "string", minLength: 1, maxLength: 256 },
+        timezone: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "gateway_list_jobs",
+    label: "List scheduled jobs",
+    description: "List durable jobs owned by the active principal, including schedules, next runs, and failures.",
+    loadMode: "essential",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "gateway_set_job_enabled",
+    label: "Enable or disable job",
+    description: "Enable or disable a durable job owned by the active principal.",
+    loadMode: "discoverable",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", minLength: 1, maxLength: 128 },
+        enabled: { type: "boolean" },
+      },
+      required: ["id", "enabled"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "gateway_delete_job",
+    label: "Delete scheduled job",
+    description: "Permanently delete a durable job owned by the active principal.",
+    loadMode: "discoverable",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "string", minLength: 1, maxLength: 128 } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "gateway_run_job",
+    label: "Run scheduled job now",
+    description: "Queue a durable job owned by the active principal to run as soon as the current turn finishes.",
+    loadMode: "discoverable",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "string", minLength: 1, maxLength: 128 } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+];
+
+export function gatewayHostToolDefinitions(automation = false): RpcHostToolDefinition[] {
+  const tools = automation ? [...gatewayHostTools, ...automationHostTools] : gatewayHostTools;
+  return tools.map((tool) => ({ ...tool }));
 }
 
 export async function executeGatewayHostTool(
@@ -122,6 +218,18 @@ export async function executeGatewayHostTool(
       return executeReact(call.arguments, context, signal);
     case "gateway_ask":
       return executeAsk(call.arguments, context, signal);
+    case "gateway_schedule_job":
+      return executeScheduleJob(call.arguments, context);
+    case "gateway_update_job":
+      return executeUpdateJob(call.arguments, context);
+    case "gateway_list_jobs":
+      return executeListJobs(call.arguments, context);
+    case "gateway_set_job_enabled":
+      return executeSetJobEnabled(call.arguments, context);
+    case "gateway_delete_job":
+      return executeDeleteJob(call.arguments, context);
+    case "gateway_run_job":
+      return executeRunJob(call.arguments, context);
     default:
       throw new Error(`Unknown host tool: ${call.toolName}`);
   }
@@ -195,6 +303,84 @@ async function executeAsk(
     signal,
   );
   return { answer: multi === true ? response.selected : response.selected[0] };
+}
+
+function executeScheduleJob(arguments_: unknown, context: GatewayHostToolContext): { job: string } {
+  const automation = requireAutomation(context);
+  const argumentsRecord = parseArguments(arguments_, ["name", "prompt", "at", "cron", "timezone"]);
+  const job = automation.create({
+    name: requiredNonEmptyString(argumentsRecord, "name"),
+    prompt: requiredNonEmptyString(argumentsRecord, "prompt"),
+    ...(optionalNonEmptyString(argumentsRecord, "at") === undefined ? {} : { at: optionalNonEmptyString(argumentsRecord, "at") }),
+    ...(optionalNonEmptyString(argumentsRecord, "cron") === undefined ? {} : { cron: optionalNonEmptyString(argumentsRecord, "cron") }),
+    ...(optionalNonEmptyString(argumentsRecord, "timezone") === undefined ? {} : { timezone: optionalNonEmptyString(argumentsRecord, "timezone") }),
+  }, scheduledContext(context));
+  return { job: formatScheduledJob(job) };
+}
+
+function executeUpdateJob(arguments_: unknown, context: GatewayHostToolContext): { job: string } {
+  const automation = requireAutomation(context);
+  const argumentsRecord = parseArguments(arguments_, ["id", "name", "prompt", "at", "cron", "timezone"]);
+  const job = automation.update({
+    id: requiredNonEmptyString(argumentsRecord, "id"),
+    ...(optionalNonEmptyString(argumentsRecord, "name") === undefined ? {} : { name: optionalNonEmptyString(argumentsRecord, "name") }),
+    ...(optionalNonEmptyString(argumentsRecord, "prompt") === undefined ? {} : { prompt: optionalNonEmptyString(argumentsRecord, "prompt") }),
+    ...(optionalNonEmptyString(argumentsRecord, "at") === undefined ? {} : { at: optionalNonEmptyString(argumentsRecord, "at") }),
+    ...(optionalNonEmptyString(argumentsRecord, "cron") === undefined ? {} : { cron: optionalNonEmptyString(argumentsRecord, "cron") }),
+    ...(optionalNonEmptyString(argumentsRecord, "timezone") === undefined ? {} : { timezone: optionalNonEmptyString(argumentsRecord, "timezone") }),
+  }, scheduledContext(context));
+  return { job: formatScheduledJob(job) };
+}
+
+function executeListJobs(arguments_: unknown, context: GatewayHostToolContext): { jobs: readonly string[] } {
+  parseArguments(arguments_, []);
+  return {
+    jobs: requireAutomation(context).list(context.deliveryContext.principal.id).map(formatScheduledJob),
+  };
+}
+
+function executeSetJobEnabled(arguments_: unknown, context: GatewayHostToolContext): { job: string } {
+  const argumentsRecord = parseArguments(arguments_, ["id", "enabled"]);
+  const enabled = optionalBoolean(argumentsRecord, "enabled");
+  if (enabled === undefined) throw new Error("enabled is required");
+  const job = requireAutomation(context).setEnabled(
+    requiredNonEmptyString(argumentsRecord, "id"),
+    context.deliveryContext.principal.id,
+    enabled,
+  );
+  return { job: formatScheduledJob(job) };
+}
+
+function executeDeleteJob(arguments_: unknown, context: GatewayHostToolContext): { deleted: boolean } {
+  const argumentsRecord = parseArguments(arguments_, ["id"]);
+  return {
+    deleted: requireAutomation(context).remove(
+      requiredNonEmptyString(argumentsRecord, "id"),
+      context.deliveryContext.principal.id,
+    ),
+  };
+}
+
+function executeRunJob(arguments_: unknown, context: GatewayHostToolContext): { job: string } {
+  const argumentsRecord = parseArguments(arguments_, ["id"]);
+  const job = requireAutomation(context).runNow(
+    requiredNonEmptyString(argumentsRecord, "id"),
+    context.deliveryContext.principal.id,
+  );
+  return { job: formatScheduledJob(job) };
+}
+
+function requireAutomation(context: GatewayHostToolContext): GatewayAutomationControl {
+  if (context.automation === undefined) throw new Error("Gateway automation is disabled");
+  return context.automation;
+}
+
+function scheduledContext(context: GatewayHostToolContext): ScheduledJobContext {
+  return {
+    principal: context.deliveryContext.principal,
+    identity: context.identity,
+    address: context.address,
+  };
 }
 
 function parseArguments(value: unknown, allowedKeys: readonly string[]): RpcRecord {

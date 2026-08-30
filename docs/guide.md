@@ -32,7 +32,7 @@ WebSocket client      ─┘                                    │
                                         SQLite state and session checkpoint
 ```
 
-The start order prevents an adapter from accepting traffic before the OMP session is available. On shutdown, adapters stop before OMP and the state store closes before the lock is released.
+The start order prevents an adapter or scheduler from accepting work before the OMP session is available. On shutdown, the scheduler stops first, then adapters stop before OMP, and the state store closes before the lock is released.
 
 The SQLite database is `~/.omp/agent/gateway/gateway.sqlite` by default. A newly created database is private to its owner. It records:
 
@@ -44,6 +44,7 @@ The SQLite database is `~/.omp/agent/gateway/gateway.sqlite` by default. A newly
 | inbound messages | deduplicate accepted transport messages |
 | pending UI interactions | keep transport UI metadata until completion or expiry |
 | migration markers | make legacy Telegram import idempotent |
+| scheduled jobs | persist one-shot and cron automation, ownership, next run, retry, and outcome state |
 
 SQLite uses foreign keys, full synchronous mode, and immediate transactions for the legacy import. Do not open the database for concurrent writes or share `stateDir` between gateway instances.
 
@@ -62,6 +63,8 @@ The JSON document never contains a token value. It names environment variables t
 | `profile` | identifier, `gateway` | OMP profile passed to the RPC child |
 | `omp` | object | OMP runtime settings |
 | `transports` | object | enabled transport settings |
+| `automation` | object | optional durable unattended job runner |
+| `learning` | object | optional experimental gateway-scoped memory and managed-skill capture |
 
 ### `omp`
 
@@ -79,6 +82,67 @@ The JSON document never contains a token value. It names environment variables t
 | `autoRestart` | boolean, `true` | restart an unexpectedly exited OMP child with bounded backoff |
 
 `authBrokerTokenFile`, when used, must be private in the same way as the environment file. `allowRpcBash` changes the authority available through the gateway. Leave it disabled unless it is a deliberate operational choice.
+
+### Durable automation
+
+Automation is off by default. Enable it explicitly:
+
+```json
+{
+  "automation": {
+    "enabled": true,
+    "pollIntervalMs": 1000,
+    "retryDelayMs": 15000,
+    "maxAttempts": 3
+  }
+}
+```
+
+| Field | Type and default | Meaning |
+| --- | --- | --- |
+| `enabled` | boolean, `false` | register scheduling host tools and start the durable dispatcher |
+| `pollIntervalMs` | integer, `1000` | scan interval from 250 to 60000 milliseconds |
+| `retryDelayMs` | integer, `15000` | base retry delay from 1000 to 3600000 milliseconds |
+| `maxAttempts` | integer, `3` | maximum failed attempts from 1 to 10 before a one-shot job is disabled |
+
+An authenticated operator can ask OMP to schedule a one-shot job at an ISO 8601 time with an explicit UTC offset, or a recurring cron job with an optional IANA timezone. OMP receives `gateway_schedule_job`, `gateway_update_job`, `gateway_list_jobs`, `gateway_set_job_enabled`, `gateway_delete_job`, and `gateway_run_job` host tools. The model never supplies a principal or delivery route. The gateway binds each job to the active server-derived principal, identity, and conversation.
+
+Use `/jobs` to inspect your jobs, `/job_pause <id>` or `/job_resume <id>` to change dispatch, `/job_run <id>` to make a job due immediately, and `/job_delete <id>` to remove it. Job IDs are intentionally exact and principal-scoped.
+
+The scheduler persists the next occurrence before dispatch. A restart recovers every due job from SQLite. Only one OMP turn runs at a time, so a scheduled job that finds the runtime busy is deferred without consuming an attempt. Other failures use bounded linear backoff. A one-shot job is disabled after success or after exhausting retries. A recurring job advances to its next cron occurrence after success or final failure. Job execution is at least once across process crashes, so prompts that mutate external systems should be idempotent.
+
+Scheduled output and OMP interaction requests return to the conversation that created the job. Telegram can receive output while no inbound request is active. WebSocket jobs require the exact authenticated origin to be connected when delivery occurs.
+
+### Experimental learning and profile isolation
+
+Learning is off by default because OMP marks auto-learn as experimental and automatic capture consumes an extra model turn. A private single-operator setup can enable the full loop:
+
+```json
+{
+  "omp": {
+    "inheritHarness": true
+  },
+  "learning": {
+    "enabled": true,
+    "autoCapture": true,
+    "minToolCalls": 5,
+    "memoryModel": "online"
+  }
+}
+```
+
+| Field | Type and default | Meaning |
+| --- | --- | --- |
+| `enabled` | boolean, `false` | enable isolated Mnemopi memory, `learn`, and `manage_skill` |
+| `autoCapture` | boolean, `false` | run OMP's private capture turn after an eligible stop |
+| `minToolCalls` | integer, `5` | minimum tool calls before automatic capture, from 1 to 100 |
+| `memoryModel` | string, `online` | memory extraction model: `online`, `qwen3-1.7b`, `llama3.2:3b`, `gemma-3-1b`, `qwen2.5-1.5b`, or `lfm2-1.2b` |
+
+When enabled, the gateway writes a private generated OMP overlay at `stateDir/omp-learning.json` and stores Mnemopi data under `stateDir/memory`. `online` uses OMP's configured TINY role, then its small online fallback. The other values select local on-device memory models. The active conversation model remains independently selectable through `omp.model` or `/model`.
+
+With `omp.inheritHarness: true`, each gateway start refreshes desktop `skills`, `rules`, `commands`, `agents`, `docs`, and `bin` into read-only snapshots inside the named gateway profile. Root policy and harness configuration files refresh atomically. Symlinked skill directories are materialized so the named profile never points back into the desktop profile. Secret and volatile paths such as `.env*`, dependency directories, virtual environments, logs, caches, and browser profiles are excluded.
+
+OMP-managed skill creation and refinement write to the gateway profile's separate `managed-skills` directory. Gateway memory, managed skills, sessions, credentials, and databases stay isolated, while updated desktop harness content flows into the gateway on restart.
 
 ### Telegram transport
 
@@ -261,13 +325,14 @@ The server accepts a connection at `GET /` only after HTTP WebSocket upgrade. It
 
 ## Operational limitations
 
-- One gateway process owns one OMP session and one SQLite writer. This is not a scheduler, a worker pool, or a distributed multi-writer system.
-- While an authenticated conversation has an active OMP turn, a different authenticated conversation receives a busy response rather than sharing that turn's stream or final response.
-- In-flight OMP work is not resumable after a process or child crash. Only the persisted session checkpoint can be resumed.
+- One gateway process owns one OMP session, one scheduler, and one SQLite writer. This is not a worker pool or a distributed multi-writer system.
+- Interactive and scheduled work serialize through the same OMP runtime. A due job waits while another turn is active. A different interactive conversation receives a busy response while another turn is active.
+- Job dispatch is at least once across gateway or host crashes. External side effects require idempotent prompts or downstream deduplication.
+- In-flight OMP work is not resumable after a process or child crash. Completed session and scheduled-job state remain durable.
 - One Telegram bot token has one long poller. Do not run multiple pollers or mix long polling with a Telegram webhook.
 - WebSocket delivery requires the authenticated client for the exact configured origin to remain connected. The gateway does not queue delivery for a disconnected WebSocket client.
-- HTTP is health-only. There is no HTTP prompt API, scheduler API, database API, or unauthenticated transport API.
-- Package publication is a separate authorized action. Installing from npm is available only after the package has been published.
+- HTTP is health-only. There is no HTTP prompt, scheduler, database, or unauthenticated transport API.
+- Experimental auto-capture uses extra provider tokens and can create or refine gateway-profile managed skills. Review that profile before relying on learned behavior for consequential automation.
 
 ## Further reference
 

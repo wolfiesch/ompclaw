@@ -223,6 +223,27 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("waits for scheduled turns to finish before acknowledging dispatch", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    const completion = runtime.handleScheduled(message("scheduled", "Run the durable job"));
+    let settled = false;
+    void completion.then(() => {
+      settled = true;
+    });
+    await settle();
+    expect(settled).toBe(false);
+
+    const rpc = FakeOmpRpcClient.instances[0];
+    expect(rpc.sent.some((command) => command.type === "prompt")).toBe(true);
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "scheduled result" }] }] });
+    await completion;
+
+    expect(settled).toBe(true);
+    expect(deliveries.some((call) => call.address.channel === "scheduled" && textFromContent(call.content) === "scheduled result")).toBe(true);
+    await runtime.stop();
+  });
+
   test("maps text, local images, and non-image attachment locations into the OMP prompt", async () => {
     const directory = await mkdtemp(join(tmpdir(), "omp-gateway-runtime-"));
     const imagePath = join(directory, "image.png");
@@ -326,6 +347,30 @@ describe("RpcGatewayRuntime", () => {
 
     expect(presentationSignal?.aborted).toBe(true);
     expect(rpc.writes).toEqual([]);
+    await runtime.stop();
+  });
+
+  test("holds a scheduled dispatch open until the terminal OMP event", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    const scheduled = runtime.handleScheduled(message("scheduled", "Run unattended task"));
+    let completed = false;
+    void scheduled.then(() => { completed = true; });
+    await settle();
+
+    const rpc = FakeOmpRpcClient.instances[0];
+    expect(rpc.sent.some((command) => command.type === "prompt")).toBe(true);
+    expect(completed).toBe(false);
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Scheduled result" }] }],
+    });
+    await scheduled;
+
+    expect(completed).toBe(true);
+    expect(deliveries.some((call) => textFromContent(call.content) === "Scheduled result")).toBe(true);
+    expect(runtime.isBusy()).toBe(false);
     await runtime.stop();
   });
 

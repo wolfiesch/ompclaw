@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripGatewaySecretsFromChildEnv } from "./gateway-config";
 import { buildOmpChildEnv, buildOmpRpcArgv, loadLiteralEnvFile, type RpcRuntimeConfig } from "./rpc-config";
-import { prepareInheritedHarness } from "./rpc-profile";
+import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
 
 const directories: string[] = [];
 
@@ -23,8 +23,19 @@ function runtimeConfig(overrides: Partial<RpcRuntimeConfig> = {}): RpcRuntimeCon
   };
 }
 
+function makeRemovable(path: string): void {
+  if (!existsSync(path)) return;
+  const info = lstatSync(path);
+  if (!info.isDirectory()) return;
+  chmodSync(path, 0o700);
+  for (const entry of readdirSync(path)) makeRemovable(join(path, entry));
+}
+
 afterEach(() => {
-  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  for (const directory of directories.splice(0)) {
+    makeRemovable(directory);
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 describe("RPC configuration", () => {
@@ -134,11 +145,55 @@ describe("RPC configuration", () => {
     expect(childEnv).toEqual({ PATH: "/bin", OMP_AUTH_BROKER_TOKEN: "broker-secret" });
   });
 
+  test("materializes experimental learning in gateway-owned state only when enabled", () => {
+    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-learning-"));
+    directories.push(directory);
+    expect(prepareLearningOverlay({
+      stateDir: directory,
+      learning: { enabled: false, autoCapture: false, minToolCalls: 5, memoryModel: "online" },
+    })).toBeUndefined();
+
+    const path = prepareLearningOverlay({
+      stateDir: directory,
+      learning: { enabled: true, autoCapture: true, minToolCalls: 7, memoryModel: "qwen3-1.7b" },
+    })!;
+    expect(lstatSync(path).mode & 0o077).toBe(0);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      memory: { backend: "mnemopi" },
+      mnemopi: {
+        dbPath: join(directory, "memory", "mnemopi.sqlite"),
+        bank: "gateway",
+        scoping: "global",
+        autoRecall: true,
+        autoRetain: true,
+      },
+      autolearn: { enabled: true, autoContinue: true, minToolCalls: 7 },
+      providers: { memoryModel: "qwen3-1.7b" },
+    });
+  });
+
   test("accepts gateway runtime config for inherited harness assets without credentials or runtime state", () => {
     const directory = mkdtempSync(join(tmpdir(), "omp-gateway-profile-"));
     directories.push(directory);
     const source = join(directory, "agent");
     mkdirSync(join(source, "skills"), { recursive: true });
+    mkdirSync(join(source, "skills", "shared-skill"));
+    writeFileSync(join(source, "skills", "shared-skill", "SKILL.md"), "desktop v1");
+    writeFileSync(join(source, "skills", "shared-skill", ".env"), "SKILL_SECRET=value");
+    mkdirSync(join(source, "skills", "shared-skill", "node_modules"));
+    writeFileSync(join(source, "skills", "shared-skill", "node_modules", "dependency.js"), "ignored");
+    mkdirSync(join(source, "skills", "shared-skill", "logs"));
+    writeFileSync(join(source, "skills", "shared-skill", "logs", "runtime.log"), "ignored");
+    mkdirSync(join(source, "skills", "shared-skill", "data", "browser_profile_old"), { recursive: true });
+    writeFileSync(join(source, "skills", "shared-skill", "data", "browser_profile_old", "RunningChromeVersion"), "volatile");
+    mkdirSync(join(source, "skills", "shared-skill", "data", "browser_profile_cft146"));
+    writeFileSync(join(source, "skills", "shared-skill", "data", "browser_profile_cft146", "Cookies"), "volatile");
+    writeFileSync(join(source, "skills", "shared-skill", "data", "fixture.json"), "{}");
+    const linkedSkill = join(directory, "linked-skill");
+    mkdirSync(linkedSkill);
+    writeFileSync(join(linkedSkill, "SKILL.md"), "linked desktop skill");
+    symlinkSync(linkedSkill, join(source, "skills", "linked-skill"), "dir");
+    symlinkSync(join(directory, "temporarily-missing-skill"), join(source, "skills", "missing-skill"), "dir");
     mkdirSync(join(source, "extensions"));
     mkdirSync(join(source, "hooks"));
     writeFileSync(join(source, "AGENTS.md"), "rules");
@@ -149,6 +204,28 @@ describe("RPC configuration", () => {
     try {
       const target = prepareInheritedHarness(runtimeConfig({ profile: "phone", inheritHarness: true }))!;
       expect(lstatSync(join(target, "skills")).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(target, "skills"))).not.toBe(join(source, "skills"));
+      expect(readFileSync(join(target, "skills", "shared-skill", "SKILL.md"), "utf8")).toBe("desktop v1");
+      expect(lstatSync(join(target, "skills", "shared-skill", "SKILL.md")).mode & 0o222).toBe(0);
+      expect(existsSync(join(target, "skills", "shared-skill", ".env"))).toBe(false);
+      expect(existsSync(join(target, "skills", "shared-skill", "node_modules"))).toBe(false);
+      expect(existsSync(join(target, "skills", "shared-skill", "logs"))).toBe(false);
+      expect(existsSync(join(target, "skills", "shared-skill", "data", "browser_profile_old"))).toBe(false);
+      expect(readFileSync(join(target, "skills", "shared-skill", "data", "fixture.json"), "utf8")).toBe("{}");
+      expect(readFileSync(join(target, "skills", "linked-skill", "SKILL.md"), "utf8")).toBe("linked desktop skill");
+      expect(lstatSync(join(target, "skills", "linked-skill")).isSymbolicLink()).toBe(false);
+      expect(existsSync(join(target, "skills", "missing-skill"))).toBe(false);
+      expect(existsSync(join(target, "skills", "shared-skill", "data", "browser_profile_cft146"))).toBe(false);
+      mkdirSync(join(target, "managed-skills"), { recursive: true });
+      writeFileSync(join(target, "managed-skills", "gateway-skill.md"), "gateway only");
+      writeFileSync(join(source, "skills", "shared-skill", "SKILL.md"), "desktop v2");
+      chmodSync(join(source, "AGENTS.md"), 0o600);
+      writeFileSync(join(source, "AGENTS.md"), "rules v2");
+      prepareInheritedHarness(runtimeConfig({ profile: "phone", inheritHarness: true }));
+      expect(readFileSync(join(target, "skills", "shared-skill", "SKILL.md"), "utf8")).toBe("desktop v2");
+      expect(readFileSync(join(target, "managed-skills", "gateway-skill.md"), "utf8")).toBe("gateway only");
+      expect(lstatSync(join(target, "AGENTS.md")).mode & 0o222).toBe(0);
+      expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toBe("rules v2");
       expect(existsSync(join(target, "AGENTS.md"))).toBe(true);
       expect(existsSync(join(target, "extensions"))).toBe(false);
       expect(existsSync(join(target, "hooks"))).toBe(false);

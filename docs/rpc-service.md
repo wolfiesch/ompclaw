@@ -8,7 +8,7 @@
 
 The runtime starts one OMP child with `--mode rpc-ui`, the configured workspace and profile, and a persisted session path when one exists. It subscribes to OMP subagent progress, registers the gateway host tools, and asks OMP for session state.
 
-An inbound message establishes an active delivery context containing the authenticated principal and the exact transport address. Streamed updates, final assistant text, OMP UI, command output, host-tool delivery, and unexpected-exit notifications go only to that context. A message from a different authenticated conversation during an active turn receives a busy response. It does not join the active turn or receive its output.
+An inbound message or scheduled job establishes an active delivery context containing the authenticated principal and the exact transport address. Streamed updates, final assistant text, OMP UI, command output, host-tool delivery, and unexpected-exit notifications go only to that context. A message from a different authenticated conversation during an active turn receives a busy response. It does not join the active turn or receive its output. Due scheduled work defers while the runtime is busy.
 
 Assistant updates are lossless and ordered at the gateway boundary. A first visible assistant update creates an outbound message; later visible updates edit that same receipt when the transport supports it. A terminal OMP response delivers the final visible assistant text and clears the active delivery context. Thinking and tool-call blocks are not forwarded as assistant text.
 
@@ -48,6 +48,11 @@ Send these commands as a slash command in an authenticated conversation. Any oth
 | `/autocompact [on|off]` | show or set automatic compaction |
 | `/login` | show provider login availability and authentication state |
 | `/login <provider-id>` | start OMP provider login and route its secure URL prompt to the active delivery context |
+| `/jobs` | list durable scheduled jobs owned by the active principal |
+| `/job_pause <id>` | disable an owned scheduled job |
+| `/job_resume <id>` | enable an owned scheduled job and recompute its next occurrence |
+| `/job_run <id>` | make an owned scheduled job due immediately |
+| `/job_delete <id>` | permanently delete an owned scheduled job |
 | `/help` | show the gateway command summary |
 | `/shell <command>` | execute OMP RPC bash only when `omp.allowRpcBash` is explicitly `true` |
 | `/abortbash` | abort OMP RPC bash only when `omp.allowRpcBash` is explicitly `true` |
@@ -91,15 +96,23 @@ Only `select`, `confirm`, `input`, and `editor` produce a response back to OMP. 
 
 ## Gateway host tools
 
-The OMP child receives three host tools. They act only in the current active delivery context. A model cannot choose a different transport, principal, or conversation address.
+The OMP child always receives three delivery host tools. When `automation.enabled` is true, it also receives six durable job-control tools. The gateway derives the principal, transport identity, and conversation address from the active server-owned context. A model cannot choose or override them.
 
 | Tool | Parameters | Behavior |
 | --- | --- | --- |
 | `gateway_send` | `text` and/or `files` | send text and optional absolute local file paths to the active conversation; at least one is required |
 | `gateway_ask` | `question`, optional `title`, `options`, and `multi` | ask the operator a free-text, single-select, or multi-select question in the active conversation |
 | `gateway_react` | `message_id`, `emoji` | react to a message in the active conversation |
+| `gateway_schedule_job` | `name`, `prompt`, exactly one of `at` or `cron`, optional `timezone` | create an owned one-shot or recurring job bound to the active conversation |
+| `gateway_update_job` | `id`, optional mutable job fields | update an owned job and recompute its next occurrence |
+| `gateway_list_jobs` | none | list the active principal's jobs |
+| `gateway_set_job_enabled` | `id`, `enabled` | pause or resume an owned job |
+| `gateway_delete_job` | `id` | permanently remove an owned job |
+| `gateway_run_job` | `id` | make an owned job due now |
 
 `gateway_send` accepts only absolute local paths for `files`. Transport adapters enforce their own attachment and message rules. `gateway_ask` without `options` uses text input; with options it uses selection, and `multi: true` requests multi-select. Host-tool cancellation aborts the in-progress gateway delivery operation.
+
+One-shot `at` values must be ISO 8601 date-times with an explicit UTC offset. Cron timezones must be valid IANA names. Names, prompts, expressions, and retry state are bounded and validated before SQLite mutation. Job lookup and mutation always include the server-derived principal ID.
 
 ## WebSocket protocol v1
 
@@ -224,4 +237,4 @@ Telegram outbound delivery supports text messages and edits, reactions, uploads,
 
 ## Limits
 
-The gateway does not schedule jobs, distribute turns across writers, create one OMP session per client, or offer a general HTTP API. A session checkpoint can recover an exact completed session after restart, but it cannot resume in-flight work. WebSocket state is live only and Telegram is limited to one long-polling owner for a bot token.
+The gateway does not distribute turns across writers, create one OMP session per client, resume an in-flight OMP turn, or offer a general HTTP API. Durable jobs run through the same single OMP session with at-least-once dispatch and bounded retry. WebSocket state is live only, scheduled WebSocket delivery requires the originating client to be connected, and Telegram is limited to one long-polling owner for a bot token.
