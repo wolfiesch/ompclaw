@@ -1,149 +1,146 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import type { TgCallbackQuery, TgMessage } from "./api";
-import type { TelegramCall } from "./control";
+import type {
+  ConversationAddress,
+  DeliveryContext,
+  UiRequest,
+  UiResponse,
+  UiResponseFor,
+} from "./gateway-types";
+import type { GatewayDelivery } from "./gateway-tools";
 import type { RpcExtensionUiResponse } from "./rpc-protocol";
-import { RpcUiBroker, type RpcTelegramTarget } from "./rpc-ui";
+import { RpcGatewayUiBroker } from "./rpc-ui";
 
-interface TelegramInvocation {
-  method: string;
-  payload: Record<string, unknown>;
+interface Presentation {
+  readonly address: ConversationAddress;
+  readonly context: DeliveryContext;
+  readonly request: UiRequest;
+  readonly signal?: AbortSignal;
 }
 
-let calls: TelegramInvocation[];
+let presentations: Presentation[];
 let responses: RpcExtensionUiResponse[];
-let nextMessageId: number;
-let messageSent: ReturnType<typeof Promise.withResolvers<void>>;
-const target: RpcTelegramTarget = { chatId: "42", chatType: "private", responderId: "42" };
+let present: <Request extends UiRequest>(request: Request, signal?: AbortSignal) => Promise<UiResponseFor<Request>>;
+
+const address: ConversationAddress = { transport: "test", account: "account", channel: "channel" };
+const deliveryContext: DeliveryContext = {
+  principal: { id: "operator", roles: ["owner"] },
+  origin: address,
+};
 
 beforeEach(() => {
-  calls = [];
+  presentations = [];
   responses = [];
-  nextMessageId = 100;
-  messageSent = Promise.withResolvers<void>();
+  present = async <Request extends UiRequest>(request: Request): Promise<UiResponseFor<Request>> => {
+    const responseByType: Record<UiRequest["type"], UiResponse> = {
+      confirm: { type: "confirm", confirmed: true },
+      select: { type: "select", selected: ["one"] },
+      input: { type: "input", cancelled: false, value: "typed" },
+      editor: { type: "editor", cancelled: false, value: "edited" },
+      notify: { type: "notify", acknowledged: true },
+      open_url: { type: "open_url", opened: true },
+      status: { type: "status", acknowledged: true },
+      widget: { type: "widget", acknowledged: true },
+      title: { type: "title", acknowledged: true },
+      editor_text: { type: "editor_text", acknowledged: true },
+    };
+    return responseByType[request.type] as UiResponseFor<Request>;
+  };
 });
 
-function broker(): RpcUiBroker {
-  const callTelegram: TelegramCall = async <T>(method: string, payload: Record<string, unknown>): Promise<T> => {
-    calls.push({ method, payload });
-    if (method === "sendMessage") messageSent.resolve();
-    return (method === "sendMessage" ? { message_id: ++nextMessageId } : {}) as T;
+function broker(): RpcGatewayUiBroker {
+  const delivery: GatewayDelivery = {
+    send: async () => ({ transport: "test", messageId: "send" }),
+    update: async (_address, receipt) => receipt,
+    react: async () => {},
+    presentUi: async <Request extends UiRequest>(
+      requestedAddress: ConversationAddress,
+      request: Request,
+      context: DeliveryContext,
+      signal?: AbortSignal,
+    ): Promise<UiResponseFor<Request>> => {
+      presentations.push({ address: requestedAddress, context, request, signal });
+      return present(request, signal);
+    },
   };
-  return new RpcUiBroker({
-    callTelegram,
+  return new RpcGatewayUiBroker({
+    delivery,
     sendResponse: (response) => responses.push(response),
-    getTarget: () => target,
-    fallbackTarget: () => undefined,
-    isAuthorized: (candidate) => candidate.chatId === "42" && candidate.responderId === "42",
+    getTarget: () => ({ address, deliveryContext }),
     log: { warn: () => {} },
   });
 }
 
-function callbackData(row: number, column: number): string {
-  const markup = calls.findLast((call) => call.method === "sendMessage")?.payload.reply_markup as {
-    inline_keyboard: Array<Array<{ callback_data: string }>>;
-  };
-  return markup.inline_keyboard[row][column].callback_data;
+async function settle(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
-function callback(data: string, from = 42): TgCallbackQuery {
-  return {
-    id: `callback-${from}`,
-    from: { id: from },
-    data,
-    message: { message_id: nextMessageId, chat: { id: 42, type: "private" } },
-  };
-}
-
-describe("RpcUiBroker", () => {
-  test("bridges confirmation approval and denial as confirmed booleans", async () => {
+describe("RpcGatewayUiBroker", () => {
+  test("converts interactive RPC UI requests and responses through the active delivery context", async () => {
     const ui = broker();
-    await ui.handle({ type: "extension_ui_request", id: "confirm-1", method: "confirm", title: "Run tool?", message: "Review command" });
-    await ui.handleCallback(callback(callbackData(0, 1)));
-    expect(responses).toEqual([{ type: "extension_ui_response", id: "confirm-1", confirmed: false }]);
 
-    await ui.handle({ type: "extension_ui_request", id: "confirm-2", method: "confirm", title: "Run tool?", message: "Review command" });
-    await ui.handleCallback(callback(callbackData(0, 0)));
-    expect(responses.at(-1)).toEqual({ type: "extension_ui_response", id: "confirm-2", confirmed: true });
-  });
-
-  test("rejects callbacks from another Telegram user", async () => {
-    const ui = broker();
-    await ui.handle({ type: "extension_ui_request", id: "confirm", method: "confirm", title: "Approve", message: "Sensitive" });
-    await ui.handleCallback(callback(callbackData(0, 0), 99));
-    expect(responses).toEqual([]);
-    expect(calls.at(-1)).toMatchObject({ method: "answerCallbackQuery", payload: { show_alert: true } });
-  });
-
-  test("correlates free-text input to the force-reply message and operator", async () => {
-    const ui = broker();
+    await ui.handle({ type: "extension_ui_request", id: "select", method: "select", title: "Choose", options: ["one", "two"], optionDetails: [{ description: "first" }] });
+    await ui.handle({ type: "extension_ui_request", id: "confirm", method: "confirm", title: "Continue", message: "Proceed?" });
     await ui.handle({ type: "extension_ui_request", id: "input", method: "input", title: "Value", placeholder: "Type it" });
-    const message: TgMessage = {
-      message_id: 102,
-      date: 1,
-      text: "the answer",
-      chat: { id: 42, type: "private" },
-      from: { id: 42 },
-      reply_to_message: { message_id: 101, date: 1, chat: { id: 42, type: "private" } },
-    };
-    expect(await ui.handleMessage(message)).toBe(true);
-    expect(responses).toEqual([{ type: "extension_ui_response", id: "input", value: "the answer" }]);
+    await ui.handle({ type: "extension_ui_request", id: "editor", method: "editor", title: "Edit", prefill: "before" });
+    await settle();
+
+    expect(presentations.map((presentation) => presentation.request)).toEqual([
+      { type: "select", title: "Choose", options: [{ value: "one", label: "one", description: "first" }, { value: "two", label: "two" }] },
+      { type: "confirm", title: "Continue", message: "Proceed?" },
+      { type: "input", title: "Value", prompt: "Type it", placeholder: "Type it" },
+      { type: "editor", title: "Edit", initialValue: "before" },
+    ]);
+    expect(presentations.every((presentation) => presentation.address === address && presentation.context === deliveryContext)).toBe(true);
+    expect(responses).toEqual([
+      { type: "extension_ui_response", id: "select", value: "one" },
+      { type: "extension_ui_response", id: "confirm", confirmed: true },
+      { type: "extension_ui_response", id: "input", value: "typed" },
+      { type: "extension_ui_response", id: "editor", value: "edited" },
+    ]);
   });
 
-  test("supports multi-select questions for host tools", async () => {
+  test("converts every display RPC UI method to a typed gateway UI request", async () => {
     const ui = broker();
-    const answer = ui.ask({ title: "Select", message: "Pick", options: ["A", "B"], multi: true });
-    await messageSent.promise;
-    await ui.handleCallback(callback(callbackData(0, 0)));
-    await ui.handleCallback(callback(callbackData(2, 0)));
-    expect(await answer).toEqual(["A"]);
+
+    await ui.handle({ type: "extension_ui_request", id: "notify", method: "notify", message: "Saved", notifyType: "warning" });
+    await ui.handle({ type: "extension_ui_request", id: "status", method: "setStatus", statusKey: "mode", statusText: "working" });
+    await ui.handle({ type: "extension_ui_request", id: "widget", method: "setWidget", widgetKey: "queue", widgetLines: ["one", "two"], widgetPlacement: "belowEditor" });
+    await ui.handle({ type: "extension_ui_request", id: "title", method: "setTitle", title: "Focused" });
+    await ui.handle({ type: "extension_ui_request", id: "editor-text", method: "set_editor_text", text: "suggestion" });
+    await ui.handle({ type: "extension_ui_request", id: "open", method: "open_url", url: "https://example.test", launchUrl: "https://secure.example.test", instructions: "Authenticate" });
+    await settle();
+
+    expect(presentations.map((presentation) => presentation.request)).toEqual([
+      { type: "notify", message: "Saved", level: "warning" },
+      { type: "status", key: "mode", text: "working" },
+      { type: "widget", key: "queue", lines: ["one", "two"], placement: "belowEditor" },
+      { type: "title", title: "Focused" },
+      { type: "editor_text", text: "suggestion" },
+      { type: "open_url", url: "https://secure.example.test", label: "Authenticate" },
+    ]);
+    expect(ui.statusText()).toContain("Surface: Focused\nmode: working\nqueue: one | two\nSuggested input: suggestion");
+    expect(responses).toEqual([]);
   });
 
-  test("removes a host-tool question when the RPC call is cancelled", async () => {
+  test("cancels an in-flight presentation and reports RPC cancellation", async () => {
     const ui = broker();
-    const controller = new AbortController();
-    const answer = ui.ask({ title: "Select", message: "Pick", options: ["A", "B"] }, controller.signal);
-    await messageSent.promise;
-    const staleCallback = callbackData(0, 0);
-    controller.abort();
-    expect(await answer).toBeUndefined();
-    expect(calls.some((call) => call.method === "editMessageReplyMarkup")).toBe(true);
-    await ui.handleCallback(callback(staleCallback));
-    expect(calls.at(-1)).toMatchObject({
-      method: "answerCallbackQuery",
-      payload: { text: "This control has expired.", show_alert: true },
-    });
-  });
-
-  test("aborts a host-tool question while Telegram sendMessage is in flight", async () => {
     const started = Promise.withResolvers<void>();
-    let sendSignal: AbortSignal | undefined;
-    const callTelegram: TelegramCall = async <T>(
-      method: string,
-      payload: Record<string, unknown>,
-      options?: { signal?: AbortSignal },
-    ): Promise<T> => {
-      calls.push({ method, payload });
-      if (method !== "sendMessage") return {} as T;
-      sendSignal = options?.signal;
+    let presentationSignal: AbortSignal | undefined;
+    present = async <Request extends UiRequest>(_request: Request, signal?: AbortSignal): Promise<UiResponseFor<Request>> => {
+      presentationSignal = signal;
       started.resolve();
-      return await new Promise<T>((_resolve, reject) => {
-        options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+      return await new Promise<UiResponseFor<Request>>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
       });
     };
-    const ui = new RpcUiBroker({
-      callTelegram,
-      sendResponse: (response) => responses.push(response),
-      getTarget: () => target,
-      fallbackTarget: () => undefined,
-      isAuthorized: (candidate) => candidate.chatId === "42" && candidate.responderId === "42",
-      log: { warn: () => {} },
-    });
-    const controller = new AbortController();
-    const answer = ui.ask({ title: "Select", message: "Pick", options: ["A", "B"] }, controller.signal);
+
+    await ui.handle({ type: "extension_ui_request", id: "pending", method: "input", title: "Input" });
     await started.promise;
-    controller.abort();
-    expect(await answer).toBeUndefined();
-    expect(sendSignal?.aborted).toBe(true);
-    expect(calls.map((call) => call.method)).toEqual(["sendMessage"]);
+    await ui.handle({ type: "extension_ui_request", id: "cancel", method: "cancel", targetId: "pending" });
+    await settle();
+
+    expect(presentationSignal?.aborted).toBe(true);
+    expect(responses).toEqual([{ type: "extension_ui_response", id: "pending", cancelled: true }]);
   });
 });

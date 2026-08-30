@@ -1,278 +1,142 @@
-# omp-telegram
+# omp-gateway
 
-Use Telegram to chat with your omp sessions and start new ones from your phone.
+[![CI](https://github.com/wolfiesch/omp-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/wolfiesch/omp-gateway/actions/workflows/ci.yml?query=branch%3Amain)
+[![npm package](https://img.shields.io/badge/npm-omp--gateway-CB3837?logo=npm)](https://www.npmjs.com/package/omp-gateway)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Each top-level omp session gets its own Telegram topic; task subagents stay in
-their parent session's topic. A separate **omp control** topic is where you run
-commands like `/spawn`, `/sessions`, `/cleanup`, and `/status`.
+**Status: Alpha.** `omp-gateway` is a Bun package for operators who need one persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) 17+ session reachable through Telegram and authenticated WebSocket clients. It deliberately has one session owner and one state writer, rather than creating separate agent processes for each chat or client.
 
-## Choose a runtime
+Use it when a single trusted operator needs remote access to an OMP workspace without placing transport credentials in OMP configuration or handing clients an OMP process directly. Telegram and WebSocket are adapters around the same authenticated session. HTTP is health-only.
 
-`omp-telegram` has two supported runtime shapes:
+- **Package:** [`omp-gateway`](https://www.npmjs.com/package/omp-gateway) `0.1.0`
+- **Repository:** [`wolfiesch/omp-gateway`](https://github.com/wolfiesch/omp-gateway)
+- **License:** [MIT](LICENSE)
+- **Upstream provenance:** [TerrifiedBug/omp-telegram](https://github.com/TerrifiedBug/omp-telegram), preserved in [NOTICE](NOTICE)
 
-| Runtime | Best for |
-| --- | --- |
-| OMP extension | Mirroring terminal sessions, one Telegram topic per session, and herdr fleet control |
-| Standalone RPC service | One persistent, fully remote OMP session with approvals, input, commands, files, and exact-session resume |
+## User quickstart
 
-The extension setup follows below. For a Hermes-style personal agent that stays
-online without a terminal, jump to [Standalone OMP RPC service](#standalone-omp-rpc-service).
+### Prerequisites
 
+- [Bun](https://bun.sh/)
+- `omp` 17.0.0 or newer, authenticated for the provider you intend to use
+- A Telegram bot token if Telegram is enabled
 
-## What you need
-
-- [omp](https://github.com/can1357/oh-my-pi) 17.0.0 or newer
-- [Bun](https://bun.sh/) 1.3 or newer
-- A Telegram bot from [@BotFather](https://t.me/BotFather)
-- [herdr](https://herdr.dev/) for `/spawn`, `/sessions`, and stale-topic auto-resume
-
-Regular Telegram chat works without herdr.
-
-## 1. Install
+Install the package:
 
 ```bash
-omp plugin install omp-telegram
+bun add --global omp-gateway
+omp-gateway --help
 ```
 
-There is no build step and no runtime dependency install.
-
-## 2. Create your Telegram bot
-
-1. Open [@BotFather](https://t.me/BotFather).
-2. Send `/newbot` and follow the prompts.
-3. Copy the bot token.
-4. In **Bot Settings**, enable topics for private chats, and turn **off**
-   "allow users to create topics". The bot creates one topic per omp session
-   itself; leaving user creation on means a command like `/spawn` typed outside
-   an existing topic makes Telegram spin up a throwaway topic to hold it. If it
-   is left on, `/status` and `/telegram doctor` flag it.
-
-## 3. Start the bridge
-
-Open omp and run:
-
-```text
-/telegram token <your-bot-token>
-/telegram on
-```
-
-`/telegram on` keeps the bridge enabled for future omp sessions.
-
-With owner-DM topics enabled and no groups configured, `/telegram on` also
-starts a laptop-wide Bun daemon. It keeps polling when every omp session is
-closed, so a message to a saved session topic can resume that session. Other
-configurations use a live omp session as the poller.
-
-## 4. Pair your Telegram account
-
-1. Send any normal message to your new bot.
-2. The bot replies with a short pairing code.
-3. Back in omp, run:
-
-```text
-/telegram pair <code>
-```
-
-Only one Telegram account can own the bridge.
-
-## 5. Turn on session topics
-
-In omp, run:
-
-```text
-/telegram topics on
-```
-
-The bot creates:
-
-- **omp control** — bridge commands live here.
-- One topic for each omp session — chat with that session here.
-
-Restart any omp sessions that were already running before you enabled topics so
-they can claim their own topic.
-
-Topics persist and are re-adopted on restart. To tidy them automatically instead,
-run `/telegram topics tidy on` — each session's topic is deleted (DM host) or
-closed and reopened on re-adoption (group host) when it exits. Sweep leftovers from
-crashed sessions with `/cleanup`.
-
-Messages inside a session topic still route to that topic's session. A private
-DM outside a topic goes to a persisted DM-owner session. The first enabled
-session claims ownership, and a resumed session reclaims it by session file.
-Run `/telegram own [status|clear]` to manage the owner. Set
-`OMP_TELEGRAM_DM_OWNER=1` in a fleet or conductor session to force its claim at
-each start. If the saved owner is not running, the bot refuses the DM and names
-the required recovery action.
-
-## Use it
-
-Inside **omp control**:
-
-```text
-/spawn                         Choose a herdr space and start another omp session
-/spawn new <branch> [space]    Create a worktree from a space and start omp
-/spawn dir <absolute-path>     Create a herdr workspace and start omp
-/sessions                      See live, unattached, and stale sessions
-/cleanup                       Preview exited-session topics, then tap to delete (DM) or close (group); /cleanup go skips the tap
-/status                        Check the bridge
-/help                          Show Telegram commands
-```
-
-Inside an omp session topic:
-
-- Send a normal message to talk to that session.
-- Use `/stop` to stop its current task.
-- Use `/compact [focus]` to compact that session's context.
-- Use `/model` and `/thinking` to change that session with inline pickers.
-- When omp needs a choice, the bot shows single-select, multi-select, and **Other**
-  controls directly in Telegram.
-- When omp waits more than two seconds for tool approval, the bot pings the
-  active session topic. Approval still happens at the terminal.
-- Send photos or files as normal Telegram attachments.
-- Voice notes are saved as attachments. To append a local transcript to the
-  agent prompt, configure a no-shell argv template:
-
-  ```text
-  /telegram set transcribeCommand ["whisper-cli","-f","{file}"]
-  ```
-- If its omp process was closed, send a normal message to queue it and resume
-  the exact saved session in its original herdr space.
-
-Replies stream back while omp is working (unless the host is configured as a
-headless daemon — see below).
-
-## Standalone OMP RPC service
-
-The standalone service owns one persistent OMP process through its versioned
-JSONL RPC interface. It streams assistant replies, presents OMP confirmations
-and questions as authenticated Telegram controls, resumes the exact session
-after a restart, exposes session/model/queue/subagent commands, and supervises
-the child process.
-
-Install the command:
+Create a token-free JSON configuration. Run the command from the OMP workspace you want the gateway to use, or replace the example workspace path with an absolute path.
 
 ```bash
-bun add --global omp-telegram
+mkdir -p ~/.config/omp-gateway
+cat > ~/.config/omp-gateway/config.json <<'JSON'
+{
+  "workspace": "~/path/to/workspace",
+  "stateDir": "~/.omp/agent/gateway",
+  "profile": "gateway",
+  "omp": {
+    "command": "omp",
+    "autoRestart": true
+  },
+  "transports": {
+    "telegram": {
+      "enabled": true,
+      "account": "default",
+      "tokenEnv": "TELEGRAM_BOT_TOKEN"
+    },
+    "websocket": {
+      "enabled": true,
+      "hostname": "127.0.0.1",
+      "port": 8787,
+      "account": "local",
+      "credentials": [
+        {
+          "tokenEnv": "OMP_GATEWAY_WS_TOKEN",
+          "subject": "local-operator",
+          "channel": "local"
+        }
+      ]
+    }
+  }
+}
+JSON
 ```
 
-Create a mode-`0600` environment file containing the bot token and your immutable
-numeric Telegram user ID:
-
-```dotenv
-TELEGRAM_BOT_TOKEN=123456:replace-me
-TELEGRAM_ALLOWED_USERS=123456789
-```
-
-Validate both Telegram and OMP RPC without invoking a model:
+Put token values only in a private environment file. The values below are placeholders, not usable credentials.
 
 ```bash
-omp-telegram-rpc doctor \
-  --env-file ~/.config/omp-telegram/rpc.env \
-  --cwd ~/Projects \
-  --profile telegram \
-  --inherit-harness
+cat > ~/.config/omp-gateway/gateway.env <<'ENV'
+TELEGRAM_BOT_TOKEN=replace-with-telegram-bot-token
+OMP_GATEWAY_WS_TOKEN=replace-with-a-long-random-websocket-token
+ENV
+chmod 600 ~/.config/omp-gateway/gateway.env
 ```
 
-Then install a launchd user agent on macOS or a systemd user service on Linux:
+Authorize the Telegram operator and the example local WebSocket identity. Set `TELEGRAM_USER_ID` to the numeric ID of the person you intend to authorize.
 
 ```bash
-omp-telegram-rpc service-install \
-  --env-file ~/.config/omp-telegram/rpc.env \
-  --cwd ~/Projects \
-  --profile telegram \
-  --inherit-harness
+TELEGRAM_USER_ID=123456789
+omp-gateway telegram-allow "$TELEGRAM_USER_ID" \
+  --config ~/.config/omp-gateway/config.json
+omp-gateway principal-add local-operator \
+  --config ~/.config/omp-gateway/config.json
+omp-gateway identity-bind websocket local local-operator local-operator \
+  --config ~/.config/omp-gateway/config.json
 ```
 
-`--inherit-harness` seeds the isolated profile with the default profile's
-skills, rules, agents, commands, documentation, helper binaries, configuration,
-and MCP definitions. It does not inherit hooks or extensions, and it never
-copies `.env`, credentials, runtime databases, sessions, or blobs. Omit it for a
-blank profile, then configure only the capabilities the remote session should
-have.
+The first command prints `Telegram user allowed as telegram:default:<numeric-user-id>`. The identity commands print the updated principal and binding.
 
-If the copied OMP configuration uses an auth broker, add
-`--auth-broker-token-file ~/.omp/auth-broker.token`. The bridge reads that
-owner-only file directly into the OMP child environment without copying it into
-the Telegram profile or service definition.
+Validate credentials, the SQLite store, Telegram reachability, and a short OMP RPC session before starting the gateway:
 
-Use a separate Telegram bot token for every poller. Stop the extension daemon,
-Hermes gateway, or any other `getUpdates` consumer before starting the RPC
-service with the same token. Telegram permits only one long poller per bot.
+```bash
+omp-gateway doctor \
+  --config ~/.config/omp-gateway/config.json \
+  --env-file ~/.config/omp-gateway/gateway.env
+```
 
-See [the standalone RPC guide](docs/rpc-service.md) for the complete command
-surface, security model, state layout, supervision details, and manual run mode.
-
-## Away mode (answer local runs from your phone)
-
-Runs you start at the terminal don't touch Telegram by default. When you're
-stepping away, flip **away mode** so those runs reach your phone:
-
-- `/away` — quick toggle. Run it, then kick off your work and walk away; it
-  auto-clears when you next type a prompt at the terminal (or run it again).
-- While away, any `ask` the agent raises is shown on **both** your terminal and
-  Telegram at once — answer wherever you are, first one wins. Idle-completion
-  pings go to Telegram too.
-- Pick the destination once with `/telegram notify <chat_id>` (or turn on
-  per-session `/telegram topics`). `/telegram notify away | always | off` is the
-  full surface; `always` is the standing "mirror even at my desk" mode.
-
-## Headless hosts
-
-On a machine nobody sits at — a scheduler, or a fleet orchestrator whose runs are
-cron ticks — the laptop defaults are backwards: every turn of a long task arrives
-as its own message, and each run's closing text gets posted when it goes idle.
-One key switches all of that:
+When Telegram is enabled, successful output includes the bot identity, `Webhook: none (...)`, the OMP RPC protocol and session, and ends with:
 
 ```text
-/telegram set profile daemon
+Doctor: ready
 ```
 
-Assistant text then never auto-relays: it reaches Telegram only when the agent
-calls `telegram_send` or `telegram_ask`, so an answer is one message and internal
-working text stays on the host. `telegram_ask` is also kept mounted and pointed at
-you on every turn, including scheduled ones, so a run that needs a decision can
-always reach you. Tool-approval and blocked-input pings still fire — those mean
-something needs a human. `/telegram status` shows the profile and the output mode
-actually in force.
-
-## If something looks wrong
-
-- Start with `/telegram doctor`. It checks token validity, webhook conflicts,
-  daemon and poll-lock state, state-file permissions, optional binaries, and
-  herdr reachability without printing the bot token.
-- **No omp control topic:** enable private-chat topics in BotFather, then run
-  `/telegram daemon restart`.
-- **`/spawn` says herdr is unavailable:** run omp inside a herdr-managed pane;
-  `/spawn dir` can create a workspace from any existing herdr session.
-- **A running session has no topic:** restart that omp session, then check
-  `/sessions` again.
-- **A stale topic will not resume:** legacy topics and sessions started outside
-  herdr must be resumed locally once to record their session and herdr identity.
-- **The bot stops responding:** run `/telegram doctor`, then
-  `/telegram daemon restart`. A session poller takes over when the daemon is
-  disabled or unavailable.
-
-## Security
-
-Treat every permitted Telegram sender as an omp user with the session's normal
-workspace and tool access. Only configure trusted groups, prefer group sender
-allowlists, and never use `--no-mention` in a public or untrusted group.
-
-Downloaded attachments are limited to 20 MiB each, expire after 7 days, and are
-pruned oldest-first when the inbox exceeds 250 MiB.
-
-Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
-
-## More
-
-The full command reference, group setup, security model, state files, streaming
-behavior, and design notes are in the **[complete guide](docs/guide.md)**.
-
-Architecture decisions live in [`docs/adr/`](docs/adr/).
-
-## Development
+Start the foreground gateway:
 
 ```bash
-bun install
-bun run check
+omp-gateway run \
+  --config ~/.config/omp-gateway/config.json \
+  --env-file ~/.config/omp-gateway/gateway.env
 ```
+
+The process owns the OMP session until it receives `SIGINT` or `SIGTERM`. Telegram starts long polling. The WebSocket endpoint accepts authenticated connections at `ws://127.0.0.1:8787/`; `GET /healthz` returns `{"status":"ok"}`.
+
+To install it as a user service instead, use the same validated files:
+
+```bash
+omp-gateway service-install \
+  --config ~/.config/omp-gateway/config.json \
+  --env-file ~/.config/omp-gateway/gateway.env
+```
+
+The command reports `Installed and started <manager> service: <path>`. It installs launchd label `com.omp.gateway` on macOS or user systemd unit `omp-gateway.service` on Linux.
+
+## What the gateway provides
+
+- One authenticated OMP RPC session with streamed assistant updates and a final response routed only to the active authenticated conversation.
+- OMP commands for steering, follow-up, abort, models, thinking, session controls, queue policy, compaction, retries, subagents, history, branching, exports, and login.
+- Telegram long polling with durable update checkpoints, message editing, buttons, file intake, reactions, topics, and interactive OMP UI.
+- An authenticated versioned WebSocket protocol with client identity and conversation address derived from configured credential metadata, not client-supplied fields.
+- SQLite-backed principals, transport identities, conversation bindings, OMP session checkpointing, inbound deduplication, UI state, and legacy Telegram migration markers.
+
+Read the [operator guide](docs/guide.md) for configuration, migration, operations, and security boundaries. Read the [RPC and transport reference](docs/rpc-service.md) for the command and protocol matrix.
+
+## Contributors
+
+Package installation above is for operators. Source checkout, development conventions, and verification commands are intentionally separate in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License and notice
+
+`omp-gateway` is MIT licensed. It includes and adapts work from TerrifiedBug's MIT-licensed `omp-telegram`; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
