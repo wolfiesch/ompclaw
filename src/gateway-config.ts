@@ -45,6 +45,22 @@ export interface GatewayWebSocketConfig {
   readonly credentials: readonly GatewayWebSocketCredentialConfig[];
 }
 
+export interface GatewayAutomationConfig {
+  readonly enabled: boolean;
+  readonly pollIntervalMs: number;
+  readonly retryDelayMs: number;
+  readonly maxAttempts: number;
+}
+
+export type GatewayMemoryModel = "online" | "qwen3-1.7b" | "llama3.2:3b" | "gemma-3-1b" | "qwen2.5-1.5b" | "lfm2-1.2b";
+
+export interface GatewayLearningConfig {
+  readonly enabled: boolean;
+  readonly autoCapture: boolean;
+  readonly minToolCalls: number;
+  readonly memoryModel: GatewayMemoryModel;
+}
+
 export interface GatewayConfig {
   readonly workspace: string;
   readonly stateDir: string;
@@ -54,6 +70,8 @@ export interface GatewayConfig {
     readonly telegram?: GatewayTelegramConfig;
     readonly websocket?: GatewayWebSocketConfig;
   };
+  readonly automation: GatewayAutomationConfig;
+  readonly learning: GatewayLearningConfig;
 }
 
 export interface GatewaySecrets {
@@ -104,7 +122,7 @@ export function loadGatewayConfig(options: LoadGatewayConfigOptions = {}): Gatew
 /** Parse a JSON value for callers that already bound file loading. */
 export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()): GatewayConfig {
   const root = object(value, "Gateway config");
-  rejectUnknown(root, ["workspace", "stateDir", "profile", "omp", "transports"], "Gateway config");
+  rejectUnknown(root, ["workspace", "stateDir", "profile", "omp", "transports", "automation", "learning"], "Gateway config");
 
   const workspace = root.workspace === undefined ? resolve(cwd) : expandGatewayPath(string(root.workspace, "workspace"), cwd);
   const stateDir = root.stateDir === undefined
@@ -113,8 +131,10 @@ export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()):
   const profile = root.profile === undefined ? "gateway" : identifier(root.profile, "profile");
   const omp = parseOmp(root.omp, cwd);
   const transports = parseTransports(root.transports);
+  const automation = parseAutomation(root.automation);
+  const learning = parseLearning(root.learning);
 
-  return { workspace, stateDir, profile, omp, transports };
+  return { workspace, stateDir, profile, omp, transports, automation, learning };
 }
 
 /** Resolve only the env names carried by config, keeping token values out of it. */
@@ -255,6 +275,38 @@ function parseWebSocket(value: unknown): GatewayWebSocketConfig {
   };
 }
 
+function parseAutomation(value: unknown): GatewayAutomationConfig {
+  if (value === undefined) {
+    return { enabled: false, pollIntervalMs: 1_000, retryDelayMs: 15_000, maxAttempts: 3 };
+  }
+  const automation = object(value, "automation");
+  rejectUnknown(automation, ["enabled", "pollIntervalMs", "retryDelayMs", "maxAttempts"], "automation");
+  return {
+    enabled: boolean(automation.enabled, "automation.enabled", false),
+    pollIntervalMs: integer(automation.pollIntervalMs, "automation.pollIntervalMs", 250, 60_000, 1_000),
+    retryDelayMs: integer(automation.retryDelayMs, "automation.retryDelayMs", 1_000, 3_600_000, 15_000),
+    maxAttempts: integer(automation.maxAttempts, "automation.maxAttempts", 1, 10, 3),
+  };
+}
+
+function parseLearning(value: unknown): GatewayLearningConfig {
+  if (value === undefined) {
+    return { enabled: false, autoCapture: false, minToolCalls: 5, memoryModel: "online" };
+  }
+  const learning = object(value, "learning");
+  rejectUnknown(learning, ["enabled", "autoCapture", "minToolCalls", "memoryModel"], "learning");
+  const memoryModel = learning.memoryModel === undefined ? "online" : nonEmptyString(learning.memoryModel, "learning.memoryModel");
+  if (!["online", "qwen3-1.7b", "llama3.2:3b", "gemma-3-1b", "qwen2.5-1.5b", "lfm2-1.2b"].includes(memoryModel)) {
+    throw new Error("learning.memoryModel is not a supported OMP memory model");
+  }
+  return {
+    enabled: boolean(learning.enabled, "learning.enabled", false),
+    autoCapture: boolean(learning.autoCapture, "learning.autoCapture", false),
+    minToolCalls: integer(learning.minToolCalls, "learning.minToolCalls", 1, 100, 5),
+    memoryModel: memoryModel as GatewayMemoryModel,
+  };
+}
+
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!isRecord(value) || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value;
@@ -299,6 +351,14 @@ function identifier(value: unknown, label: string): string {
 function boolean(value: unknown, label: string, defaultValue?: boolean): boolean {
   if (value === undefined && defaultValue !== undefined) return defaultValue;
   if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
+  return value;
+}
+
+function integer(value: unknown, label: string, minimum: number, maximum: number, defaultValue: number): number {
+  if (value === undefined) return defaultValue;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${label} must be an integer between ${minimum} and ${maximum}`);
+  }
   return value;
 }
 

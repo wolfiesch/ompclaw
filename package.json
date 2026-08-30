@@ -1,6 +1,6 @@
 {
   "name": "omp-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Authenticated OMP gateway for Telegram and WebSocket clients",
   "type": "module",
   "license": "MIT",
@@ -43,6 +43,7 @@
     "src/gateway-config.ts",
     "src/gateway-core.ts",
     "src/gateway-store.ts",
+    "src/gateway-scheduler.ts",
     "src/gateway-tools.ts",
     "src/gateway-types.ts",
     "src/rpc-cli.ts",
@@ -84,5 +85,8 @@
   },
   "overrides": {
     "@opentelemetry/core": "2.8.0"
+  },
+  "dependencies": {
+    "croner": "10.0.1"
   }
 }

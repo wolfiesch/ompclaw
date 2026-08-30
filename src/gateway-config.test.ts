@@ -25,6 +25,43 @@ describe("gateway config", () => {
     expect(expandGatewayPath("~/state", "/workspace/current")).toMatch(/state$/);
   });
 
+  test("keeps unattended automation opt-in and validates bounded runtime controls", () => {
+    expect(parseGatewayConfig({}).automation).toEqual({
+      enabled: false,
+      pollIntervalMs: 1_000,
+      retryDelayMs: 15_000,
+      maxAttempts: 3,
+    });
+    expect(parseGatewayConfig({
+      automation: { enabled: true, pollIntervalMs: 2_000, retryDelayMs: 30_000, maxAttempts: 5 },
+    }).automation).toEqual({
+      enabled: true,
+      pollIntervalMs: 2_000,
+      retryDelayMs: 30_000,
+      maxAttempts: 5,
+    });
+    expect(() => parseGatewayConfig({ automation: { enabled: true, maxAttempts: 11 } })).toThrow("between 1 and 10");
+    expect(() => parseGatewayConfig({ automation: { enabled: true, unknown: true } })).toThrow("unknown key unknown");
+  });
+
+  test("keeps experimental learning opt-in with an explicit memory model", () => {
+    expect(parseGatewayConfig({}).learning).toEqual({
+      enabled: false,
+      autoCapture: false,
+      minToolCalls: 5,
+      memoryModel: "online",
+    });
+    expect(parseGatewayConfig({
+      learning: { enabled: true, autoCapture: true, minToolCalls: 9, memoryModel: "lfm2-1.2b" },
+    }).learning).toEqual({
+      enabled: true,
+      autoCapture: true,
+      minToolCalls: 9,
+      memoryModel: "lfm2-1.2b",
+    });
+    expect(() => parseGatewayConfig({ learning: { enabled: true, memoryModel: "unknown" } })).toThrow("supported OMP memory model");
+  });
+
   test("rejects unknown keys and literal transport tokens", () => {
     expect(() => parseGatewayConfig({ unexpected: true })).toThrow("unknown key unexpected");
     expect(() => parseGatewayConfig({

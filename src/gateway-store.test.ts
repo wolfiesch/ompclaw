@@ -285,6 +285,55 @@ describe("GatewayStore", () => {
     reopened.close();
   });
 
+  test("persists and scopes durable scheduled jobs across restart", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    first.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    first.upsertPrincipal({ id: "operator-7", roles: ["operator"] });
+    first.createScheduledJob({
+      id: "job-42",
+      principalId: "operator-42",
+      identity: telegramOwner,
+      address: ownerAddress,
+      name: "daily summary",
+      prompt: "Summarize the latest work.",
+      schedule: { kind: "cron", expression: "0 9 * * *", timezone: "America/Los_Angeles" },
+      enabled: true,
+      nextRunAt: 1_800_000_000_000,
+      attemptCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_000,
+    });
+    expect(first.listDueScheduledJobs(1_799_999_999_999)).toEqual([]);
+    first.close();
+
+    const restarted = new GatewayStore(path);
+    expect(restarted.getScheduledJob("job-42", "operator-7")).toBeUndefined();
+    expect(restarted.listScheduledJobs("operator-42")).toEqual([
+      expect.objectContaining({
+        id: "job-42",
+        identity: telegramOwner,
+        address: ownerAddress,
+        schedule: { kind: "cron", expression: "0 9 * * *", timezone: "America/Los_Angeles" },
+      }),
+    ]);
+    expect(restarted.listDueScheduledJobs(1_800_000_000_000).map((job) => job.id)).toEqual(["job-42"]);
+    const job = restarted.getScheduledJob("job-42", "operator-42")!;
+    expect(restarted.updateScheduledJob({
+      ...job,
+      enabled: false,
+      successCount: 1,
+      lastRunAt: 1_800_000_000_000,
+      updatedAt: 1_800_000_000_001,
+    })).toBe(true);
+    expect(restarted.listDueScheduledJobs(1_900_000_000_000)).toEqual([]);
+    expect(restarted.deleteScheduledJob("job-42", "operator-7")).toBe(false);
+    expect(restarted.deleteScheduledJob("job-42", "operator-42")).toBe(true);
+    restarted.close();
+  });
+
   test("imports legacy Telegram state once without ingesting a token or changing the source files", () => {
     const databasePath = temporaryDatabase();
     const directory = dirname(databasePath);

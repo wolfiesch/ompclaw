@@ -204,6 +204,12 @@ export class RpcGatewayUiBroker {
   }
 
   #logMissingTarget(request: Exclude<RpcExtensionUiRequest, { method: "cancel" }>): void {
+    if (
+      request.method === "setStatus"
+      || request.method === "setWidget"
+      || request.method === "setTitle"
+      || request.method === "set_editor_text"
+    ) return;
     this.#options.log.warn(`[gateway rpc] Cannot present ${request.method}: no active delivery context`);
     if (request.method === "select" || request.method === "confirm" || request.method === "input" || request.method === "editor") {
       this.#options.sendResponse({ type: "extension_ui_response", id: request.id, cancelled: true });

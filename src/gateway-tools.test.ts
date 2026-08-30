@@ -15,6 +15,7 @@ import {
   type GatewayHostToolContext,
 } from "./gateway-tools";
 import type { RpcHostToolCall } from "./rpc-protocol";
+import type { GatewayAutomationControl } from "./gateway-scheduler";
 
 const address: ConversationAddress = {
   transport: "test",
@@ -27,6 +28,7 @@ const deliveryContext: DeliveryContext = {
   origin: address,
 };
 const sentReceipt: OutboundReceipt = { transport: "test", messageId: "outbound-1" };
+const identity = { transport: "test", account: "account-1", subject: "operator-1" } as const;
 
 interface DeliveryInvocation {
   readonly method: "send" | "react" | "presentUi";
@@ -49,7 +51,7 @@ function hostToolCall(toolName: string, arguments_: unknown): RpcHostToolCall {
   };
 }
 
-function harness(initialUiResponse: UiResponse = { type: "input", cancelled: false, value: "typed answer" }): {
+function harness(initialUiResponse: UiResponse = { type: "input", cancelled: false, value: "typed answer" }, automation?: GatewayAutomationControl): {
   readonly context: GatewayHostToolContext;
   readonly invocations: DeliveryInvocation[];
   setUiResponse(response: UiResponse): void;
@@ -73,7 +75,7 @@ function harness(initialUiResponse: UiResponse = { type: "input", cancelled: fal
     },
   };
   return {
-    context: { delivery, address, deliveryContext },
+    context: { delivery, address, deliveryContext, identity, ...(automation === undefined ? {} : { automation }) },
     invocations,
     setUiResponse(response) {
       uiResponse = response;
@@ -99,6 +101,20 @@ describe("gateway host tools", () => {
         expect(parameters.properties).not.toHaveProperty(routingArgument);
       }
     }
+  });
+
+  test("advertises automation tools only when durable scheduling is enabled", () => {
+    expect(gatewayHostToolDefinitions(true).map((definition) => definition.name)).toEqual([
+      "gateway_send",
+      "gateway_react",
+      "gateway_ask",
+      "gateway_schedule_job",
+      "gateway_update_job",
+      "gateway_list_jobs",
+      "gateway_set_job_enabled",
+      "gateway_delete_job",
+      "gateway_run_job",
+    ]);
   });
 
   test("sends text and absolute local files as file URL attachments", async () => {
@@ -202,6 +218,63 @@ describe("gateway host tools", () => {
       multiSelect: true,
     });
     expectDeliveryContext(multiInvocation, multiSignal);
+  });
+
+  test("binds scheduled jobs to the server-derived principal, identity, and conversation", async () => {
+    let capturedContext: Parameters<GatewayAutomationControl["create"]>[1] | undefined;
+    const job = {
+      id: "job-1",
+      principalId: deliveryContext.principal.id,
+      identity,
+      address,
+      name: "daily report",
+      prompt: "Summarize work",
+      schedule: { kind: "cron", expression: "0 9 * * *", timezone: "UTC" } as const,
+      enabled: true,
+      nextRunAt: Date.parse("2026-08-31T09:00:00Z"),
+      attemptCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      createdAt: Date.parse("2026-08-30T12:00:00Z"),
+      updatedAt: Date.parse("2026-08-30T12:00:00Z"),
+    };
+    const automation: GatewayAutomationControl = {
+      create(_input, context) {
+        capturedContext = context;
+        return job;
+      },
+      update() {
+        return job;
+      },
+      remove(id, principalId) {
+        return id === job.id && principalId === deliveryContext.principal.id;
+      },
+      setEnabled() {
+        return job;
+      },
+      runNow() {
+        return job;
+      },
+      list(principalId) {
+        return principalId === deliveryContext.principal.id ? [job] : [];
+      },
+    };
+    const { context } = harness(undefined, automation);
+
+    await expect(executeGatewayHostTool(
+      hostToolCall("gateway_schedule_job", {
+        name: "daily report",
+        prompt: "Summarize work",
+        cron: "0 9 * * *",
+        timezone: "UTC",
+      }),
+      context,
+    )).resolves.toEqual({ job: expect.stringContaining("daily report") });
+    expect(capturedContext).toEqual({ principal: deliveryContext.principal, identity, address });
+    await expect(executeGatewayHostTool(hostToolCall("gateway_list_jobs", {}), context)).resolves.toEqual({
+      jobs: [expect.stringContaining("job-1")],
+    });
+    await expect(executeGatewayHostTool(hostToolCall("gateway_delete_job", { id: "job-1" }), context)).resolves.toEqual({ deleted: true });
   });
 
   test("rejects unknown and malformed arguments before invoking delivery", async () => {

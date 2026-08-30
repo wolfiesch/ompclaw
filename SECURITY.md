@@ -29,7 +29,7 @@ The gateway is designed for one trusted operator environment:
 - Telegram sender identity is obtained from the Telegram update. WebSocket identity and conversation address are derived from the configured credential, never from client message fields.
 - A live WebSocket connection is limited to one configured conversation origin. Gateway delivery is constrained to the active principal and origin.
 - The JSON configuration contains paths and environment-variable names, not token values. Transport-secret environment variables are removed before the OMP child starts.
-- The gateway locks its state directory so a second gateway process cannot become another state writer. The Telegram adapter separately locks one polling account.
+- The gateway locks its state directory so a second gateway process cannot become another state writer. The Telegram adapter separately locks one polling account. Durable automation remains scoped to the principal and conversation derived when the job was created.
 
 The gateway does **not** make an OMP workspace safe for untrusted operators. An authorized principal can cause prompts to be processed by OMP with the authority of the configured OMP profile, workspace, tools, and provider credentials. Treat granting a Telegram allowance or binding a WebSocket identity as granting access to that environment.
 
@@ -44,13 +44,15 @@ The gateway does not defend against a compromised host, another process running 
 5. Allow only the specific Telegram user IDs that should operate the session. Keep Telegram in long-polling mode and resolve any configured webhook before starting the gateway. `doctor` checks for this conflict.
 6. Keep one gateway process and one Telegram poller per bot token. Do not share the state directory, token, or SQLite file among instances.
 7. Leave `omp.allowRpcBash` disabled unless the operator has deliberately accepted the authority granted to OMP RPC bash commands.
-8. Keep Bun, OMP, the gateway, operating system, and any reverse proxy current with their security updates.
+8. Treat unattended scheduled prompts as standing authorization to use the configured OMP environment. Make prompts with external side effects idempotent, pause jobs that no longer need to run, and remove obsolete jobs.
+9. Leave experimental learning disabled unless the operator accepts automatic provider use and gateway-profile managed-skill mutation. Review learned skills before using them in consequential automation.
+10. Keep Bun, OMP, the gateway, operating system, and any reverse proxy current with their security updates.
 
 ## Secret handling
 
 - Put Telegram and WebSocket token values in a separate environment file passed with `--env-file`; use only variable names in the JSON configuration.
 - The environment file must be a regular file, owned by the current user, with mode `0600` or stricter on supported Unix systems. Do not commit it, upload it, or paste it into issue reports.
-- The SQLite database stores principals, bindings, checkpoints, deduplication records, and pending UI metadata. It is created with private permissions. Treat its containing state directory and database backups as sensitive.
+- The SQLite database stores principals, bindings, checkpoints, deduplication records, pending UI metadata, and durable job prompts and outcomes. Experimental learning also writes gateway-private memory data and managed skills. Treat the state directory and every backup as sensitive.
 - Do not put provider tokens, bot tokens, WebSocket tokens, session exports, or private attachment files in source control, service definitions, shell history, screenshots, or telemetry.
 - Rotate a token and restart the gateway if you suspect disclosure. Review and remove its principal binding if the associated operator should no longer have access.
 

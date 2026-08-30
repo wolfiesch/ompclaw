@@ -8,12 +8,14 @@ import type {
   InboundMessage,
   MessageAttachment,
   OutboundReceipt,
+  TransportIdentity,
 } from "./gateway-types";
 import {
   executeGatewayHostTool,
   gatewayHostToolDefinitions,
   type GatewayDelivery,
 } from "./gateway-tools";
+import { formatScheduledJob, ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
 import { OmpRpcClient, RpcCommandError, type RpcCommandInput } from "./rpc-client";
 import { type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-config";
 import {
@@ -44,6 +46,7 @@ export interface RpcGatewayRuntimeOptions {
   readonly delivery: GatewayDelivery;
   readonly sessionFile?: string;
   readonly onSessionState?: (state: RpcSessionState) => void;
+  readonly automation?: GatewayAutomationControl;
 }
 
 interface RuntimeStatus {
@@ -58,9 +61,17 @@ interface HostToolExecution {
   readonly controller: AbortController;
 }
 
-interface ActiveTurn extends RpcGatewayUiTarget {
+interface GatewayTurnTarget extends RpcGatewayUiTarget {
+  readonly identity: TransportIdentity;
+}
+
+interface ActiveTurn extends GatewayTurnTarget {
   receipt?: OutboundReceipt;
   assistantText?: string;
+  scheduledCompletion?: {
+    readonly resolve: () => void;
+    readonly reject: (error: Error) => void;
+  };
 }
 
 interface ParsedCommand {
@@ -82,6 +93,11 @@ const RUNTIME_COMMANDS = [
   ["stats", "Show session statistics"],
   ["todos", "Show the current todo phases"],
   ["subagents", "Show active and recent subagents"],
+  ["jobs", "List durable scheduled jobs"],
+  ["job_pause", "Pause a scheduled job by ID"],
+  ["job_resume", "Resume a scheduled job by ID"],
+  ["job_run", "Run a scheduled job now by ID"],
+  ["job_delete", "Delete a scheduled job by ID"],
   ["commands", "List OMP slash commands"],
   ["history", "Show recent conversation messages"],
   ["branch", "List branch points or branch by entry ID"],
@@ -202,6 +218,9 @@ export class RpcGatewayRuntime {
     this.#ui = undefined;
     for (const execution of this.#hostTools.values()) execution.controller.abort();
     this.#hostTools.clear();
+    const active = this.#activeTurn;
+    this.#activeTurn = undefined;
+    active?.scheduledCompletion?.reject(new Error("OMP runtime stopped"));
     const rpc = this.#rpc;
     this.#rpc = undefined;
     await rpc?.stop();
@@ -222,6 +241,30 @@ export class RpcGatewayRuntime {
     const prompt = this.#promptQueue.then(() => this.#deliverPrompt(message, delivery));
     this.#promptQueue = prompt.catch(() => {});
     return prompt;
+  }
+
+  isBusy(): boolean {
+    return this.#activeTurn !== undefined || this.#status.state?.isStreaming === true;
+  }
+
+  /** Queue a scheduler-owned prompt and resolve only after its terminal OMP event. */
+  async handleScheduled(message: InboundMessage): Promise<void> {
+    if (this.isBusy()) throw new ScheduledDispatchBusyError("OMP is serving another turn");
+    if (!this.#rpc?.running) throw new Error("OMP RPC is not running");
+    const completion = Promise.withResolvers<void>();
+    void completion.promise.catch(() => undefined);
+    const delivery = this.#deliveryFor(message);
+    this.#activate({
+      ...delivery,
+      scheduledCompletion: {
+        resolve: () => completion.resolve(),
+        reject: (error) => completion.reject(error),
+      },
+    });
+    const prompt = this.#promptQueue.then(() => this.#deliverPrompt(message, delivery));
+    this.#promptQueue = prompt.catch(() => {});
+    await prompt;
+    if (this.#activeTurn && this.#sameDelivery(this.#activeTurn, delivery)) await completion.promise;
   }
 
   async statusText(): Promise<string> {
@@ -272,7 +315,7 @@ export class RpcGatewayRuntime {
     });
     await rpc.start();
     await rpc.send({ type: "set_subagent_subscription", level: "progress" });
-    await rpc.send({ type: "set_host_tools", tools: gatewayHostToolDefinitions() });
+    await rpc.send({ type: "set_host_tools", tools: gatewayHostToolDefinitions(this.#options.automation !== undefined) });
     const state = await this.#requestData<RpcSessionState>({ type: "get_state" });
     this.#status.state = state;
     this.#persistSession(state);
@@ -288,6 +331,7 @@ export class RpcGatewayRuntime {
     const active = this.#activeTurn;
     this.#activeTurn = undefined;
     if (active) {
+      active.scheduledCompletion?.reject(error);
       await this.#send(active, `OMP stopped unexpectedly: ${error.message}\n\nThe gateway will ${this.#options.config.autoRestart ? "restart it" : "remain offline"}.`).catch(() => {});
     }
     if (!this.#options.config.autoRestart) return;
@@ -359,14 +403,21 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "prompt_result" && frame.agentInvoked === false) {
+      const active = this.#activeTurn;
       this.#activeTurn = undefined;
+      active?.scheduledCompletion?.resolve();
       await this.#refreshState();
       return;
     }
     if (frame.type === "agent_end" && frame.isTerminal !== false) {
       if (this.#status.state) this.#status.state.isStreaming = false;
+      const active = this.#activeTurn;
       try {
         await this.#deliverAssistantText(finalAssistantText(frame.messages));
+        active?.scheduledCompletion?.resolve();
+      } catch (error) {
+        active?.scheduledCompletion?.reject(error instanceof Error ? error : new Error(String(error)));
+        throw error;
       } finally {
         this.#activeTurn = undefined;
         await this.#refreshState();
@@ -462,7 +513,7 @@ export class RpcGatewayRuntime {
     }
   }
 
-  async #handleCommand(delivery: RpcGatewayUiTarget, name: string, args: string): Promise<boolean> {
+  async #handleCommand(delivery: GatewayTurnTarget, name: string, args: string): Promise<boolean> {
     const reply = async (text: string): Promise<void> => {
       await this.#send(delivery, text);
     };
@@ -497,6 +548,30 @@ export class RpcGatewayRuntime {
       else if (name === "todos") await reply(this.#todosText());
       else if (name === "subagents") await this.#subagentsCommand(reply);
       else if (name === "commands") await this.#commandsCommand(reply);
+      else if (name === "jobs") {
+        const automation = this.#options.automation;
+        if (automation === undefined) await reply("Gateway automation is disabled.");
+        else {
+          const jobs = automation.list(delivery.deliveryContext.principal.id);
+          await reply(jobs.length === 0 ? "No scheduled jobs." : jobs.map(formatScheduledJob).join("\n"));
+        }
+      }
+      else if (name === "job_pause" || name === "job_resume" || name === "job_run" || name === "job_delete") {
+        const automation = this.#options.automation;
+        if (automation === undefined) await reply("Gateway automation is disabled.");
+        else if (!args) await reply(`Usage: /${name} <job id>`);
+        else {
+          const principalId = delivery.deliveryContext.principal.id;
+          if (name === "job_delete") {
+            await reply(automation.remove(args, principalId) ? `Deleted scheduled job ${args}.` : `Scheduled job ${args} was not found.`);
+          } else {
+            const job = name === "job_run"
+              ? automation.runNow(args, principalId)
+              : automation.setEnabled(args, principalId, name === "job_resume");
+            await reply(formatScheduledJob(job));
+          }
+        }
+      }
       else if (name === "history") await this.#historyCommand(args, reply);
       else if (name === "branch") await this.#branchCommand(args, reply);
       else if (name === "name") {
@@ -667,7 +742,7 @@ export class RpcGatewayRuntime {
     await reply("Session export attached.");
   }
 
-  async #loginCommand(delivery: RpcGatewayUiTarget, args: string, reply: (text: string) => Promise<void>): Promise<void> {
+  async #loginCommand(delivery: GatewayTurnTarget, args: string, reply: (text: string) => Promise<void>): Promise<void> {
     if (!args) {
       const data = await this.#requestData<{ providers: Array<{ id: string; name: string; available: boolean; authenticated: boolean }> }>({ type: "get_login_providers" });
       await reply(data.providers.map((provider) => `${provider.id} — ${provider.authenticated ? "authenticated" : provider.available ? "available" : "unavailable"}`).join("\n"));
@@ -721,14 +796,15 @@ export class RpcGatewayRuntime {
     return response.data as T;
   }
 
-  #deliveryFor(message: InboundMessage): RpcGatewayUiTarget {
+  #deliveryFor(message: InboundMessage): GatewayTurnTarget {
     return {
       address: message.address,
       deliveryContext: { principal: message.principal, origin: message.address },
+      identity: message.identity,
     };
   }
 
-  #activate(delivery: RpcGatewayUiTarget): void {
+  #activate(delivery: GatewayTurnTarget | ActiveTurn): void {
     if (!this.#activeTurn) this.#activeTurn = { ...delivery };
   }
 
@@ -777,6 +853,8 @@ export class RpcGatewayRuntime {
         delivery: this.#options.delivery,
         address: active.address,
         deliveryContext: active.deliveryContext,
+        identity: active.identity,
+        automation: this.#options.automation,
       }, controller.signal);
       if (!controller.signal.aborted) {
         rpc.write({ type: "host_tool_result", id: call.id, result: { content: [{ type: "text", text: valueText(result) }] } });

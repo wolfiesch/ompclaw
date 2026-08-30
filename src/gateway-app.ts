@@ -8,14 +8,22 @@ import {
 } from "./gateway-config";
 import { GatewayCore, type GatewayCoreOptions } from "./gateway-core";
 import type { GatewayDelivery } from "./gateway-tools";
-import { GatewayStore, type ConversationBinding, type JsonValue } from "./gateway-store";
+import {
+  GatewayScheduler,
+  ScheduledDispatchBusyError,
+  type GatewayAutomationControl,
+  type GatewayScheduledJobStore,
+  type GatewaySchedulerOptions,
+} from "./gateway-scheduler";
+import { GatewayStore, type ConversationBinding, type JsonValue, type ScheduledJob } from "./gateway-store";
 import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
 import { RpcGatewayRuntime, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import type { RpcSessionState } from "./rpc-protocol";
+import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
 import { TelegramTransportAdapter, type TelegramTransportAdapterOptions } from "./transports/telegram/adapter";
 import { WebSocketTransportAdapter, type WebSocketTransportOptions } from "./transports/websocket/adapter";
 
-export interface GatewayApplicationStore {
+export interface GatewayApplicationStore extends Partial<GatewayScheduledJobStore> {
   close(): void;
   resolvePrincipal(identity: TransportIdentity): Principal | undefined;
   getCheckpoint(adapter: string, key: string): JsonValue | undefined;
@@ -31,9 +39,15 @@ export interface GatewayRuntime {
   start(): Promise<void>;
   stop(): Promise<void>;
   handleInbound(message: InboundMessage): Promise<void>;
+  handleScheduled?(message: InboundMessage): Promise<void>;
+  isBusy?(): boolean;
 }
 
 export type GatewayCoreRuntime = GatewayDelivery & Pick<GatewayCore, "register" | "start" | "stop">;
+export interface GatewaySchedulerRuntime extends GatewayAutomationControl {
+  start(): void;
+  stop(): void;
+}
 
 export interface GatewayApplicationSeams {
   readonly createStore?: (path: string) => GatewayApplicationStore;
@@ -41,6 +55,7 @@ export interface GatewayApplicationSeams {
   readonly createRuntime?: (options: RpcGatewayRuntimeOptions) => GatewayRuntime;
   readonly createTelegramAdapter?: (options: TelegramTransportAdapterOptions) => TransportAdapter;
   readonly createWebSocketAdapter?: (options: WebSocketTransportOptions) => TransportAdapter;
+  readonly createScheduler?: (options: GatewaySchedulerOptions) => GatewaySchedulerRuntime;
   readonly acquireLock?: (path: string) => { readonly ok: true } | { readonly ok: false; readonly holder: number };
   readonly releaseLock?: (path: string) => void;
   readonly startLockHeartbeat?: (path: string) => () => void;
@@ -77,6 +92,7 @@ export class GatewayApplication {
   #store: GatewayApplicationStore | undefined;
   #core: GatewayCoreRuntime | undefined;
   #runtime: GatewayRuntime | undefined;
+  #scheduler: GatewaySchedulerRuntime | undefined;
   #releaseHeartbeat: (() => void) | undefined;
   #adapters: TransportAdapter[] = [];
   #sessionFile: string | undefined;
@@ -128,11 +144,33 @@ export class GatewayApplication {
       this.#adapters = this.#createAdapters(store, secrets);
       for (const adapter of this.#adapters) core.register(adapter);
 
+      let scheduler: GatewaySchedulerRuntime | undefined;
+      if (this.#config.automation.enabled) {
+        const scheduledStore = requireScheduledStore(store);
+        scheduler = (this.#seams.createScheduler ?? ((options: GatewaySchedulerOptions) => new GatewayScheduler(options)))({
+          store: scheduledStore,
+          dispatch: (job, scheduledFor) => this.#dispatchScheduledJob(job, scheduledFor),
+          enabled: true,
+          pollIntervalMs: this.#config.automation.pollIntervalMs,
+          retryDelayMs: this.#config.automation.retryDelayMs,
+          maxAttempts: this.#config.automation.maxAttempts,
+          ...(this.#seams.now === undefined ? {} : { now: this.#seams.now }),
+          onPermanentFailure: (job, error) => this.#notifyScheduledFailure(job, error),
+        });
+        this.#scheduler = scheduler;
+      }
+
+      let rpcConfig = gatewayRpcRuntimeConfig(this.#config);
+      prepareInheritedHarness(rpcConfig);
+      const learningOverlay = prepareLearningOverlay(this.#config);
+      if (learningOverlay !== undefined) rpcConfig = { ...rpcConfig, configFiles: [...rpcConfig.configFiles, learningOverlay] };
+
       const runtime = (this.#seams.createRuntime ?? ((options: RpcGatewayRuntimeOptions) => new RpcGatewayRuntime(options)))({
-        config: gatewayRpcRuntimeConfig(this.#config),
+        config: rpcConfig,
         delivery: core,
         sessionFile: this.#sessionFile,
         onSessionState: (session) => this.#recordSessionState(session),
+        ...(scheduler === undefined ? {} : { automation: scheduler }),
       });
       this.#runtime = runtime;
 
@@ -140,6 +178,7 @@ export class GatewayApplication {
       await runtime.start();
       this.#checkpointSession();
       await core.start(signal);
+      scheduler?.start();
       this.#state = "started";
     } catch (error) {
       await this.#rollbackStart(lockHeld);
@@ -186,13 +225,19 @@ export class GatewayApplication {
   }
 
   async #handleInbound(message: InboundMessage): Promise<void> {
+    await this.#processInbound(message, false);
+  }
+
+  async #processInbound(message: InboundMessage, scheduled: boolean): Promise<void> {
     const store = this.#requireStore();
     const runtime = this.#requireRuntime();
     const { transport, account } = message.address;
+    if (scheduled) store.releaseInboundMessage(transport, account, message.id);
     if (!store.claimInboundMessage(transport, account, message.id, (this.#seams.now ?? Date.now)())) return;
 
     try {
-      await runtime.handleInbound(message);
+      if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
+      else await runtime.handleInbound(message);
       const sessionFile = this.#sessionFile;
       if (sessionFile === undefined) throw new Error("OMP runtime did not report its current session file");
       store.bindConversation({
@@ -202,11 +247,43 @@ export class GatewayApplication {
       });
       this.#checkpointSession();
     } catch (error) {
-      // A failed turn has no durable dedupe or session/binding checkpoint, so its
-      // exact upstream ID can be retried by the adapter.
       store.releaseInboundMessage(transport, account, message.id);
       throw error;
     }
+  }
+
+  async #dispatchScheduledJob(job: ScheduledJob, scheduledFor: number): Promise<void> {
+    const runtime = this.#requireRuntime();
+    if (runtime.isBusy?.()) throw new ScheduledDispatchBusyError("OMP is serving another turn");
+    const principal = this.#requireStore().resolvePrincipal(job.identity);
+    if (principal === undefined || principal.id !== job.principalId) {
+      throw new Error(`Scheduled job ${job.id} no longer has an authorized principal`);
+    }
+    await this.#processInbound({
+      id: `scheduled:${job.id}:${scheduledFor}`,
+      sentAt: scheduledFor,
+      identity: job.identity,
+      principal,
+      address: job.address,
+      content: {
+        text: [
+          `Scheduled job "${job.name}" is due (job ${job.id}, scheduled ${new Date(scheduledFor).toISOString()}).`,
+          "Execute this unattended task now and report the result to this conversation:",
+          job.prompt,
+        ].join("\n\n"),
+      },
+    }, true);
+  }
+
+  async #notifyScheduledFailure(job: ScheduledJob, error: Error): Promise<void> {
+    const principal = this.#requireStore().resolvePrincipal(job.identity);
+    const core = this.#core;
+    if (principal === undefined || principal.id !== job.principalId || core === undefined) return;
+    await core.send(
+      job.address,
+      { text: `Scheduled job "${job.name}" failed after ${this.#config.automation.maxAttempts} attempts: ${error.message}`, format: "text" },
+      { principal, origin: job.address },
+    );
   }
 
   #recordSessionState(state: RpcSessionState): void {
@@ -225,6 +302,16 @@ export class GatewayApplication {
   async #stopResources(lockHeld = true): Promise<unknown> {
     let firstError: unknown;
     const remember = (error: unknown): void => { firstError ??= error; };
+
+    const scheduler = this.#scheduler;
+    this.#scheduler = undefined;
+    if (scheduler !== undefined) {
+      try {
+        scheduler.stop();
+      } catch (error) {
+        remember(error);
+      }
+    }
 
     const core = this.#core;
     this.#core = undefined;
@@ -288,4 +375,19 @@ export class GatewayApplication {
 
 export function gatewayDatabasePath(config: Pick<GatewayConfig, "stateDir">): string {
   return join(config.stateDir, "gateway.sqlite");
+}
+
+function requireScheduledStore(store: GatewayApplicationStore): GatewayScheduledJobStore {
+  const methods = [
+    "createScheduledJob",
+    "updateScheduledJob",
+    "getScheduledJob",
+    "listScheduledJobs",
+    "listDueScheduledJobs",
+    "deleteScheduledJob",
+  ] as const;
+  for (const method of methods) {
+    if (typeof store[method] !== "function") throw new Error(`Gateway store does not support automation method ${method}`);
+  }
+  return store as GatewayScheduledJobStore;
 }

@@ -7,6 +7,7 @@ import {
   type GatewayApplicationStore,
   type GatewayCoreRuntime,
   type GatewayRuntime,
+  type GatewaySchedulerRuntime,
 } from "./gateway-app";
 import { parseGatewayConfig, type GatewayConfig } from "./gateway-config";
 import type { GatewayCoreOptions } from "./gateway-core";
@@ -336,6 +337,70 @@ describe("GatewayApplication", () => {
     await expect(app.start()).rejects.toThrow("adapter failed");
     expect(events).toEqual(["lock", "heartbeat", "runtime-start", "core-start", "core-stop", "runtime-stop", "heartbeat-stop", "unlock"]);
     expect(store.closed).toBe(true);
+  });
+
+  test("wires enabled automation into RPC and brackets it around transport availability", async () => {
+    const events: string[] = [];
+    const base = gatewayConfig();
+    const config: GatewayConfig = {
+      ...base,
+      automation: { enabled: true, pollIntervalMs: 1_000, retryDelayMs: 15_000, maxAttempts: 3 },
+    };
+    const core = coreHarness(events);
+    const scheduler: GatewaySchedulerRuntime = {
+      start() {
+        events.push("scheduler-start");
+      },
+      stop() {
+        events.push("scheduler-stop");
+      },
+      create() {
+        throw new Error("not used");
+      },
+      update() {
+        throw new Error("not used");
+      },
+      remove() {
+        return false;
+      },
+      setEnabled() {
+        throw new Error("not used");
+      },
+      runNow() {
+        throw new Error("not used");
+      },
+      list() {
+        return [];
+      },
+    };
+    let runtimeOptions: RpcGatewayRuntimeOptions | undefined;
+    const app = new GatewayApplication({
+      config,
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createCore: core.create,
+        createScheduler: () => scheduler,
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return {
+            async start() { events.push("runtime-start"); },
+            async stop() { events.push("runtime-stop"); },
+            async handleInbound() {},
+          };
+        },
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    expect(runtimeOptions?.automation).toBe(scheduler);
+    expect(events).toEqual(["runtime-start", "core-start", "scheduler-start"]);
+    await app.stop();
+    expect(events).toEqual(["runtime-start", "core-start", "scheduler-start", "scheduler-stop", "core-stop", "runtime-stop"]);
   });
 
   test("exposes strictly validated SQLite management helpers", () => {

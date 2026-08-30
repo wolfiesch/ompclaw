@@ -8,7 +8,7 @@
 
 Use it when a single trusted operator needs remote access to an OMP workspace without placing transport credentials in OMP configuration or handing clients an OMP process directly. Telegram and WebSocket are adapters around the same authenticated session. HTTP is health-only.
 
-- **Package:** [`omp-gateway`](https://www.npmjs.com/package/omp-gateway) `0.1.0`
+- **Package:** [`omp-gateway`](https://www.npmjs.com/package/omp-gateway) `0.2.0`
 - **Repository:** [`wolfiesch/omp-gateway`](https://github.com/wolfiesch/omp-gateway)
 - **License:** [MIT](LICENSE)
 - **Upstream provenance:** [TerrifiedBug/omp-telegram](https://github.com/TerrifiedBug/omp-telegram), preserved in [NOTICE](NOTICE)
@@ -60,6 +60,14 @@ cat > ~/.config/omp-gateway/config.json <<'JSON'
         }
       ]
     }
+  },
+  "automation": {
+    "enabled": true
+  },
+  "learning": {
+    "enabled": true,
+    "autoCapture": true,
+    "memoryModel": "online"
   }
 }
 JSON
@@ -129,7 +137,9 @@ The command reports `Installed and started <manager> service: <path>`. It instal
 - OMP commands for steering, follow-up, abort, models, thinking, session controls, queue policy, compaction, retries, subagents, history, branching, exports, and login.
 - Telegram long polling with durable update checkpoints, message editing, buttons, file intake, reactions, topics, and interactive OMP UI.
 - An authenticated versioned WebSocket protocol with client identity and conversation address derived from configured credential metadata, not client-supplied fields.
-- SQLite-backed principals, transport identities, conversation bindings, OMP session checkpointing, inbound deduplication, UI state, and legacy Telegram migration markers.
+- SQLite-backed principals, transport identities, conversation bindings, OMP session checkpointing, inbound deduplication, UI state, durable scheduled jobs, and legacy Telegram migration markers.
+- Optional unattended automation with one-shot and cron schedules, explicit timezone support, bounded retries, restart recovery, per-principal ownership, and natural-language job control through OMP host tools.
+- Optional experimental Mnemopi memory and auto-learn capture in gateway-owned state. Inherited desktop skills are refreshed into a read-only snapshot, while gateway-created managed skills and memory remain isolated in the named OMP profile.
 
 Read the [operator guide](docs/guide.md) for configuration, migration, operations, and security boundaries. Read the [RPC and transport reference](docs/rpc-service.md) for the command and protocol matrix.
 
