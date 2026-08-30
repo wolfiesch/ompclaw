@@ -20,6 +20,7 @@ import {
   releaseLock,
   startLockHeartbeat,
   tg,
+  tgUpload,
   webhookConflictHint,
   withRateLimit,
 } from "./api";
@@ -63,6 +64,47 @@ describe("Telegram Bot API transport", () => {
       expect((error as TgError).code).toBe(429);
       expect((error as TgError).retryAfter).toBe(3);
       expect((error as TgError).message).toBe("Too Many Requests");
+    }
+  });
+
+  test("uploads exact bytes and surfaces Telegram failures", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omp-tg-upload-"));
+    const filePath = join(dir, "payload.bin");
+    const expectedBytes = new Uint8Array([0, 1, 127, 128, 255]);
+    writeFileSync(filePath, expectedBytes);
+    const uploadedBytes: Uint8Array[] = [];
+    let requests = 0;
+    globalThis.fetch = (async (_url, init) => {
+      const form = init?.body;
+      if (!(form instanceof FormData)) throw new Error("expected multipart form data");
+      const upload = form.get("document");
+      if (!(upload instanceof Blob)) throw new Error("expected document upload");
+      uploadedBytes.push(new Uint8Array(await upload.arrayBuffer()));
+      requests++;
+      if (requests === 1) {
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 17 } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: false, error_code: 400, description: "Bad document" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      await expect(
+        tgUpload<{ message_id: number }>("secret", "sendDocument", { chat_id: 42 }, { field: "document", path: filePath }),
+      ).resolves.toEqual({ message_id: 17 });
+      expect(uploadedBytes).toEqual([expectedBytes]);
+
+      await expect(tgUpload("secret", "sendDocument", { chat_id: 42 }, { field: "document", path: filePath })).rejects.toMatchObject({
+        code: 400,
+        message: "Bad document",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

@@ -2,57 +2,58 @@
 
 ## Supported versions
 
-Security fixes are provided for the latest released version.
+`omp-gateway` is Alpha. Security fixes are considered for the newest published `0.1.x` release only. There is no guaranteed response or remediation timeline during Alpha. If a security fix requires an upgrade, use the newest release rather than expecting backports.
 
-## Reporting a vulnerability
+## Report a vulnerability privately
 
-Do not open a public issue for a suspected vulnerability. Use GitHub's private
-vulnerability reporting flow:
+Do not open a public issue, discussion, pull request, or chat message for a suspected vulnerability. Use GitHub's private vulnerability reporting flow for this repository:
 
-<https://github.com/TerrifiedBug/omp-telegram/security/advisories/new>
+<https://github.com/wolfiesch/omp-gateway/security/advisories/new>
 
-Include:
+A useful report includes:
 
-- the affected version or commit;
-- the required Telegram access state (unpaired DM, paired owner, configured group);
-- reproduction steps and impact;
-- whether a bot token or other credential may have been exposed.
+- affected package version and operating system;
+- a minimal reproduction or proof of concept;
+- the impact and attack preconditions;
+- whether an attacker needs local host access, a Telegram account, a WebSocket token, or network access;
+- relevant logs and configuration with every token, user ID, hostname, workspace path, and session path removed.
 
-If a credential was exposed, revoke or rotate it immediately. A report is not a
-reason to keep using a compromised token.
+Please allow maintainers to investigate and prepare a fix before public disclosure. Do not publish exploit details, working credentials, session files, or a bypass while the report is being handled.
 
-## Security model
+## Threat model
 
-One paired private-DM operator owns control commands. Configured groups can send
-normal omp user prompts but never receive bridge-control authority. Because those
-prompts retain the session's normal workspace and tool access, only trusted groups
-and sender IDs should be configured.
+The gateway is designed for one trusted operator environment:
 
-## Standalone RPC service
+- It runs one OMP RPC child process for one configured workspace and profile.
+- A transport identity must resolve to a principal recorded in the local SQLite store before its inbound message reaches OMP.
+- Telegram sender identity is obtained from the Telegram update. WebSocket identity and conversation address are derived from the configured credential, never from client message fields.
+- A live WebSocket connection is limited to one configured conversation origin. Gateway delivery is constrained to the active principal and origin.
+- The JSON configuration contains paths and environment-variable names, not token values. Transport-secret environment variables are removed before the OMP child starts.
+- The gateway locks its state directory so a second gateway process cannot become another state writer. The Telegram adapter separately locks one polling account.
 
-The standalone service gives the paired Telegram operator the normal authority
-of the selected OMP profile, workspace, tools, and MCP servers. It is a remote
-OMP terminal, not a limited chat bot.
+The gateway does **not** make an OMP workspace safe for untrusted operators. An authorized principal can cause prompts to be processed by OMP with the authority of the configured OMP profile, workspace, tools, and provider credentials. Treat granting a Telegram allowance or binding a WebSocket identity as granting access to that environment.
 
-The transport enforces:
+The gateway does not defend against a compromised host, another process running as the same operating-system user, stolen provider credentials, a stolen Telegram account, a stolen WebSocket token, a malicious OMP plugin or MCP server, or a compromised client device. It also does not provide end-to-end encryption beyond the transport guarantees supplied by Telegram or your own network deployment.
 
-- one immutable numeric Telegram operator;
-- private chats only, with group policy rejected at startup;
-- callback binding to the operator, chat, topic, and control message;
-- one live writer for the resumed OMP session;
-- RPC confirmations and input translated into authenticated Telegram controls;
-- bot credentials removed from the OMP child environment;
-- credential files required to be regular, owner-only, and mode `0600` or stricter;
-- direct RPC bash disabled unless the operator starts with `--allow-rpc-bash`;
-- atomic owner-only access and session state files;
-- inbound size/retention limits and outbound path checks.
+## Deployment hardening
 
-Mode checks do not inspect platform-specific extended ACLs. Keep the environment
-and auth-broker token files free of ACL grants to other local principals.
+1. Run the gateway under a dedicated, non-administrator user when practical. Limit that user's workspace, SSH, network, and provider access to what the session requires.
+2. Keep the default WebSocket bind address on loopback, such as `127.0.0.1`. Do not expose the WebSocket port directly to an untrusted network.
+3. If remote WebSocket access is required, put it behind a TLS-terminating, access-controlled network boundary. Restrict firewall rules and protect the client token in transit. Do not rely on the health endpoint as authentication.
+4. Use distinct high-entropy WebSocket tokens for each configured credential. Bind each credential subject explicitly to the intended principal with `identity-bind`.
+5. Allow only the specific Telegram user IDs that should operate the session. Keep Telegram in long-polling mode and resolve any configured webhook before starting the gateway. `doctor` checks for this conflict.
+6. Keep one gateway process and one Telegram poller per bot token. Do not share the state directory, token, or SQLite file among instances.
+7. Leave `omp.allowRpcBash` disabled unless the operator has deliberately accepted the authority granted to OMP RPC bash commands.
+8. Keep Bun, OMP, the gateway, operating system, and any reverse proxy current with their security updates.
 
-`--inherit-harness` links read-mostly skills, rules, commands, agents,
-documentation, and helper binaries, then copies selected configuration from the
-default OMP profile. It excludes hooks, extensions, `.env`, credentials,
-sessions, blobs, and runtime databases. Review inherited rules, skills, MCP
-definitions, helper binaries, and workspace authority before enabling remote
-access, especially on a VPS.
+## Secret handling
+
+- Put Telegram and WebSocket token values in a separate environment file passed with `--env-file`; use only variable names in the JSON configuration.
+- The environment file must be a regular file, owned by the current user, with mode `0600` or stricter on supported Unix systems. Do not commit it, upload it, or paste it into issue reports.
+- The SQLite database stores principals, bindings, checkpoints, deduplication records, and pending UI metadata. It is created with private permissions. Treat its containing state directory and database backups as sensitive.
+- Do not put provider tokens, bot tokens, WebSocket tokens, session exports, or private attachment files in source control, service definitions, shell history, screenshots, or telemetry.
+- Rotate a token and restart the gateway if you suspect disclosure. Review and remove its principal binding if the associated operator should no longer have access.
+
+## Safe disclosure and remediation
+
+Maintainers may ask for a sanitized reproducer or a private follow-up through the GitHub advisory. Before sharing anything, replace token values, numeric user IDs, hostnames, workspace paths, session paths, attachment contents, and message text with safe placeholders. After a fix is available, coordinate a public advisory that describes affected versions, impact, mitigations, and upgrade guidance without publishing secrets or operational data.

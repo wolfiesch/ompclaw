@@ -1,0 +1,33 @@
+{
+  "workspace": ".",
+  "stateDir": "~/.omp/agent/gateway",
+  "profile": "gateway",
+  "omp": {
+    "command": "omp",
+    "configFiles": [],
+    "args": [],
+    "allowRpcBash": false,
+    "inheritHarness": false,
+    "autoRestart": true
+  },
+  "transports": {
+    "telegram": {
+      "enabled": true,
+      "account": "default",
+      "tokenEnv": "TELEGRAM_BOT_TOKEN"
+    },
+    "websocket": {
+      "enabled": true,
+      "hostname": "127.0.0.1",
+      "port": 7788,
+      "account": "local",
+      "credentials": [
+        {
+          "tokenEnv": "OMP_GATEWAY_WEBSOCKET_TOKEN",
+          "subject": "local-client",
+          "channel": "gateway"
+        }
+      ]
+    }
+  }
+}

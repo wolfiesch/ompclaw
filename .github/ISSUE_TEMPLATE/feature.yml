@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a concrete, safe improvement to omp-gateway.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe a concrete user-visible outcome. Do not include credentials, access tokens, authorization headers, private paths, or personal data.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and documentation for this idea.
+          required: true
+        - label: I removed secrets and other sensitive information from this request.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the current reproducible limitation and who it affects.
+      placeholder: When a local authenticated client does X, the gateway cannot do Y.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Current reproducible behavior
+      description: Provide the smallest redacted setup and sequence that shows the current limitation. Use placeholder environment variable names, not values.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the desired behavior as an observable scenario, including the expected result.
+      placeholder: Given X, when Y occurs, omp-gateway should Z.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or other approaches you considered.
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Architecture and security boundaries
+      description: Explain any impact on the one-session ownership model, transport authentication, secret handling, or health-only HTTP surface. Use redacted examples only.
+    validations:
+      required: true

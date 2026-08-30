@@ -1,115 +1,141 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertRpcAccess, buildOmpChildEnv, buildOmpRpcArgv, loadLiteralEnvFile, parseRpcCliArgs } from "./rpc-config";
+import { stripGatewaySecretsFromChildEnv } from "./gateway-config";
+import { buildOmpChildEnv, buildOmpRpcArgv, loadLiteralEnvFile, type RpcRuntimeConfig } from "./rpc-config";
 import { prepareInheritedHarness } from "./rpc-profile";
 
 const directories: string[] = [];
+
+function runtimeConfig(overrides: Partial<RpcRuntimeConfig> = {}): RpcRuntimeConfig {
+  return {
+    cwd: "/workspace",
+    stateDir: "/state",
+    profile: "gateway",
+    ompCommand: "omp",
+    configFiles: [],
+    ompArgs: [],
+    allowRpcBash: false,
+    inheritHarness: false,
+    autoRestart: true,
+    ...overrides,
+  };
+}
 
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
 describe("RPC configuration", () => {
-  test("parses the public CLI and builds a resumable RPC command", () => {
-    const config = parseRpcCliArgs(
-      [
-        "doctor",
-        "--cwd",
-        "~/workspace",
-        "--state-dir",
-        "~/state",
-        "--profile",
-        "phone",
-        "--model",
-        "openai/gpt-5",
-        "--config",
-        "~/omp.json",
-        "--omp-arg",
-        "--plan-yolo",
-      ],
-      {},
-    );
-    expect(config.command).toBe("doctor");
-    expect(config.cwd).toBe(join(homedir(), "workspace"));
-    expect(config.stateDir).toBe(join(homedir(), "state"));
+  test("builds the exact resumable OMP RPC argv", () => {
+    const config = runtimeConfig({
+      cwd: "/workspace/omp-gateway",
+      profile: "production",
+      ompCommand: "/opt/omp/bin/omp",
+      resume: "/sessions/default.jsonl",
+      model: "example/model-v1",
+      sessionDir: "/sessions",
+      configFiles: ["/config/base.json", "/config/production.json"],
+      ompArgs: ["--plan-yolo", "--color", "never"],
+    });
+
     expect(buildOmpRpcArgv(config, "/sessions/exact.jsonl")).toEqual([
-      "omp",
+      "/opt/omp/bin/omp",
       "--mode",
       "rpc-ui",
       "--cwd",
-      join(homedir(), "workspace"),
+      "/workspace/omp-gateway",
       "--profile",
-      "phone",
+      "production",
       "--no-title",
       "--resume",
       "/sessions/exact.jsonl",
       "--model",
-      "openai/gpt-5",
+      "example/model-v1",
+      "--session-dir",
+      "/sessions",
       "--config",
-      join(homedir(), "omp.json"),
+      "/config/base.json",
+      "--config",
+      "/config/production.json",
       "--plan-yolo",
+      "--color",
+      "never",
     ]);
   });
 
-  test("loads literal environment values without overriding the process environment", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-telegram-env-"));
-    directories.push(directory);
-    const path = join(directory, ".env");
-    writeFileSync(path, "# comment\nexport TELEGRAM_BOT_TOKEN='from-file'\nTELEGRAM_ALLOWED_USERS=123,456\nINVALID LINE\n", { mode: 0o600 });
-    const env: NodeJS.ProcessEnv = { TELEGRAM_BOT_TOKEN: "existing" };
-    loadLiteralEnvFile(path, env);
-    expect(env.TELEGRAM_BOT_TOKEN).toBe("existing");
-    expect(env.TELEGRAM_ALLOWED_USERS).toBe("123,456");
+  test("strips Telegram, gateway, and WebSocket credentials from the OMP child", () => {
+    const childEnv = stripGatewaySecretsFromChildEnv(
+      buildOmpChildEnv({
+        PATH: "/bin",
+        TELEGRAM_BOT_TOKEN: "telegram-secret",
+        OMP_GATEWAY_TELEGRAM_TOKEN: "gateway-secret",
+        GATEWAY_AUTHORIZATION: "gateway-authorization",
+        OMP_TRANSPORT_TOKEN: "transport-secret",
+        OMP_WEBSOCKET_TOKEN: "omp-websocket-secret",
+        WEBSOCKET_TOKEN: "websocket-secret",
+      }),
+    );
+
+    expect(childEnv).toEqual({ PATH: "/bin" });
   });
 
-  test("rejects transport credential files with unsafe permissions or symlinks", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-telegram-env-security-"));
+  test("loads literal environment values without overriding inherited values", () => {
+    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-env-"));
+    directories.push(directory);
+    const path = join(directory, ".env");
+    writeFileSync(
+      path,
+      "# comment\nexport FROM_FILE='literal value'\nALREADY=from-file\nEXPANSION=$HOME\nINVALID LINE\n",
+      { mode: 0o600 },
+    );
+    const env: NodeJS.ProcessEnv = { ALREADY: "inherited" };
+
+    loadLiteralEnvFile(path, env);
+
+    expect(env).toEqual({ FROM_FILE: "literal value", ALREADY: "inherited", EXPANSION: "$HOME" });
+  });
+
+  test("rejects non-private or non-regular environment files", () => {
+    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-env-security-"));
     directories.push(directory);
     const loose = join(directory, "loose.env");
     const link = join(directory, "linked.env");
-    writeFileSync(loose, "TELEGRAM_BOT_TOKEN=secret\n", { mode: 0o644 });
-    expect(() => loadLiteralEnvFile(loose, {})).toThrow("permissions must be 0600 or stricter");
+    const notFile = join(directory, "not-file");
+    writeFileSync(loose, "TOKEN=secret\n", { mode: 0o644 });
     symlinkSync(loose, link);
+    mkdirSync(notFile);
+
+    if (process.platform !== "win32") {
+      expect(() => loadLiteralEnvFile(loose, {})).toThrow("permissions must be 0600 or stricter");
+    }
     expect(() => loadLiteralEnvFile(link, {})).toThrow("regular file, not a symlink");
+    expect(() => loadLiteralEnvFile(notFile, {})).toThrow("regular file, not a symlink");
   });
 
-  test("rejects shared group policy in the single-operator runtime", () => {
-    expect(() => assertRpcAccess({ allowFrom: ["42"], groups: { "-100": { requireMention: false, allowFrom: [] } } })).toThrow(
-      "private chats only",
-    );
-    expect(() => assertRpcAccess({ allowFrom: ["42", "43"], groups: {} })).toThrow("at most one paired");
-    expect(() => assertRpcAccess({ allowFrom: ["42"], groups: {} })).not.toThrow();
-  });
-
-  test("strips transport credentials from the OMP child", () => {
-    expect(
-      buildOmpChildEnv({
-        PATH: "/bin",
-        TELEGRAM_BOT_TOKEN: "secret",
-        TELEGRAM_ALLOWED_USERS: "123",
-        OMP_TELEGRAM_RPC_ENV_FILE: "/secret/.env",
-        OMP_TELEGRAM_STATE_DIR: "/secret/state",
-      }),
-    ).toEqual({ PATH: "/bin", OMP_TELEGRAM_RPC_CHILD: "1" });
-  });
-
-  test("passes an explicitly scoped auth broker token without its file path", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-telegram-broker-"));
+  test("injects a private auth broker token without exposing its source path", () => {
+    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-broker-"));
     directories.push(directory);
     const path = join(directory, "auth-broker.token");
     writeFileSync(path, "broker-secret\n", { mode: 0o600 });
-    expect(
+
+    const childEnv = stripGatewaySecretsFromChildEnv(
       buildOmpChildEnv(
-        { PATH: "/bin", OMP_TELEGRAM_RPC_AUTH_BROKER_TOKEN_FILE: path },
+        {
+          PATH: "/bin",
+          TELEGRAM_BOT_TOKEN: "telegram-secret",
+          OMP_GATEWAY_AUTH_BROKER_TOKEN_FILE: path,
+        },
         { authBrokerTokenFile: path },
       ),
-    ).toEqual({ PATH: "/bin", OMP_AUTH_BROKER_TOKEN: "broker-secret", OMP_TELEGRAM_RPC_CHILD: "1" });
+    );
+
+    expect(childEnv).toEqual({ PATH: "/bin", OMP_AUTH_BROKER_TOKEN: "broker-secret" });
   });
 
-  test("inherits harness assets without sharing credentials or runtime state", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-telegram-profile-"));
+  test("accepts gateway runtime config for inherited harness assets without credentials or runtime state", () => {
+    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-profile-"));
     directories.push(directory);
     const source = join(directory, "agent");
     mkdirSync(join(source, "skills"), { recursive: true });
@@ -121,8 +147,7 @@ describe("RPC configuration", () => {
     const previous = process.env.OMP_HOME;
     process.env.OMP_HOME = directory;
     try {
-      const config = parseRpcCliArgs(["run", "--profile", "phone", "--inherit-harness"], {});
-      const target = prepareInheritedHarness(config)!;
+      const target = prepareInheritedHarness(runtimeConfig({ profile: "phone", inheritHarness: true }))!;
       expect(lstatSync(join(target, "skills")).isSymbolicLink()).toBe(true);
       expect(existsSync(join(target, "AGENTS.md"))).toBe(true);
       expect(existsSync(join(target, "extensions"))).toBe(false);
@@ -133,10 +158,5 @@ describe("RPC configuration", () => {
       if (previous === undefined) delete process.env.OMP_HOME;
       else process.env.OMP_HOME = previous;
     }
-  });
-
-  test("rejects unknown flags and missing values", () => {
-    expect(() => parseRpcCliArgs(["run", "--unknown"], {})).toThrow("Unknown option");
-    expect(() => parseRpcCliArgs(["run", "--cwd"], {})).toThrow("requires a value");
   });
 });

@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible problem in omp-gateway.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Do not include credentials, access tokens, authorization headers, private paths, or personal data.
+        For a security concern, use the private vulnerability reporting route instead of this form.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed secrets and other sensitive information from this report.
+          required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: Describe exactly what happened and include a redacted error message if one was shown.
+      placeholder: The gateway accepted the connection, then returned an unexpected response.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe the behavior you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproducible steps
+      description: List the smallest redacted setup and sequence that reliably reproduces the problem. Use placeholder environment variable names, not values.
+      placeholder: |
+        1. Start with the example configuration.
+        2. Set the required environment variable names with placeholder values outside this report.
+        3. Run the command that triggers the problem.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: omp-gateway version or commit
+      description: Provide the released version or commit identifier that reproduces the problem.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Provide relevant runtime versions and transport configuration at a high level. Redact all sensitive values.
+    validations:
+      required: false

@@ -9,16 +9,12 @@ permissions:
   contents: read
   id-token: write
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  npm:
-    name: publish omp-telegram to npm
-    if: github.repository == 'TerrifiedBug/omp-telegram'
+  publish:
+    name: Publish omp-gateway
+    if: github.repository == 'wolfiesch/omp-gateway'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -31,7 +27,7 @@ jobs:
           package-manager-cache: false
       - name: Require tag to match package version
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - run: bun run check
       - name: Install trusted-publishing-capable npm
         run: npm install --global npm@11.5.1

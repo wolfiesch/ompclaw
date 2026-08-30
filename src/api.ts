@@ -225,8 +225,12 @@ export async function tgUpload<T>(
   for (const [k, v] of Object.entries(fields)) {
     if (v !== undefined) form.append(k, String(v));
   }
-  const bytes = await readFile(file.path);
+  const source = await readFile(file.path);
   callerSignal?.throwIfAborted();
+  // `Buffer` may expose a SharedArrayBuffer-compatible backing store. Copy it
+  // once into an owned ArrayBuffer-backed view, which BlobPart accepts.
+  const bytes = new Uint8Array(source.byteLength);
+  bytes.set(source);
   form.append(file.field, new Blob([bytes]), file.filename ?? basename(file.path));
   const timeout = AbortSignal.timeout(timeoutMs);
   const signal = callerSignal ? AbortSignal.any([timeout, callerSignal]) : timeout;
