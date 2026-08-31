@@ -37,6 +37,8 @@ export interface GatewayApplicationStore extends Partial<GatewayScheduledJobStor
   claimInboundMessage(transport: string, account: string, messageId: string, receivedAt: number): boolean;
   releaseInboundMessage(transport: string, account: string, messageId: string): boolean;
   bindConversation(binding: ConversationBinding): void;
+  getConversationBinding(address: InboundMessage["address"]): ConversationBinding | undefined;
+  hasConversationBindingForSession?(sessionPath: string): boolean;
   putPendingInteraction: GatewayStore["putPendingInteraction"];
   deletePendingInteraction: GatewayStore["deletePendingInteraction"];
 }
@@ -47,6 +49,8 @@ export interface GatewayRuntime {
   handleInbound(message: InboundMessage): Promise<void>;
   handleScheduled?(message: InboundMessage): Promise<void>;
   isBusy?(): boolean;
+  newSession?(name?: string): Promise<boolean>;
+  switchSession?(sessionPath: string): Promise<boolean>;
 }
 
 export type GatewayCoreRuntime = GatewayDelivery & Pick<GatewayCore, "register" | "start" | "stop">;
@@ -102,6 +106,7 @@ export class GatewayApplication {
   #releaseHeartbeat: (() => void) | undefined;
   #adapters: TransportAdapter[] = [];
   #sessionFile: string | undefined;
+  #inboundTail: Promise<void> = Promise.resolve();
 
   constructor(options: GatewayApplicationOptions) {
     this.#config = options.config;
@@ -214,6 +219,7 @@ export class GatewayApplication {
         stateDir: this.#config.stateDir,
         store,
         commands: runtimeCommandMenu(this.#config.omp.allowRpcBash),
+        createTopicsFromRoot: telegram.topicSessions.enabled && telegram.topicSessions.createFromRoot,
       }));
     }
 
@@ -233,7 +239,21 @@ export class GatewayApplication {
   }
 
   async #handleInbound(message: InboundMessage): Promise<void> {
-    await this.#processInbound(message, false);
+    await this.#serializeInbound(() => this.#processInbound(message, false));
+  }
+
+  async #serializeInbound(operation: () => Promise<void>): Promise<void> {
+    const previous = this.#inboundTail;
+    let release: (() => void) | undefined;
+    this.#inboundTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      await operation();
+    } finally {
+      release?.();
+    }
   }
 
   async #processInbound(message: InboundMessage, scheduled: boolean): Promise<void> {
@@ -244,6 +264,9 @@ export class GatewayApplication {
     if (!store.claimInboundMessage(transport, account, message.id, (this.#seams.now ?? Date.now)())) return;
 
     try {
+      if (this.#config.transports.telegram?.topicSessions.enabled === true) {
+        await this.#selectConversationSession(store, runtime, message);
+      }
       if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
       else await runtime.handleInbound(message);
       const sessionFile = this.#sessionFile;
@@ -260,6 +283,43 @@ export class GatewayApplication {
     }
   }
 
+  async #selectConversationSession(
+    store: GatewayApplicationStore,
+    runtime: GatewayRuntime,
+    message: InboundMessage,
+  ): Promise<void> {
+    const binding = store.getConversationBinding(message.address);
+    const currentSession = this.#sessionFile;
+    if (binding !== undefined) {
+      if (binding.ompSessionPath === currentSession) return;
+      if (runtime.switchSession === undefined) throw new Error("OMP runtime does not support conversation session switching");
+      if (runtime.isBusy?.()) throw new Error("OMP is busy and cannot switch conversation sessions");
+      const switched = await runtime.switchSession(binding.ompSessionPath);
+      if (!switched) throw new Error(`OMP cancelled the session switch for ${binding.ompSessionPath}`);
+      return;
+    }
+
+    const isTopic = message.address.transport === "telegram" && message.address.thread !== undefined;
+    const currentOwned = currentSession === undefined
+      ? false
+      : store.hasConversationBindingForSession?.(currentSession) === true;
+    if (!isTopic && !currentOwned) return;
+    if (runtime.newSession === undefined) throw new Error("OMP runtime does not support per-conversation sessions");
+    if (runtime.isBusy?.()) throw new Error("OMP is busy and cannot create a conversation session");
+    const created = await runtime.newSession(this.#sessionName(message));
+    if (!created) throw new Error("OMP cancelled conversation session creation");
+  }
+
+  #sessionName(message: InboundMessage): string {
+    const source = message.content.text ?? message.content.attachments?.[0]?.name;
+    if (source !== undefined) {
+      const normalized = source.replace(/\s+/g, " ").trim();
+      if (normalized.length > 0) return [...normalized].slice(0, 80).join("");
+    }
+    const thread = message.address.thread === undefined ? "" : ` topic ${message.address.thread}`;
+    return `Telegram ${message.address.channel}${thread}`;
+  }
+
   async #dispatchScheduledJob(job: ScheduledJob, scheduledFor: number): Promise<void> {
     const runtime = this.#requireRuntime();
     if (runtime.isBusy?.()) throw new ScheduledDispatchBusyError("OMP is serving another turn");
@@ -267,7 +327,7 @@ export class GatewayApplication {
     if (principal === undefined || principal.id !== job.principalId) {
       throw new Error(`Scheduled job ${job.id} no longer has an authorized principal`);
     }
-    await this.#processInbound({
+    await this.#serializeInbound(() => this.#processInbound({
       id: `scheduled:${job.id}:${scheduledFor}`,
       sentAt: scheduledFor,
       identity: job.identity,
@@ -280,7 +340,7 @@ export class GatewayApplication {
           job.prompt,
         ].join("\n\n"),
       },
-    }, true);
+    }, true));
   }
 
   async #notifyScheduledFailure(job: ScheduledJob, error: Error): Promise<void> {

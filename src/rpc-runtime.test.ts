@@ -504,6 +504,7 @@ describe("RpcGatewayRuntime", () => {
     await runtime.handleInbound(message("commands", "/subagents"));
     await runtime.handleInbound(message("commands", "/new"));
     await runtime.handleInbound(message("commands", "/status"));
+    await expect(runtime.switchSession("/sessions/resume.jsonl")).resolves.toBe(true);
 
     expect(rpc.sent.map((command) => command.type)).toEqual(expect.arrayContaining([
       "set_model",
@@ -512,6 +513,7 @@ describe("RpcGatewayRuntime", () => {
       "get_subagents",
       "new_session",
       "get_state",
+      "switch_session",
     ]));
     expect(sessionStates.map((state) => state.sessionFile)).toContain("/sessions/new.jsonl");
     expect(deliveries.some((call) => textFromContent(call.content)?.startsWith("OmpClaw v"))).toBe(true);

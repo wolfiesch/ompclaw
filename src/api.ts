@@ -99,6 +99,7 @@ export interface TgChat {
   id: number;
   type: string;
   title?: string;
+  is_forum?: boolean;
 }
 export interface TgMessageEntity {
   type: string;

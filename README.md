@@ -4,9 +4,9 @@
 [![npm package](https://img.shields.io/badge/npm-ompclaw-CB3837?logo=npm)](https://www.npmjs.com/package/ompclaw)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Status: Alpha.** OmpClaw is a Bun package for operators who need one persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) 17+ session reachable through Telegram and authenticated WebSocket clients. It deliberately has one session owner and one state writer, rather than creating separate agent processes for each chat or client.
+**Status: Alpha.** OmpClaw is a Bun package for operators who need persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) 17+ sessions reachable through Telegram and authenticated WebSocket clients. One RPC process remains the sole session owner and state writer. Optional Telegram topic sessions isolate context without launching another agent process per chat.
 
-Use it when a single trusted operator needs remote access to an OMP workspace without placing transport credentials in OMP configuration or handing clients an OMP process directly. Telegram and WebSocket are adapters around the same authenticated session. HTTP is health-only.
+Use it when a trusted operator needs remote access to an OMP workspace without placing transport credentials in OMP configuration or handing clients an OMP process directly. Telegram and WebSocket are authenticated adapters around the same serialized runtime. HTTP is health-only.
 
 - **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.3.0`
 - **Repository:** [`wolfiesch/ompclaw`](https://github.com/wolfiesch/ompclaw)
@@ -45,7 +45,11 @@ cat > ~/.config/ompclaw/config.json <<'JSON'
     "telegram": {
       "enabled": true,
       "account": "default",
-      "tokenEnv": "TELEGRAM_BOT_TOKEN"
+      "tokenEnv": "TELEGRAM_BOT_TOKEN",
+      "topicSessions": {
+        "enabled": false,
+        "createFromRoot": false
+      }
     },
     "websocket": {
       "enabled": true,
@@ -133,9 +137,10 @@ The command reports `Installed and started <manager> service: <path>`. It instal
 
 ## What the gateway provides
 
-- One authenticated OMP RPC session with streamed assistant updates and a final response routed only to the active authenticated conversation.
+- One authenticated OMP RPC process with serialized session switching, streamed assistant updates, and a final response routed only to the active authenticated conversation.
 - OMP commands for steering, follow-up, abort, models, thinking, session controls, queue policy, compaction, retries, subagents, history, branching, exports, and login.
 - Telegram long polling with durable update checkpoints, message editing, buttons, file intake, reactions, topics, and interactive OMP UI.
+- Optional per-topic OMP sessions with persistent conversation bindings and authorized root-message topic creation.
 - An authenticated versioned WebSocket protocol with client identity and conversation address derived from configured credential metadata, not client-supplied fields.
 - SQLite-backed principals, transport identities, conversation bindings, OMP session checkpointing, inbound deduplication, UI state, durable scheduled jobs, and legacy Telegram migration markers.
 - Optional unattended automation with one-shot and cron schedules, explicit timezone support, bounded retries, restart recovery, per-principal ownership, and natural-language job control through OMP host tools.

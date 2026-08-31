@@ -78,6 +78,7 @@ async function fixture(options: {
   readonly transcribe?: boolean;
   readonly uiTimeoutMs?: number;
   readonly commands?: readonly { readonly command: string; readonly description: string }[];
+  readonly createTopicsFromRoot?: boolean;
 } = {}) {
   const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-telegram-"));
   temporaryPaths.push(stateDir);
@@ -106,6 +107,7 @@ async function fixture(options: {
     uiTimeoutMs: options.uiTimeoutMs,
     commands: options.commands,
     transcribeCommand: options.transcribe ? ["not-used", "{file}"] : undefined,
+    createTopicsFromRoot: options.createTopicsFromRoot,
     api: {
       poller: fakePoller,
       callTelegram: async (method, payload) => {
@@ -114,6 +116,7 @@ async function fixture(options: {
         for (const waiter of callWaiters) waiter(call, callIndex);
         if (method === "getFile") return { file_path: `private/${payload?.file_id}.ogg` };
         if (method === "sendMessageDraft") return true;
+        if (method === "createForumTopic") return { message_thread_id: 55 };
         const responseMessageId = nextMessageId++;
         call.responseMessageId = responseMessageId;
         return { message_id: responseMessageId };
@@ -320,6 +323,54 @@ describe("TelegramTransportAdapter inbound conversion", () => {
       }),
     ]);
     await adapter.stop();
+  });
+
+  test("creates one forum topic for an authorized root message and routes the turn into it", async () => {
+    const { adapter, calls, received, store } = await fixture({ createTopicsFromRoot: true });
+    const rootMessage = message({
+      message_id: 12,
+      text: "Plan the release\nwith a safe rollout",
+      chat: { id: -1001, type: "supergroup", is_forum: true },
+    });
+    await adapter.handleUpdate({ update_id: 1, message: rootMessage });
+    await adapter.handleUpdate({ update_id: 2, message: rootMessage });
+
+    expect(calls.filter(({ method }) => method === "createForumTopic")).toEqual([{
+      method: "createForumTopic",
+      payload: { chat_id: -1001, name: "Plan the release with a safe rollout" },
+    }]);
+    expect(received.map(({ address }) => address)).toEqual([
+      { transport: "telegram", account: "default", channel: "-1001", thread: "55" },
+      { transport: "telegram", account: "default", channel: "-1001", thread: "55" },
+    ]);
+    expect(store.checkpoints.get("telegram:root_topic:-1001:12")).toBe(55);
+    await adapter.stop();
+  });
+
+  test("never creates forum topics for unauthorized users or root commands", async () => {
+    const unauthorized = await fixture({
+      createTopicsFromRoot: true,
+      resolveIdentity: () => undefined,
+    });
+    await unauthorized.adapter.handleUpdate({
+      update_id: 1,
+      message: message({ chat: { id: -1001, type: "supergroup", is_forum: true } }),
+    });
+    expect(unauthorized.calls.some(({ method }) => method === "createForumTopic")).toBe(false);
+    expect(unauthorized.received[0]?.address.thread).toBeUndefined();
+    await unauthorized.adapter.stop();
+
+    const authorized = await fixture({ createTopicsFromRoot: true });
+    await authorized.adapter.handleUpdate({
+      update_id: 1,
+      message: message({
+        text: "/status",
+        chat: { id: -1001, type: "supergroup", is_forum: true },
+      }),
+    });
+    expect(authorized.calls.some(({ method }) => method === "createForumTopic")).toBe(false);
+    expect(authorized.received[0]?.address.thread).toBeUndefined();
+    await authorized.adapter.stop();
   });
 
   test("checkpoints only completed updates and ignores their replay", async () => {

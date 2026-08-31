@@ -45,6 +45,8 @@ describe("GatewayStore", () => {
       ompSessionPath: "/sessions/42.jsonl",
       workspace: { root: "/work/project" },
     });
+    expect(restarted.hasConversationBindingForSession("/sessions/42.jsonl")).toBe(true);
+    expect(restarted.hasConversationBindingForSession("/sessions/missing.jsonl")).toBe(false);
     expect(restarted.getCheckpoint("telegram", "update_id")).toBe("100");
     expect(restarted.getPendingInteraction("approve-42")).toEqual({
       id: "approve-42",

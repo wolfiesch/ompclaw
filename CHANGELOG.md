@@ -2,10 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 0.4.0 (2026-08-30)
 
 ### Added
 
+- Add opt-in Telegram forum-topic sessions, including root-message topic creation and persisted topic-to-session routing.
 - Persist queued, running, tool, completed, stopped, failed, and interrupted task states; expose recent tasks with `/tasks`; and render authenticated stop controls in Telegram.
 - Add a native Telegram command menu, `/home` control center, and paginated model and reasoning pickers.
 - Stream partial responses through native Telegram drafts with a typing fallback when the Bot API does not support drafts.
