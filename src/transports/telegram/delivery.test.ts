@@ -150,6 +150,26 @@ describe("Telegram outbound delivery", () => {
     ]);
   });
 
+  test("drops a stale receipt when Telegram reports its message already absent", async () => {
+    let messageId = 100;
+    const { outbound, calls } = harness(async (method) => {
+      if (method === "deleteMessage") throw new TgError("Bad Request: message to delete not found", 400);
+      if (method === "sendMessage") return { message_id: ++messageId };
+      return true;
+    });
+    const initial = await outbound.sendMessages(
+      address,
+      "x".repeat(TELEGRAM_MAX_CHARS + 200),
+      context,
+    );
+    calls.splice(0);
+
+    const compact = await outbound.replaceMessages(address, initial, "updated", context);
+    expect(compact).toEqual([{ transport: "telegram", messageId: "101" }]);
+    expect(calls.map((entry) => entry.method)).toEqual(["deleteMessage", "editMessageText"]);
+    expect(calls.at(-1)?.payload).toMatchObject({ message_id: 101, text: "updated" });
+  });
+
   test("retains and refreshes control-card chunks that Telegram can no longer delete", async () => {
     let messageId = 100;
     const { outbound, calls } = harness(async (method) => {
