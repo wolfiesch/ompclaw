@@ -499,6 +499,8 @@ export class RpcGatewayRuntime {
         throw error;
       } finally {
         this.#activeTurn = undefined;
+        if (this.#status.state) this.#status.state.isStreaming = false;
+        this.#wakeIdleWaiters();
         await this.#refreshState();
         await this.#reactToSource(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
       }
@@ -527,7 +529,7 @@ export class RpcGatewayRuntime {
       const response = await rpc.send(command);
       if (isRecord(response.data) && response.data.agentInvoked === false) {
         await this.#setTurnLifecycle("completed");
-        this.#clearActiveDelivery(delivery);
+        this.#clearActiveDelivery(delivery, true);
         await this.#refreshState();
       }
     } catch (error) {
@@ -688,7 +690,7 @@ export class RpcGatewayRuntime {
         this.#activate(delivery);
         const response = await this.#sendRpc({ type: "prompt", message: `/${name}${args ? ` ${args}` : ""}` });
         if (isRecord(response.data) && response.data.agentInvoked === false) {
-          this.#clearActiveDelivery(delivery);
+          this.#clearActiveDelivery(delivery, true);
           await this.#refreshState();
         }
       }
@@ -973,9 +975,10 @@ export class RpcGatewayRuntime {
     if (!this.#activeTurn) this.#activeTurn = { ...delivery };
   }
 
-  #clearActiveDelivery(delivery: RpcGatewayUiTarget): void {
+  #clearActiveDelivery(delivery: RpcGatewayUiTarget, terminal = false): void {
     if (!this.#activeTurn || !this.#sameDelivery(this.#activeTurn, delivery)) return;
     this.#activeTurn = undefined;
+    if (terminal && this.#status.state) this.#status.state.isStreaming = false;
     this.#wakeIdleWaiters();
   }
 
