@@ -18,7 +18,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Persist full queued inbound requests before transport acknowledgement, retry dispatch failures without releasing deduplication claims, and replay pending work after restart.
-- Resume scheduler-owned pending attempts through scheduler accounting, preserve queued attachment files during inbox cleanup, and serialize session-mutating controls behind active work.
+- Resume scheduler-owned pending attempts through scheduler accounting, preserve queued attachment files during inbox cleanup, serialize session-mutating controls behind active work, and gate immediate RPC bash aborts on RPC bash being enabled.
 - Retry poison entries behind newer queued work and retry post-dispatch bookkeeping without resubmitting successful prompts.
 - Revalidate durable principals at dispatch and keep recovered prompts behind the startup gate until the transport core starts.
 

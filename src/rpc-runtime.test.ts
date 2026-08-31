@@ -294,6 +294,7 @@ describe("RpcGatewayRuntime", () => {
     expect(runtime.isActiveConversation(first)).toBe(true);
     expect(runtime.isActiveConversation(second)).toBe(false);
     expect(runtime.canHandleInboundImmediately(message("first", "/steer correct this"))).toBe(true);
+    expect(runtime.canHandleInboundImmediately(message("first", "/abortbash"))).toBe(false);
     expect(runtime.canHandleInboundImmediately(message("first", "/new"))).toBe(false);
     expect(runtime.canHandleInboundImmediately(message("first", "/switch /sessions/other"))).toBe(false);
     expect(runtime.canHandleInboundImmediately(message("second", "/status"))).toBe(true);
@@ -326,6 +327,16 @@ describe("RpcGatewayRuntime", () => {
     const secondFinal = deliveries.find((call) => textFromContent(call.content) === "second final");
     expect(firstFinal).toMatchObject({ address: first.address, context: { principal: first.principal, origin: first.address } });
     expect(secondFinal).toMatchObject({ address: second.address, context: { principal: second.principal, origin: second.address } });
+    await runtime.stop();
+  });
+
+  test("handles abortbash immediately only when RPC bash is enabled", async () => {
+    const runtime = new RpcGatewayRuntime({ config: { ...config, allowRpcBash: true }, delivery: delivery() });
+    await runtime.start();
+    const active = message("first", "Build this");
+    await runtime.handleInbound(active);
+
+    expect(runtime.canHandleInboundImmediately(message("first", "/abortbash"))).toBe(true);
     await runtime.stop();
   });
 

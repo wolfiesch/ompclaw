@@ -382,7 +382,8 @@ export class RpcGatewayRuntime {
     if (parsed === undefined) return false;
     const active = this.#activeTurn;
     if (active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message))) {
-      return SAME_DELIVERY_IMMEDIATE_COMMANDS.has(parsed.name);
+      return SAME_DELIVERY_IMMEDIATE_COMMANDS.has(parsed.name)
+        && (parsed.name !== "abortbash" || this.#options.config.allowRpcBash);
     }
     return CROSS_DELIVERY_COMMANDS.has(parsed.name);
   }
