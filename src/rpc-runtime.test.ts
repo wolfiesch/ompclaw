@@ -154,7 +154,7 @@ function defaultUiResponse<Request extends UiRequest>(request: Request): UiRespo
   return responses[request.type] as UiResponseFor<Request>;
 }
 
-function delivery(): GatewayDelivery {
+function delivery(onReact?: (reaction: { readonly emoji: string }) => Promise<void>): GatewayDelivery {
   return {
     send: async (address, content, context, signal) => {
       deliveries.push({ method: "send", address, context, content, signal });
@@ -170,6 +170,7 @@ function delivery(): GatewayDelivery {
     },
     react: async (address, _receipt, reaction, context, signal) => {
       deliveries.push({ method: "react", address, context, reaction, signal });
+      await onReact?.(reaction);
     },
     presentUi: async <Request extends UiRequest>(address, request, context, signal): Promise<UiResponseFor<Request>> => {
       deliveries.push({ method: "presentUi", address, context, request, signal });
@@ -426,7 +427,16 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("finishes the source reaction when a terminal prompt event skips the agent", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const terminalReaction = Promise.withResolvers<void>();
+    let terminalReactionStarted = false;
+    const runtime = new RpcGatewayRuntime({
+      config,
+      delivery: delivery(async (reaction) => {
+        if (reaction.emoji !== "👍") return;
+        terminalReactionStarted = true;
+        await terminalReaction.promise;
+      }),
+    });
     await runtime.start();
     const sourceReceipt = { transport: "test", messageId: "source-prompt-result" };
     await runtime.handleInbound({ ...message("first", "Run a command"), sourceReceipt });
@@ -438,6 +448,11 @@ describe("RpcGatewayRuntime", () => {
     rpc.failNextGetState = true;
     rpc.emit({ type: "prompt_result", agentInvoked: false });
     await waiting;
+    expect(runtime.isBusy()).toBe(false);
+    await settle();
+    expect(terminalReactionStarted).toBe(true);
+    terminalReaction.resolve();
+    await settle();
 
     expect(rpc.state.isStreaming).toBe(false);
     expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
