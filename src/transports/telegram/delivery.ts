@@ -265,17 +265,65 @@ export class Outbound {
     options: TelegramMessageOptions = {},
     signal?: AbortSignal,
   ): Promise<OutboundReceipt> {
-    await this.#assertTarget(address, context);
-    const pieces = renderDirectText(text, options);
-    let result: OutboundReceipt | undefined;
-    for (let index = 0; index < pieces.length; index += 1) {
-      result = await this.#sendOneText(address, pieces[index]!, {
-        replyTo: index === 0 ? options.replyTo : undefined,
-        replyMarkup: index === pieces.length - 1 ? options.replyMarkup : undefined,
-      }, signal);
-    }
+    const messages = await this.sendMessages(address, text, context, options, signal);
+    const result = messages.at(-1);
     if (result === undefined) throw new Error("Telegram message text must not be empty");
     return result;
+  }
+
+  async sendMessages(
+    address: ConversationAddress,
+    text: string,
+    context: DeliveryContext,
+    options: TelegramMessageOptions = {},
+    signal?: AbortSignal,
+  ): Promise<readonly OutboundReceipt[]> {
+    await this.#assertTarget(address, context);
+    const pieces = renderDirectText(text, options);
+    const results: OutboundReceipt[] = [];
+    for (let index = 0; index < pieces.length; index += 1) {
+      results.push(await this.#sendOneText(address, pieces[index]!, {
+        replyTo: index === 0 ? options.replyTo : undefined,
+        replyMarkup: index === pieces.length - 1 ? options.replyMarkup : undefined,
+      }, signal));
+    }
+    return results;
+  }
+
+  async replaceMessages(
+    address: ConversationAddress,
+    targets: readonly OutboundReceipt[],
+    text: string,
+    context: DeliveryContext,
+    options: TelegramMessageOptions = {},
+    signal?: AbortSignal,
+  ): Promise<readonly OutboundReceipt[]> {
+    await this.#assertTarget(address, context);
+    const pieces = renderDirectText(text, options);
+    const results: OutboundReceipt[] = [];
+    const emptyMarkup = { inline_keyboard: [] };
+    const count = Math.max(targets.length, pieces.length);
+    for (let index = 0; index < count; index += 1) {
+      const target = targets[index];
+      const piece = pieces[index];
+      if (piece === undefined) {
+        if (target !== undefined) {
+          await this.#request("deleteMessage", {
+            ...messageBase(address),
+            message_id: messageId(target),
+          }, signal, address);
+        }
+        continue;
+      }
+      const replyMarkup = index === pieces.length - 1 ? options.replyMarkup ?? emptyMarkup : emptyMarkup;
+      if (target === undefined) {
+        results.push(await this.#sendOneText(address, piece, { replyMarkup }, signal));
+        continue;
+      }
+      await this.#editOneText(address, target, piece, replyMarkup, signal);
+      results.push(target);
+    }
+    return results;
   }
 
   async setReplyMarkup(
@@ -385,18 +433,30 @@ export class Outbound {
   ): Promise<void> {
     const [first, ...remaining] = renderText(text, format);
     if (first === undefined) return;
+    await this.#editOneText(address, target, first, undefined, signal);
+    for (const part of remaining) await this.#sendOneText(address, part, {}, signal);
+  }
+
+  async #editOneText(
+    address: ConversationAddress,
+    target: OutboundReceipt,
+    text: RenderedText,
+    replyMarkup: Record<string, unknown> | undefined,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const payload: Record<string, unknown> = {
       ...messageBase(address),
       message_id: messageId(target),
-      text: first.wireText,
-      ...(first.parseMode === undefined ? {} : { parse_mode: first.parseMode }),
+      text: text.wireText,
+      ...(text.parseMode === undefined ? {} : { parse_mode: text.parseMode }),
+      ...(replyMarkup === undefined ? {} : { reply_markup: replyMarkup }),
     };
     try {
       await this.#request("editMessageText", payload, signal, address);
     } catch (error) {
       if (unchangedMessage(error)) return;
-      if (first.parseMode === undefined || !parseFailure(error)) throw error;
-      const plain: Record<string, unknown> = { ...payload, text: first.plainText };
+      if (text.parseMode === undefined || !parseFailure(error)) throw error;
+      const plain: Record<string, unknown> = { ...payload, text: text.plainText };
       delete plain.parse_mode;
       try {
         await this.#request("editMessageText", plain, signal, address);
@@ -404,7 +464,6 @@ export class Outbound {
         if (!unchangedMessage(plainError)) throw plainError;
       }
     }
-    for (const part of remaining) await this.#sendOneText(address, part, {}, signal);
   }
 
   async #sendAttachments(
