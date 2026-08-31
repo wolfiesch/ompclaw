@@ -323,6 +323,23 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("releases idle waiters when a terminal prompt result cannot refresh state", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    await runtime.handleInbound(message("first", "Run a command"));
+    const rpc = FakeOmpRpcClient.instances[0];
+    rpc.emit({ type: "agent_start" });
+    await settle();
+    const waiting = runtime.waitUntilIdle();
+
+    rpc.failNextGetState = true;
+    rpc.emit({ type: "prompt_result", agentInvoked: false });
+    await waiting;
+
+    expect(rpc.state.isStreaming).toBe(false);
+    await runtime.stop();
+  });
+
   test("waits for scheduled turns to finish before acknowledging dispatch", async () => {
     const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
     await runtime.start();
