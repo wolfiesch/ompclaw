@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { GatewayStore, JsonValue, PendingInteraction } from "../../gateway-store";
 import type {
@@ -392,7 +392,14 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#stopHeartbeat = this.#heartbeat(lock);
     try {
       if (this.#commands.length > 0) {
-        await this.#telegram("setMyCommands", { commands: this.#commands }, context.signal);
+        try {
+          await this.#telegram("setMyCommands", { commands: this.#commands }, context.signal);
+        } catch (error) {
+          if (context.signal?.aborted) throw error;
+          this.#log?.warn(
+            `[telegram] command menu registration failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
       this.#poller.start(
         this.#token,
@@ -718,7 +725,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       for (const attachment of pending.message.content.attachments ?? []) {
         try {
           const url = new URL(attachment.url);
-          if (url.protocol === "file:") paths.add(resolve(url.pathname));
+          if (url.protocol === "file:") paths.add(resolve(fileURLToPath(url)));
         } catch {
           continue;
         }
