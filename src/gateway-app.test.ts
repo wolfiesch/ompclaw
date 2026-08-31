@@ -89,6 +89,7 @@ class MemoryStore implements GatewayApplicationStore {
   readonly releases: string[] = [];
   readonly migrations = new Set<string>();
   closed = false;
+  failBindings = 0;
 
   close() {
     this.closed = true;
@@ -130,6 +131,10 @@ class MemoryStore implements GatewayApplicationStore {
   }
 
   bindConversation(binding: ConversationBinding) {
+    if (this.failBindings > 0) {
+      this.failBindings -= 1;
+      throw new Error("temporary binding failure");
+    }
     this.bindings.push(binding);
   }
 
@@ -545,6 +550,87 @@ describe("GatewayApplication", () => {
     await core.options().onInbound(inbound("retry-me"));
     await Bun.sleep(5);
     expect(attempts).toBe(2);
+    await app.stop();
+  });
+
+  test("retries bookkeeping without dispatching a successful prompt twice", async () => {
+    const store = new MemoryStore();
+    store.failBindings = 1;
+    const core = coreHarness([]);
+    let dispatches = 0;
+    const errors: unknown[] = [];
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound() {
+            dispatches += 1;
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+        inboundRetryDelayMs: 1,
+        onInboundDispatchError: (_message, error) => errors.push(error),
+      },
+    });
+
+    await app.start();
+    await core.options().onInbound(inbound("completion-retry"));
+    await waitFor(() => store.pending.size === 0);
+    expect(dispatches).toBe(1);
+    expect(errors).toHaveLength(1);
+    expect(store.bindings).toHaveLength(1);
+    await app.stop();
+  });
+
+  test("lets later queued work pass a permanently failing inbound message", async () => {
+    const store = new MemoryStore();
+    const core = coreHarness([]);
+    const handled: string[] = [];
+    const errors: unknown[] = [];
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            if (message.id === "poison") throw new Error("permanent dispatch failure");
+            handled.push(message.id);
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+        inboundRetryDelayMs: 500,
+        onInboundDispatchError: (_message, error) => errors.push(error),
+      },
+    });
+
+    await app.start();
+    await core.options().onInbound(inbound("poison"));
+    await core.options().onInbound(inbound("healthy"));
+    await waitFor(() => handled.includes("healthy"));
+    expect(errors).toHaveLength(1);
+    expect(store.pending.has("telegram/bot/poison")).toBe(true);
+    expect(store.pending.has("telegram/bot/healthy")).toBe(false);
     await app.stop();
   });
 

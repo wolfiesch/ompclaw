@@ -98,6 +98,12 @@ export interface GatewayApplicationStatus {
   readonly sessionFile?: string;
 }
 
+interface PendingInboundCompletion {
+  readonly sessionFile: string;
+  readonly associateSession: boolean;
+  readonly updateSharedSession: boolean;
+}
+
 /**
  * One process owns one OMP RPC session. Transport adapters are deliberately
  * downstream of that session: no poller or server can accept traffic first.
@@ -122,6 +128,8 @@ export class GatewayApplication {
   #releaseDispatchReady: (() => void) | undefined;
   #dispatchAbort: AbortController | undefined;
   #pendingDispatches = new Map<string, Promise<void>>();
+  #pendingInboundCompletions = new Map<string, PendingInboundCompletion>();
+  #inboundRetryDelays = new Map<string, number>();
   #queuedInboundCount = 0;
 
   constructor(options: GatewayApplicationOptions) {
@@ -323,50 +331,68 @@ export class GatewayApplication {
 
   async #retryPendingInbound(message: InboundMessage, immediate: boolean): Promise<void> {
     await this.#dispatchReady;
-    let retryDelay = this.#seams.inboundRetryDelayMs ?? 1_000;
-    while (this.#state === "starting" || this.#state === "started") {
-      try {
-        await this.#dispatchPendingInbound(message, immediate, false);
-        return;
-      } catch (error) {
-        this.#reportInboundDispatchError(message, error);
-        if (this.#state !== "starting" && this.#state !== "started") return;
-        try {
-          await delay(retryDelay, undefined, { signal: this.#dispatchAbort?.signal });
-        } catch {
-          return;
-        }
-        retryDelay = Math.min(retryDelay * 2, 15_000);
-      }
+    const key = this.#inboundKey(message);
+    try {
+      await this.#dispatchPendingInbound(message, immediate, false);
+      this.#pendingInboundCompletions.delete(key);
+      this.#inboundRetryDelays.delete(key);
+    } catch (error) {
+      this.#reportInboundDispatchError(message, error);
+      if (this.#state !== "starting" && this.#state !== "started") return;
+      const retryDelay = this.#inboundRetryDelays.get(key) ?? this.#seams.inboundRetryDelayMs ?? 1_000;
+      this.#inboundRetryDelays.set(key, Math.min(retryDelay * 2, 15_000));
+      void delay(retryDelay, undefined, { signal: this.#dispatchAbort?.signal })
+        .then(() => {
+          if (this.#state === "starting" || this.#state === "started") {
+            this.#schedulePendingInbound(message, immediate);
+          }
+        })
+        .catch(() => undefined);
     }
   }
 
   async #dispatchPendingInbound(message: InboundMessage, immediate: boolean, scheduled: boolean): Promise<void> {
     const store = this.#requireStore();
     const runtime = this.#requireRuntime();
-    if (!immediate) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
+    const key = this.#inboundKey(message);
+    let completion = this.#pendingInboundCompletions.get(key);
+    if (completion === undefined) {
+      if (!immediate) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
 
-    const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
-    const associateSession = !topicSessions || !immediate;
-    if (topicSessions && !immediate) await this.#selectConversationSession(store, runtime, message);
-    if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
-    else await runtime.handleInbound(message);
+      const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
+      const associateSession = !topicSessions || !immediate;
+      if (topicSessions && !immediate) await this.#selectConversationSession(store, runtime, message);
+      if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
+      else await runtime.handleInbound(message);
 
-    const sessionFile = this.#sessionFile;
-    if (sessionFile === undefined) throw new Error("OMP runtime did not report its current session file");
-    if (associateSession) {
+      const sessionFile = this.#sessionFile;
+      if (sessionFile === undefined) throw new Error("OMP runtime did not report its current session file");
+      completion = {
+        sessionFile,
+        associateSession,
+        updateSharedSession: topicSessions && !this.#isTopicAddress(message.address) && associateSession,
+      };
+      this.#pendingInboundCompletions.set(key, completion);
+    }
+
+    if (completion.associateSession) {
       store.bindConversation({
         address: message.address,
-        ompSessionPath: sessionFile,
+        ompSessionPath: completion.sessionFile,
         workspace: this.#config.workspace,
       });
-      if (topicSessions && !this.#isTopicAddress(message.address)) this.#sharedSessionFile = sessionFile;
     }
-    this.#checkpointSession();
-    this.#checkpointSharedSession();
+    if (completion.updateSharedSession) {
+      this.#sharedSessionFile = completion.sessionFile;
+      store.setCheckpoint("omp", "shared_session_file", completion.sessionFile);
+    }
+    if (this.#sessionFile === completion.sessionFile) {
+      store.setCheckpoint("omp", "session_file", completion.sessionFile);
+    }
     if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
       throw new Error(`Pending inbound message ${message.id} disappeared before completion`);
     }
+    this.#pendingInboundCompletions.delete(key);
   }
 
   #inboundKey(message: InboundMessage): string {
@@ -547,6 +573,8 @@ export class GatewayApplication {
     this.#pendingDispatches.clear();
     this.#dispatchTail = Promise.resolve();
     this.#queuedInboundCount = 0;
+    this.#pendingInboundCompletions.clear();
+    this.#inboundRetryDelays.clear();
 
     const store = this.#store;
     this.#store = undefined;
