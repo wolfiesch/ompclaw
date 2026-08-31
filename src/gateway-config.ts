@@ -68,6 +68,12 @@ export interface GatewayLearningConfig {
   readonly memoryModel: GatewayMemoryModel;
 }
 
+export interface GatewayUpdatesConfig {
+  readonly enabled: boolean;
+  readonly repository?: string;
+  readonly healthTimeoutMs: number;
+}
+
 export interface GatewayConfig {
   readonly workspace: string;
   readonly stateDir: string;
@@ -79,6 +85,7 @@ export interface GatewayConfig {
   };
   readonly automation: GatewayAutomationConfig;
   readonly learning: GatewayLearningConfig;
+  readonly updates: GatewayUpdatesConfig;
 }
 
 export interface GatewaySecrets {
@@ -129,7 +136,7 @@ export function loadGatewayConfig(options: LoadGatewayConfigOptions = {}): Gatew
 /** Parse a JSON value for callers that already bound file loading. */
 export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()): GatewayConfig {
   const root = object(value, "OmpClaw config");
-  rejectUnknown(root, ["workspace", "stateDir", "profile", "omp", "transports", "automation", "learning"], "OmpClaw config");
+  rejectUnknown(root, ["workspace", "stateDir", "profile", "omp", "transports", "automation", "learning", "updates"], "OmpClaw config");
 
   const workspace = root.workspace === undefined ? resolve(cwd) : expandGatewayPath(string(root.workspace, "workspace"), cwd);
   const stateDir = root.stateDir === undefined
@@ -140,8 +147,9 @@ export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()):
   const transports = parseTransports(root.transports);
   const automation = parseAutomation(root.automation);
   const learning = parseLearning(root.learning);
+  const updates = parseUpdates(root.updates, cwd);
 
-  return { workspace, stateDir, profile, omp, transports, automation, learning };
+  return { workspace, stateDir, profile, omp, transports, automation, learning, updates };
 }
 
 /** Resolve only the env names carried by config, keeping token values out of it. */
@@ -332,6 +340,22 @@ function parseLearning(value: unknown): GatewayLearningConfig {
     autoCapture: boolean(learning.autoCapture, "learning.autoCapture", false),
     minToolCalls: integer(learning.minToolCalls, "learning.minToolCalls", 1, 100, 5),
     memoryModel: memoryModel as GatewayMemoryModel,
+  };
+}
+
+function parseUpdates(value: unknown, cwd: string): GatewayUpdatesConfig {
+  if (value === undefined) return { enabled: false, healthTimeoutMs: 30_000 };
+  const updates = object(value, "updates");
+  rejectUnknown(updates, ["enabled", "repository", "healthTimeoutMs"], "updates");
+  const enabled = boolean(updates.enabled, "updates.enabled", false);
+  const repository = updates.repository === undefined
+    ? undefined
+    : expandGatewayPath(string(updates.repository, "updates.repository"), cwd);
+  if (enabled && repository === undefined) throw new Error("updates.repository is required when updates.enabled");
+  return {
+    enabled,
+    ...(repository === undefined ? {} : { repository }),
+    healthTimeoutMs: integer(updates.healthTimeoutMs, "updates.healthTimeoutMs", 5_000, 300_000, 30_000),
   };
 }
 

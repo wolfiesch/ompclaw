@@ -67,6 +67,7 @@ The JSON document never contains a token value. It names environment variables t
 | `transports` | object | enabled transport settings |
 | `automation` | object | optional durable unattended job runner |
 | `learning` | object | optional experimental gateway-scoped memory and managed-skill capture |
+| `updates` | object | optional transactional self-update from one fixed repository |
 
 ### `omp`
 
@@ -145,6 +146,42 @@ When enabled, the gateway writes a private generated OMP overlay at `stateDir/om
 With `omp.inheritHarness: true`, each gateway start refreshes desktop `skills`, `rules`, `commands`, `agents`, `docs`, and `bin` into read-only snapshots inside the named gateway profile. Root policy and harness configuration files refresh atomically. Symlinked skill directories are materialized so the named profile never points back into the desktop profile. Secret and volatile paths such as `.env*`, dependency directories, virtual environments, logs, caches, and browser profiles are excluded.
 
 OMP-managed skill creation and refinement write to the gateway profile's separate `managed-skills` directory. Gateway memory, managed skills, sessions, credentials, and databases stay isolated, while updated desktop harness content flows into the gateway on restart.
+
+### Transactional self-update
+
+Self-update is off by default. Enable it only for a trusted local checkout:
+
+```json
+{
+  "updates": {
+    "enabled": true,
+    "repository": "~/Projects/ompclaw",
+    "healthTimeoutMs": 30000
+  }
+}
+```
+
+| Field | Type and default | Meaning |
+| --- | --- | --- |
+| `enabled` | boolean, `false` | register update host tools and install the service through the release supervisor |
+| `repository` | required path when enabled | fixed Git checkout whose commits may be staged |
+| `healthTimeoutMs` | integer, `30000` | readiness deadline from 5000 to 300000 milliseconds before rollback |
+
+Run `service-install` again after enabling updates. The installer resolves `HEAD` in the configured repository, runs the repository checks, compiles the gateway and external supervisor into a versioned release directory under `stateDir/updates/releases`, and points `stateDir/updates/current` at that release. The service manager launches the external supervisor rather than the gateway directly.
+
+An authenticated principal with the `operator` role can ask OMP to stage one exact commit. OMP receives `ompclaw_stage_update`, which resolves the commit in the fixed repository, exports only tracked files for that commit, installs dependencies with lifecycle scripts disabled, runs `bun run check`, and compiles isolated gateway and supervisor executables. Staging does not alter the running service.
+
+Activation is a separate explicit request through `ompclaw_activate_update` using the staged release ID. The gateway records the candidate, the previous release, and the server-derived conversation route, then finishes and delivers the active Telegram turn. Only after that turn ends does it commit the restart request.
+
+The supervisor switches the `current` symlink atomically, starts the candidate, and waits for the candidate to finish gateway startup. A ready candidate becomes the active release. A candidate that exits or misses `healthTimeoutMs` is stopped, the symlink is restored to the previous release, and the previous release is restarted. Success or rollback is delivered to the same authenticated conversation after restart.
+
+Update execution is deliberately narrow:
+
+- The tools accept a commit and a staged release ID, not a command, branch checkout, repository path, service name, or destination.
+- Both tools require the active server-derived principal to have the `operator` role.
+- Build subprocesses receive a small allowlist of environment variables and no gateway, bot, or provider credentials.
+- Existing release directories are immutable and reusable only when their manifest matches the resolved commit.
+- The supervisor accepts only validated manifests beneath `stateDir/updates/releases` and switches only the managed `current` symlink.
 
 ### Telegram transport
 
@@ -287,7 +324,7 @@ ompclaw service-install \
   --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
-The installer requires both `--config` and `--env-file` as absolute regular-file paths, requires the environment file to be exactly mode `0600`, verifies that configured secrets resolve, and reports its manager and installed path. It uses launchd label `com.ompclaw` on macOS and user systemd unit `ompclaw.service` on Linux. The environment file is referenced by the service command rather than copied into the service definition.
+The installer requires both `--config` and `--env-file` as absolute regular-file paths, requires the environment file to be exactly mode `0600`, verifies that configured secrets resolve, and reports its manager and installed path. It uses launchd label `com.ompclaw` on macOS and user systemd unit `ompclaw.service` on Linux. The environment file is referenced by the service command rather than copied into the service definition. With updates disabled, the service runs the installed package executable. With updates enabled, it bootstraps a compiled release and runs the external supervisor through `stateDir/updates/current`.
 
 Remove a user service with:
 

@@ -60,7 +60,7 @@ export interface GatewayCliSeams {
   readonly createStore?: (path: string) => GatewayStore;
   readonly createDoctorRpc?: (options: OmpRpcClientOptions) => GatewayDoctorRpc;
   readonly callTelegram?: GatewayTelegramCall;
-  readonly installService?: (config: GatewayConfig, configPath: string, envFile: string) => ServiceInstallResult;
+  readonly installService?: (config: GatewayConfig, configPath: string, envFile: string) => ServiceInstallResult | Promise<ServiceInstallResult>;
   readonly uninstallService?: () => ServiceInstallResult;
   readonly write?: (line: string) => void;
 }
@@ -334,7 +334,7 @@ export async function executeGatewayCommand(args: GatewayCliArgs, config: Gatewa
         args.envFile === undefined ? undefined : expandGatewayPath(args.envFile),
       );
       resolveGatewaySecrets(config);
-      const result = (seams.installService ?? installRpcService)(config, paths.configPath, paths.envFile);
+      const result = await (seams.installService ?? installRpcService)(config, paths.configPath, paths.envFile);
       write(`Installed and started ${result.manager} service: ${result.path}`);
       return;
     }

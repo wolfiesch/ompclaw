@@ -47,6 +47,8 @@
     "src/gateway-scheduler.ts",
     "src/gateway-tools.ts",
     "src/gateway-types.ts",
+    "src/gateway-update.ts",
+    "src/gateway-update-supervisor.ts",
     "src/rpc-cli.ts",
     "src/rpc-client.ts",
     "src/rpc-config.ts",

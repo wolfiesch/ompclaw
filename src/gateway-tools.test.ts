@@ -16,6 +16,7 @@ import {
 } from "./gateway-tools";
 import type { RpcHostToolCall } from "./rpc-protocol";
 import type { GatewayAutomationControl } from "./gateway-scheduler";
+import type { GatewayUpdateControl } from "./gateway-update";
 
 const address: ConversationAddress = {
   transport: "test",
@@ -51,7 +52,11 @@ function hostToolCall(toolName: string, arguments_: unknown): RpcHostToolCall {
   };
 }
 
-function harness(initialUiResponse: UiResponse = { type: "input", cancelled: false, value: "typed answer" }, automation?: GatewayAutomationControl): {
+function harness(
+  initialUiResponse: UiResponse = { type: "input", cancelled: false, value: "typed answer" },
+  automation?: GatewayAutomationControl,
+  updates?: GatewayUpdateControl,
+): {
   readonly context: GatewayHostToolContext;
   readonly invocations: DeliveryInvocation[];
   setUiResponse(response: UiResponse): void;
@@ -75,7 +80,14 @@ function harness(initialUiResponse: UiResponse = { type: "input", cancelled: fal
     },
   };
   return {
-    context: { delivery, address, deliveryContext, identity, ...(automation === undefined ? {} : { automation }) },
+    context: {
+      delivery,
+      address,
+      deliveryContext,
+      identity,
+      ...(automation === undefined ? {} : { automation }),
+      ...(updates === undefined ? {} : { updates }),
+    },
     invocations,
     setUiResponse(response) {
       uiResponse = response;
@@ -104,7 +116,7 @@ describe("gateway host tools", () => {
   });
 
   test("advertises automation tools only when durable scheduling is enabled", () => {
-    expect(gatewayHostToolDefinitions(true).map((definition) => definition.name)).toEqual([
+    expect(gatewayHostToolDefinitions({ automation: true }).map((definition) => definition.name)).toEqual([
       "ompclaw_send",
       "ompclaw_react",
       "ompclaw_ask",
@@ -114,6 +126,16 @@ describe("gateway host tools", () => {
       "ompclaw_set_job_enabled",
       "ompclaw_delete_job",
       "ompclaw_run_job",
+    ]);
+  });
+
+  test("advertises updates only when transactional updates are enabled", () => {
+    expect(gatewayHostToolDefinitions({ updates: true }).map((definition) => definition.name)).toEqual([
+      "ompclaw_send",
+      "ompclaw_react",
+      "ompclaw_ask",
+      "ompclaw_stage_update",
+      "ompclaw_activate_update",
     ]);
   });
 
@@ -275,6 +297,56 @@ describe("gateway host tools", () => {
       jobs: [expect.stringContaining("job-1")],
     });
     await expect(executeGatewayHostTool(hostToolCall("ompclaw_delete_job", { id: "job-1" }), context)).resolves.toEqual({ deleted: true });
+  });
+
+  test("stages and arms updates only for an authenticated operator", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage(commit) {
+        calls.push(`stage:${commit}`);
+        return {
+          release: {
+            id: "0.8.0-0123456789ab",
+            commit: "0123456789abcdef0123456789abcdef01234567",
+            version: "0.8.0",
+            path: "/state/releases/0.8.0-0123456789ab",
+          },
+          reused: false,
+        };
+      },
+      async arm(releaseId, origin) {
+        calls.push(`arm:${releaseId}:${origin.principal.id}:${origin.address.channel}`);
+        return { update: "armed" };
+      },
+      async commitArmed() {},
+      async discardArmed() {},
+    };
+    const { context } = harness(undefined, undefined, updates);
+
+    await expect(executeGatewayHostTool(
+      hostToolCall("ompclaw_stage_update", { commit: "0123456789abcdef0123456789abcdef01234567" }),
+      context,
+    )).resolves.toEqual({ release: "0.8.0-0123456789ab", reused: false });
+    await expect(executeGatewayHostTool(
+      hostToolCall("ompclaw_activate_update", { release_id: "0.8.0-0123456789ab" }),
+      context,
+    )).resolves.toEqual({ update: "armed" });
+    expect(calls).toEqual([
+      "stage:0123456789abcdef0123456789abcdef01234567",
+      "arm:0.8.0-0123456789ab:principal-1:channel-1",
+    ]);
+
+    const nonOperator = {
+      ...context,
+      deliveryContext: {
+        ...context.deliveryContext,
+        principal: { id: "principal-2", roles: [] },
+      },
+    };
+    await expect(executeGatewayHostTool(
+      hostToolCall("ompclaw_activate_update", { release_id: "0.8.0-0123456789ab" }),
+      nonOperator,
+    )).rejects.toThrow("operator role");
   });
 
   test("rejects unknown and malformed arguments before invoking delivery", async () => {

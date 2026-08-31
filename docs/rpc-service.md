@@ -96,7 +96,7 @@ Only `select`, `confirm`, `input`, and `editor` produce a response back to OMP. 
 
 ## Gateway host tools
 
-The OMP child always receives three delivery host tools. When `automation.enabled` is true, it also receives six durable job-control tools. The gateway derives the principal, transport identity, and conversation address from the active server-owned context. A model cannot choose or override them.
+The OMP child always receives three delivery host tools. When `automation.enabled` is true, it also receives six durable job-control tools. When `updates.enabled` is true, it receives two transactional update tools. The gateway derives the principal, transport identity, and conversation address from the active server-owned context. A model cannot choose or override them.
 
 | Tool | Parameters | Behavior |
 | --- | --- | --- |
@@ -109,10 +109,14 @@ The OMP child always receives three delivery host tools. When `automation.enable
 | `ompclaw_set_job_enabled` | `id`, `enabled` | pause or resume an owned job |
 | `ompclaw_delete_job` | `id` | permanently remove an owned job |
 | `ompclaw_run_job` | `id` | make an owned job due now |
+| `ompclaw_stage_update` | `commit` | resolve and build one exact commit from the fixed configured repository without changing the active release; requires the `operator` role |
+| `ompclaw_activate_update` | `release_id` | arm a staged release for supervisor activation after the active turn finishes; requires the `operator` role |
 
 `ompclaw_send` accepts only absolute local paths for `files`. Transport adapters enforce their own attachment and message rules. `ompclaw_ask` without `options` uses text input; with options it uses selection, and `multi: true` requests multi-select. Host-tool cancellation aborts the in-progress gateway delivery operation.
 
 One-shot `at` values must be ISO 8601 date-times with an explicit UTC offset. Cron timezones must be valid IANA names. Names, prompts, expressions, and retry state are bounded and validated before SQLite mutation. Job lookup and mutation always include the server-derived principal ID.
+
+Update staging cancellation terminates the active build subprocess. Update activation persists the server-derived principal and conversation address so the restarted gateway can deliver the success or rollback result to the same origin.
 
 ## WebSocket protocol v1
 

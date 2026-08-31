@@ -16,6 +16,7 @@ import {
   type GatewayDelivery,
 } from "./gateway-tools";
 import { formatScheduledJob, ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
+import type { GatewayUpdateControl } from "./gateway-update";
 import type {
   GatewayTurnLifecycleStore,
   TurnLifecycle,
@@ -53,6 +54,7 @@ export interface RpcGatewayRuntimeOptions {
   readonly onSessionState?: (state: RpcSessionState) => void;
   readonly automation?: GatewayAutomationControl;
   readonly turnStore?: GatewayTurnLifecycleStore;
+  readonly updates?: GatewayUpdateControl;
   readonly now?: () => number;
 }
 
@@ -536,7 +538,10 @@ export class RpcGatewayRuntime {
     });
     await rpc.start();
     await rpc.send({ type: "set_subagent_subscription", level: "progress" });
-    await rpc.send({ type: "set_host_tools", tools: gatewayHostToolDefinitions(this.#options.automation !== undefined) });
+    await rpc.send({ type: "set_host_tools", tools: gatewayHostToolDefinitions({
+      automation: this.#options.automation !== undefined,
+      updates: this.#options.updates !== undefined,
+    }) });
     const state = await this.#requestData<RpcSessionState>({ type: "get_state" });
     this.#status.state = state;
     this.#persistSession(state);
@@ -644,8 +649,10 @@ export class RpcGatewayRuntime {
       if (this.#status.state) this.#status.state.isStreaming = false;
       const active = this.#activeTurn;
       const terminalState = this.#terminalState(frame.messages);
+      let finalDelivered = false;
       try {
         await this.#finalizeAssistantText(finalAssistantText(frame.messages));
+        finalDelivered = true;
         await this.#setTurnLifecycle(terminalState);
         active?.scheduledCompletion?.resolve();
       } catch (error) {
@@ -658,6 +665,12 @@ export class RpcGatewayRuntime {
         this.#wakeIdleWaiters();
         await this.#refreshState();
         this.#queueSourceReaction(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
+        try {
+          if (finalDelivered) await this.#options.updates?.commitArmed();
+          else await this.#options.updates?.discardArmed();
+        } catch (error) {
+          this.#log.error(`[ompclaw update] failed to finalize armed update: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       return;
     }
@@ -1370,6 +1383,7 @@ export class RpcGatewayRuntime {
         deliveryContext: active.deliveryContext,
         identity: active.identity,
         automation: this.#options.automation,
+        updates: this.#options.updates,
       }, controller.signal);
       if (!controller.signal.aborted) {
         rpc.write({ type: "host_tool_result", id: call.id, result: { content: [{ type: "text", text: valueText(result) }] } });

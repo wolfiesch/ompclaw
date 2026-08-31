@@ -4,6 +4,7 @@ export * from "./gateway-store";
 export * from "./gateway-tools";
 export * from "./gateway-config";
 export * from "./gateway-app";
+export * from "./gateway-update";
 export * from "./rpc-protocol";
 export * from "./rpc-client";
 export * from "./rpc-runtime";

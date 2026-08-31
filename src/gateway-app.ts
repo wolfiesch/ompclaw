@@ -27,6 +27,7 @@ import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } f
 import { RpcGatewayRuntime, runtimeCommandMenu, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import type { RpcSessionState } from "./rpc-protocol";
 import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
+import { GatewayUpdateCoordinator } from "./gateway-update";
 import { TelegramTransportAdapter, type TelegramTransportAdapterOptions } from "./transports/telegram/adapter";
 import { WebSocketTransportAdapter, type WebSocketTransportOptions } from "./transports/websocket/adapter";
 
@@ -120,6 +121,7 @@ export class GatewayApplication {
   #core: GatewayCoreRuntime | undefined;
   #runtime: GatewayRuntime | undefined;
   #scheduler: GatewaySchedulerRuntime | undefined;
+  #updates: GatewayUpdateCoordinator | undefined;
   #releaseHeartbeat: (() => void) | undefined;
   #adapters: TransportAdapter[] = [];
   #sessionFile: string | undefined;
@@ -216,12 +218,18 @@ export class GatewayApplication {
       const learningOverlay = prepareLearningOverlay(this.#config);
       if (learningOverlay !== undefined) rpcConfig = { ...rpcConfig, configFiles: [...rpcConfig.configFiles, learningOverlay] };
 
+      const updates = this.#config.updates.enabled
+        ? new GatewayUpdateCoordinator({ config: this.#config.updates, stateDir: this.#config.stateDir })
+        : undefined;
+      await updates?.discardArmed();
+      this.#updates = updates;
       const runtime = (this.#seams.createRuntime ?? ((options: RpcGatewayRuntimeOptions) => new RpcGatewayRuntime(options)))({
         config: rpcConfig,
         delivery: core,
         sessionFile: this.#sessionFile,
         onSessionState: (session) => this.#recordSessionState(session),
         ...(scheduler === undefined ? {} : { automation: scheduler }),
+        ...(updates === undefined ? {} : { updates }),
         ...(isTurnLifecycleStore(store) ? { turnStore: store } : {}),
       });
       this.#runtime = runtime;
@@ -239,6 +247,9 @@ export class GatewayApplication {
       this.#releaseDispatchReady?.();
       this.#releaseDispatchReady = undefined;
       scheduler?.start();
+      void updates?.reconcile(core).catch((error: unknown) => {
+        console.error(`[ompclaw update] reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
     } catch (error) {
       await this.#rollbackStart(lockHeld);
       throw error;
@@ -599,6 +610,9 @@ export class GatewayApplication {
     this.#queuedInboundCount = 0;
     this.#pendingInboundCompletions.clear();
     this.#inboundRetryDelays.clear();
+
+    this.#updates?.stop();
+    this.#updates = undefined;
 
     const store = this.#store;
     this.#store = undefined;

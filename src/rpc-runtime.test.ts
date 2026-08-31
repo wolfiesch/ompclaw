@@ -13,6 +13,7 @@ import type {
 } from "./gateway-types";
 import type { GatewayDelivery } from "./gateway-tools";
 import type { GatewayTurnLifecycleStore, TurnLifecycle } from "./gateway-store";
+import type { GatewayUpdateControl } from "./gateway-update";
 import type { RpcCommandInput } from "./rpc-client";
 import type { RpcRuntimeConfig } from "./rpc-config";
 import type { RpcRecord, RpcResponse, RpcSessionState } from "./rpc-protocol";
@@ -365,6 +366,54 @@ describe("RpcGatewayRuntime", () => {
     });
     expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
     await runtime.stop();
+  });
+
+  test("commits activation only after final delivery and discards it when delivery fails", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const successful = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    await successful.start();
+    await successful.handleInbound(message("update-success", "Activate"));
+    FakeOmpRpcClient.instances[0]!.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Activation scheduled" }] }],
+    });
+    await waitFor(() => calls.includes("commit"));
+    expect(calls).toEqual(["commit"]);
+    await successful.stop();
+
+    const failedDelivery = delivery();
+    failedDelivery.finalize = async () => {
+      throw new Error("final delivery failed");
+    };
+    const failed = new RpcGatewayRuntime(
+      { config, delivery: failedDelivery, updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
+    await failed.start();
+    await failed.handleInbound(message("update-failure", "Activate"));
+    FakeOmpRpcClient.instances[1]!.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Activation scheduled" }] }],
+    });
+    await waitFor(() => calls.includes("discard"));
+    expect(calls).toEqual(["commit", "discard"]);
+    await failed.stop();
   });
 
   test("dispatches a prompt without waiting for the receipt acknowledgement", async () => {

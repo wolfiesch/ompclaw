@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { isAbsolute } from "node:path";
-import { buildServiceArguments, renderSystemdUnit } from "./rpc-service";
+import { buildManagedServiceArguments, buildServiceArguments, renderSystemdUnit } from "./rpc-service";
 
 describe("systemd service generation", () => {
   test("escapes WorkingDirectory without quoting the absolute path", () => {
@@ -33,6 +33,32 @@ describe("systemd service generation", () => {
       "/home/user/.config/ompclaw/config.json",
       "--env-file",
       "/home/user/.config/ompclaw/ompclaw.env",
+    ]);
+  });
+
+  test("runs update-enabled services through the external supervisor", () => {
+    const args = buildManagedServiceArguments({
+      stateDir: "/home/user/.omp/agent/ompclaw",
+      updates: {
+        enabled: true,
+        repository: "/home/user/Projects/ompclaw",
+        healthTimeoutMs: 45_000,
+      },
+    }, {
+      configPath: "/home/user/.config/ompclaw/config.json",
+      envFile: "/home/user/.config/ompclaw/ompclaw.env",
+    });
+
+    expect(args).toEqual([
+      "/home/user/.omp/agent/ompclaw/updates/current/ompclaw-supervisor",
+      "--state-dir",
+      "/home/user/.omp/agent/ompclaw",
+      "--config",
+      "/home/user/.config/ompclaw/config.json",
+      "--env-file",
+      "/home/user/.config/ompclaw/ompclaw.env",
+      "--health-timeout-ms",
+      "45000",
     ]);
   });
 });
