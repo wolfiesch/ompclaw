@@ -14,7 +14,11 @@
     "telegram": {
       "enabled": true,
       "account": "default",
-      "tokenEnv": "TELEGRAM_BOT_TOKEN"
+      "tokenEnv": "TELEGRAM_BOT_TOKEN",
+      "topicSessions": {
+        "enabled": false,
+        "createFromRoot": false
+      }
     },
     "websocket": {
       "enabled": true,

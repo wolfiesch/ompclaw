@@ -277,6 +277,28 @@ export class RpcGatewayRuntime {
   isBusy(): boolean {
     return this.#activeTurn !== undefined || this.#status.state?.isStreaming === true;
   }
+  async newSession(name?: string): Promise<boolean> {
+    const data = await this.#requestData<{ cancelled: boolean }>({ type: "new_session" });
+    this.#activeTurn = undefined;
+    if (!data.cancelled && name !== undefined) {
+      await this.#sendRpc({ type: "set_session_name", name });
+    }
+    await this.#refreshStateRequired();
+    return !data.cancelled;
+  }
+
+  async switchSession(sessionPath: string): Promise<boolean> {
+    const data = await this.#requestData<{ cancelled: boolean }>({ type: "switch_session", sessionPath });
+    this.#activeTurn = undefined;
+    await this.#refreshStateRequired();
+    return !data.cancelled;
+  }
+
+  async setSessionName(name: string): Promise<void> {
+    await this.#sendRpc({ type: "set_session_name", name });
+    await this.#refreshStateRequired();
+  }
+
 
   /** Queue a scheduler-owned prompt and resolve only after its terminal OMP event. */
   async handleScheduled(message: InboundMessage): Promise<void> {
@@ -566,10 +588,8 @@ export class RpcGatewayRuntime {
         await this.#sendRpc({ type: "abort" });
         await reply("Stop requested.");
       } else if (name === "new") {
-        const data = await this.#requestData<{ cancelled: boolean }>({ type: "new_session" });
-        this.#activeTurn = undefined;
-        await this.#refreshState();
-        await reply(data.cancelled ? "New session cancelled." : "Started a new OMP session.");
+        const created = await this.newSession();
+        await reply(created ? "Started a new OMP session." : "New session cancelled.");
       } else if (name === "steer" || name === "followup") {
         if (!args) await reply(`Usage: /${name} <message>`);
         else {
@@ -620,8 +640,7 @@ export class RpcGatewayRuntime {
       else if (name === "name") {
         if (!args) await reply("Usage: /name <session name>");
         else {
-          await this.#sendRpc({ type: "set_session_name", name: args });
-          await this.#refreshState();
+          await this.setSessionName(args);
           await reply(`Session named ${args}.`);
         }
       } else if (name === "handoff") {
@@ -632,10 +651,8 @@ export class RpcGatewayRuntime {
       } else if (name === "switch") {
         if (!args) await reply("Usage: /switch <exact session path>");
         else {
-          const data = await this.#requestData<{ cancelled: boolean }>({ type: "switch_session", sessionPath: args });
-          this.#activeTurn = undefined;
-          await this.#refreshState();
-          await reply(data.cancelled ? "Session switch cancelled." : "Session switched.");
+          const switched = await this.switchSession(args);
+          await reply(switched ? "Session switched." : "Session switch cancelled.");
         }
       } else if (name === "export") await this.#exportCommand(delivery, reply);
       else if (name === "login") await this.#loginCommand(delivery, args, reply);
@@ -885,12 +902,18 @@ export class RpcGatewayRuntime {
     return phases.map(valueText).join("\n\n");
   }
 
+  async #refreshStateRequired(): Promise<RpcSessionState> {
+    if (!this.#rpc?.running) throw new Error("OMP RPC is offline");
+    const state = await this.#requestData<RpcSessionState>({ type: "get_state" });
+    this.#status.state = state;
+    this.#persistSession(state);
+    return state;
+  }
+
   async #refreshState(): Promise<void> {
     if (!this.#rpc?.running) return;
     try {
-      const state = await this.#requestData<RpcSessionState>({ type: "get_state" });
-      this.#status.state = state;
-      this.#persistSession(state);
+      await this.#refreshStateRequired();
     } catch (error) {
       this.#status.lastError = error instanceof Error ? error.message : String(error);
     }

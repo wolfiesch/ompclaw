@@ -113,6 +113,19 @@ class MemoryStore implements GatewayApplicationStore {
     this.bindings.push(binding);
   }
 
+  getConversationBinding(address: InboundMessage["address"]) {
+    return this.bindings.findLast((binding) =>
+      binding.address.transport === address.transport &&
+      binding.address.account === address.account &&
+      binding.address.channel === address.channel &&
+      binding.address.thread === address.thread
+    );
+  }
+
+  hasConversationBindingForSession(sessionPath: string) {
+    return this.bindings.some((binding) => binding.ompSessionPath === sessionPath);
+  }
+
   putPendingInteraction() {}
 
   deletePendingInteraction() {
@@ -264,6 +277,108 @@ describe("GatewayApplication", () => {
       ompSessionPath: "/sessions/one",
       workspace: "/workspace/gateway",
     }]);
+    await app.stop();
+  });
+
+  test("isolates topic sessions and switches the single RPC owner before each turn", async () => {
+    const events: string[] = [];
+    const store = new MemoryStore();
+    const core = coreHarness(events);
+    const config = parseGatewayConfig({
+      workspace: "/workspace/gateway",
+      stateDir: gatewayConfig().stateDir,
+      transports: {
+        telegram: {
+          enabled: true,
+          account: "bot",
+          tokenEnv: "TELEGRAM_BOT_TOKEN",
+          topicSessions: { enabled: true, createFromRoot: true },
+        },
+      },
+    });
+    let currentSession = "/sessions/root";
+    let nextSession = 0;
+    const handled: Array<{ readonly id: string; readonly session: string }> = [];
+    const created: string[] = [];
+    const switched: string[] = [];
+    const firstTopicStarted = Promise.withResolvers<void>();
+    const finishFirstTopic = Promise.withResolvers<void>();
+    const app = new GatewayApplication({
+      config,
+      secrets: { telegramToken: "telegram", webSocketCredentials: [] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "root", sessionFile: currentSession });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            handled.push({ id: message.id, session: currentSession });
+            if (message.id === "topic-9-first") {
+              firstTopicStarted.resolve();
+              await finishFirstTopic.promise;
+            }
+          },
+          async newSession(name) {
+            created.push(name ?? "");
+            currentSession = `/sessions/topic-${++nextSession}`;
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: `topic-${nextSession}`,
+              sessionFile: currentSession,
+            });
+            return true;
+          },
+          async switchSession(sessionPath) {
+            switched.push(sessionPath);
+            currentSession = sessionPath;
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: sessionPath,
+              sessionFile: sessionPath,
+            });
+            return true;
+          },
+          isBusy: () => false,
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+    const topicMessage = (id: string, thread: string, text: string): InboundMessage => ({
+      ...inbound(id),
+      address: { transport: "telegram", account: "bot", channel: "-1001", thread },
+      content: { text },
+    });
+
+    await app.start();
+    await core.options().onInbound(inbound("root-first"));
+    const firstTopic = core.options().onInbound(topicMessage("topic-9-first", "9", "First topic request"));
+    await firstTopicStarted.promise;
+    const secondTopic = core.options().onInbound(topicMessage("topic-10-first", "10", "Second topic request"));
+    await Promise.resolve();
+    expect(created).toEqual(["First topic request"]);
+    finishFirstTopic.resolve();
+    await Promise.all([firstTopic, secondTopic]);
+    await core.options().onInbound(topicMessage("topic-9-again", "9", "Continue the first topic"));
+    await core.options().onInbound(inbound("root-again"));
+
+    expect(switched).toEqual(["/sessions/topic-1", "/sessions/root"]);
+    expect(handled).toEqual([
+      { id: "root-first", session: "/sessions/root" },
+      { id: "topic-9-first", session: "/sessions/topic-1" },
+      { id: "topic-10-first", session: "/sessions/topic-2" },
+      { id: "topic-9-again", session: "/sessions/topic-1" },
+      { id: "root-again", session: "/sessions/root" },
+    ]);
+    expect(store.getConversationBinding(topicMessage("ignored", "9", "ignored").address)?.ompSessionPath).toBe("/sessions/topic-1");
+    expect(store.getConversationBinding(topicMessage("ignored", "10", "ignored").address)?.ompSessionPath).toBe("/sessions/topic-2");
     await app.stop();
   });
 

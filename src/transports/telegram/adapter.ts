@@ -42,6 +42,7 @@ const DEFAULT_UI_TIMEOUT_MS = 5 * 60 * 1000;
 const CALLBACK_PREFIX = "ompui";
 const TASK_STOP_CALLBACK = "ompctl:stop";
 const SELECT_PAGE_SIZE = 8;
+const TOPIC_NAME_MAX_LENGTH = 128;
 
 export interface TelegramPoller {
   start(
@@ -77,6 +78,7 @@ export interface TelegramTransportAdapterOptions {
   readonly api?: TelegramApiSeams;
   readonly uiTimeoutMs?: number;
   readonly commands?: readonly { readonly command: string; readonly description: string }[];
+  readonly createTopicsFromRoot?: boolean;
 }
 
 type PendingKind = "confirm" | "select" | "input" | "editor";
@@ -138,13 +140,23 @@ function sourceFor(update: TgUpdate): TgMessage | undefined {
   return undefined;
 }
 
-function addressFor(message: Pick<TgMessage, "chat" | "is_topic_message" | "message_thread_id">, account: string): ConversationAddress {
+function addressFor(
+  message: Pick<TgMessage, "chat" | "is_topic_message" | "message_thread_id">,
+  account: string,
+  threadOverride?: number,
+): ConversationAddress {
+  const thread = threadOverride ?? (message.is_topic_message ? message.message_thread_id : undefined);
   return {
     transport: "telegram",
     account,
     channel: String(message.chat.id),
-    ...(message.is_topic_message && message.message_thread_id !== undefined ? { thread: String(message.message_thread_id) } : {}),
+    ...(thread === undefined ? {} : { thread: String(thread) }),
   };
+}
+
+function topicName(source: string): string {
+  const normalized = source.replace(/\s+/g, " ").trim();
+  return [...normalized].slice(0, TOPIC_NAME_MAX_LENGTH).join("") || "New OMP session";
 }
 
 function identityFor(userId: number, account: string): InboundEnvelope["identity"] {
@@ -274,6 +286,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #transcribe?: TelegramApiSeams["transcribe"];
   readonly #uiTimeoutMs: number;
   readonly #commands: readonly { readonly command: string; readonly description: string }[];
+  readonly #createTopicsFromRoot: boolean;
   readonly #outbound: Outbound;
   readonly #pending = new Map<string, PendingUi>();
   readonly #surfaces = new Map<string, Surface>();
@@ -310,6 +323,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#transcribeCommand = options.transcribeCommand;
     this.#transcribe = options.api?.transcribe;
     this.#uiTimeoutMs = options.uiTimeoutMs ?? DEFAULT_UI_TIMEOUT_MS;
+    this.#createTopicsFromRoot = options.createTopicsFromRoot ?? false;
     this.#commands = (options.commands ?? [])
       .filter(({ command, description }) => /^[a-z0-9_]{1,32}$/.test(command) && description.trim().length > 0)
       .slice(0, 100)
@@ -497,25 +511,27 @@ export class TelegramTransportAdapter implements TransportAdapter {
     }
     const message = sourceFor(update);
     if (!message || message.from?.is_bot || !message.from) return;
+    const context = this.#assertStarted();
     if (await this.#handleReply(message)) return;
 
-    const context = this.#assertStarted();
-    if (isPublicIdentityCommand(message.text)) {
-      const resolved = await context.resolveIdentity(identityFor(message.from.id, this.#account), context.signal);
-      if (resolved === undefined) {
-        await this.#sendUnknownIdentityGuidance(message);
-        return;
-      }
+    const identity = identityFor(message.from.id, this.#account);
+    const principal = await context.resolveIdentity(identity, context.signal);
+    if (isPublicIdentityCommand(message.text) && principal === undefined) {
+      await this.#sendUnknownIdentityGuidance(message);
+      return;
     }
 
     const attachment = await this.#attachmentFor(message, context.signal);
     const transcript = attachment?.voice ? await this.#transcript(attachment.path, context.signal) : undefined;
     const text = [message.text ?? message.caption, transcript].filter((value): value is string => Boolean(value)).join("\n\n") || undefined;
-    const address = addressFor(message, this.#account);
+    const thread = principal === undefined
+      ? undefined
+      : await this.#createRootTopic(message, text ?? attachment?.attachment.name, context.signal);
+    const address = addressFor(message, this.#account, thread);
     const envelope: InboundEnvelope = {
       id: `telegram:${this.#account}:${message.chat.id}:${message.message_id}`,
       sentAt: message.date * 1000,
-      identity: identityFor(message.from.id, this.#account),
+      identity,
       address,
       content: {
         ...(text === undefined ? {} : { text }),
@@ -526,6 +542,43 @@ export class TelegramTransportAdapter implements TransportAdapter {
       edited: message.edited_flag === true,
     };
     await context.receive(envelope, context.signal);
+  }
+
+  async #createRootTopic(message: TgMessage, source: string | undefined, signal?: AbortSignal): Promise<number | undefined> {
+    if (
+      !this.#createTopicsFromRoot ||
+      message.chat.type !== "supergroup" ||
+      message.chat.is_forum !== true ||
+      message.is_topic_message === true ||
+      message.message_thread_id !== undefined ||
+      source === undefined ||
+      message.text?.trimStart().startsWith("/")
+    ) return undefined;
+
+    const checkpointKey = `root_topic:${message.chat.id}:${message.message_id}`;
+    const checkpoint = this.#store.getCheckpoint(this.id, checkpointKey);
+    if (typeof checkpoint === "number" && Number.isSafeInteger(checkpoint) && checkpoint > 0) return checkpoint;
+    if (checkpoint !== undefined) {
+      this.#logger?.warn(`[telegram] Ignoring invalid root topic checkpoint ${checkpointKey}`);
+      return undefined;
+    }
+
+    try {
+      const created = await this.#callTelegram(
+        "createForumTopic",
+        { chat_id: message.chat.id, name: topicName(source) },
+        { signal },
+      ) as { readonly message_thread_id?: unknown };
+      const threadId = created.message_thread_id;
+      if (typeof threadId !== "number" || !Number.isSafeInteger(threadId) || threadId <= 0) {
+        throw new Error("Telegram returned an invalid forum topic identifier");
+      }
+      this.#store.setCheckpoint(this.id, checkpointKey, threadId);
+      return threadId;
+    } catch (error) {
+      this.#logger?.warn(`[telegram] Unable to create a forum topic: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
   }
 
   async #handleGenerationStopped(stopped: TgMessageGenerationStopped, updateId: number): Promise<void> {

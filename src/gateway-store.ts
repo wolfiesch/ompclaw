@@ -713,6 +713,13 @@ export class GatewayStore {
     return row === null ? undefined : decodeConversationBinding(row);
   }
 
+  hasConversationBindingForSession(sessionPath: string): boolean {
+    requiredText(sessionPath, "OMP session path");
+    return this.#database
+      .query("SELECT 1 FROM conversation_bindings WHERE omp_session_path = ? LIMIT 1")
+      .get(sessionPath) !== null;
+  }
+
   setCheckpoint(adapter: string, key: string, value: JsonValue): void {
     requiredText(adapter, "adapter");
     requiredText(key, "checkpoint key");

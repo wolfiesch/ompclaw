@@ -24,10 +24,16 @@ export interface GatewayOmpConfig {
   readonly autoRestart: boolean;
 }
 
+export interface GatewayTelegramTopicSessionsConfig {
+  readonly enabled: boolean;
+  readonly createFromRoot: boolean;
+}
+
 export interface GatewayTelegramConfig {
   readonly enabled: boolean;
   readonly account: string;
   readonly tokenEnv: string;
+  readonly topicSessions: GatewayTelegramTopicSessionsConfig;
 }
 
 export interface GatewayWebSocketCredentialConfig {
@@ -240,13 +246,28 @@ function parseTransports(value: unknown): GatewayConfig["transports"] {
 
 function parseTelegram(value: unknown): GatewayTelegramConfig {
   const telegram = object(value, "transports.telegram");
-  rejectUnknown(telegram, ["enabled", "account", "tokenEnv"], "transports.telegram");
+  rejectUnknown(telegram, ["enabled", "account", "tokenEnv", "topicSessions"], "transports.telegram");
   const tokenEnv = secretEnvName(telegram.tokenEnv, "transports.telegram.tokenEnv", true);
+  const topicSessions = telegram.topicSessions === undefined
+    ? { enabled: false, createFromRoot: false }
+    : parseTelegramTopicSessions(telegram.topicSessions);
   return {
     enabled: boolean(telegram.enabled, "transports.telegram.enabled"),
     account: identifier(telegram.account, "transports.telegram.account"),
     tokenEnv,
+    topicSessions,
   };
+}
+
+function parseTelegramTopicSessions(value: unknown): GatewayTelegramTopicSessionsConfig {
+  const topicSessions = object(value, "transports.telegram.topicSessions");
+  rejectUnknown(topicSessions, ["enabled", "createFromRoot"], "transports.telegram.topicSessions");
+  const enabled = boolean(topicSessions.enabled, "transports.telegram.topicSessions.enabled");
+  const createFromRoot = boolean(topicSessions.createFromRoot, "transports.telegram.topicSessions.createFromRoot", false);
+  if (createFromRoot && !enabled) {
+    throw new Error("transports.telegram.topicSessions.createFromRoot requires topicSessions.enabled");
+  }
+  return { enabled, createFromRoot };
 }
 
 function parseWebSocket(value: unknown): GatewayWebSocketConfig {

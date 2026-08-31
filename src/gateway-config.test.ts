@@ -69,6 +69,24 @@ describe("gateway config", () => {
     })).toThrow("unknown key token");
   });
 
+  test("keeps forum topic sessions opt-in and rejects implicit root topic creation", () => {
+    const telegram = (topicSessions?: unknown) => parseGatewayConfig({
+      transports: {
+        telegram: {
+          enabled: true,
+          account: "default",
+          tokenEnv: "TELEGRAM_BOT_TOKEN",
+          ...(topicSessions === undefined ? {} : { topicSessions }),
+        },
+      },
+    }).transports.telegram?.topicSessions;
+
+    expect(telegram()).toEqual({ enabled: false, createFromRoot: false });
+    expect(telegram({ enabled: true, createFromRoot: true })).toEqual({ enabled: true, createFromRoot: true });
+    expect(() => telegram({ enabled: false, createFromRoot: true })).toThrow("requires topicSessions.enabled");
+    expect(() => telegram({ enabled: true, unknown: true })).toThrow("unknown key unknown");
+  });
+
   test("accepts only credential environment names and never serializes their values", () => {
     const config = parseGatewayConfig({
       workspace: "~/workspace",

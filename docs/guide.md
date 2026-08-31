@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md)
 
-`ompclaw` runs one persistent OMP RPC session and exposes it through enabled, authenticated transport adapters. It is a gateway process, not an OMP extension and not a per-chat session launcher. Telegram and WebSocket clients feed the same OMP session.
+`ompclaw` runs one OMP RPC process and exposes it through enabled, authenticated transport adapters. By default, Telegram and WebSocket clients feed the same persistent OMP session. Optional Telegram topic sessions retain separate OMP transcripts while the gateway remains their single serialized owner.
 
 ## Before you start
 
@@ -11,7 +11,7 @@ Use the [user quickstart](../README.md#user-quickstart) for package installation
 The following operating assumptions are intentional:
 
 - OMP is version 17.0.0 or newer and is already authenticated for the provider you intend to use.
-- One process owns one gateway state directory and one OMP session.
+- One process owns one gateway state directory and one active OMP RPC session at a time.
 - Every incoming transport identity must be bound to a local principal before it is admitted.
 - A token authorizes a WebSocket credential only after that credential's identity resolves to a principal.
 - Telegram uses Bot API long polling. Do not configure a webhook for the same bot token.
@@ -26,13 +26,15 @@ Telegram long poller  ─┐
                        ├─ authenticated transport adapter ─┐
 WebSocket client      ─┘                                    │
                                                             v
-                                                 one OMP RPC session
+                                      one active OMP RPC process
                                                             │
                                                             v
                                         SQLite state and session checkpoint
 ```
 
 The start order prevents an adapter or scheduler from accepting work before the OMP session is available. On shutdown, the scheduler stops first, then adapters stop before OMP, and the state store closes before the lock is released.
+
+When Telegram topic sessions are enabled, the gateway switches that one RPC process between exact persisted session files before it accepts each turn. Inbound turns are serialized across shared and topic conversations, so two topics never write the RPC session concurrently.
 
 The SQLite database is `~/.omp/agent/ompclaw/ompclaw.sqlite` by default. A newly created database is private to its owner. It records:
 
@@ -152,7 +154,11 @@ A Telegram object is required only when Telegram is configured:
 {
   "enabled": true,
   "account": "default",
-  "tokenEnv": "TELEGRAM_BOT_TOKEN"
+  "tokenEnv": "TELEGRAM_BOT_TOKEN",
+  "topicSessions": {
+    "enabled": false,
+    "createFromRoot": false
+  }
 }
 ```
 
@@ -161,6 +167,8 @@ A Telegram object is required only when Telegram is configured:
 | `enabled` | whether to start this adapter |
 | `account` | stable local account identifier used in identities and checkpoints |
 | `tokenEnv` | environment variable containing the bot token; it must be `TELEGRAM_BOT_TOKEN` |
+| `topicSessions.enabled` | isolate each Telegram forum topic in its own persisted OMP session |
+| `topicSessions.createFromRoot` | create a new forum topic for each authorized non-command root message; requires topic sessions |
 
 Authorizing a user is an explicit local database operation:
 
@@ -170,6 +178,8 @@ ompclaw telegram-allow <your-numeric-telegram-user-id> \
 ```
 
 It creates or updates an `operator` principal and binds the exact Telegram identity for the configured account. To use a custom principal or roles, create it with `principal-add` and bind the Telegram identity with `identity-bind`.
+
+Existing forum topics get separate sessions when `topicSessions.enabled` is true. Set `createFromRoot` to true to turn an authorized root message into a newly named topic and route that same turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Telegram requires the bot to be a supergroup administrator with permission to manage topics. Topic creation is idempotent across update retries.
 
 ### WebSocket transport
 
