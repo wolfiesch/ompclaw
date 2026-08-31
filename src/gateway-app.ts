@@ -331,6 +331,7 @@ export class GatewayApplication {
 
   async #retryPendingInbound(message: InboundMessage, immediate: boolean): Promise<void> {
     await this.#dispatchReady;
+    if (this.#state !== "starting" && this.#state !== "started") return;
     const key = this.#inboundKey(message);
     try {
       await this.#dispatchPendingInbound(message, immediate, false);
@@ -357,13 +358,24 @@ export class GatewayApplication {
     const key = this.#inboundKey(message);
     let completion = this.#pendingInboundCompletions.get(key);
     if (completion === undefined) {
+      const principal = store.resolvePrincipal(message.identity);
+      if (principal === undefined || principal.id !== message.principal.id) {
+        if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+          throw new Error(`Unauthorized pending inbound message ${message.id} disappeared before rejection`);
+        }
+        console.warn(
+          `[ompclaw] discarded pending inbound ${message.address.transport}/${message.address.account}/${message.id}; identity authorization changed`,
+        );
+        return;
+      }
+      const authorizedMessage: InboundMessage = { ...message, principal };
       if (!immediate) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
 
       const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
       const associateSession = !topicSessions || !immediate;
-      if (topicSessions && !immediate) await this.#selectConversationSession(store, runtime, message);
-      if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
-      else await runtime.handleInbound(message);
+      if (topicSessions && !immediate) await this.#selectConversationSession(store, runtime, authorizedMessage);
+      if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(authorizedMessage);
+      else await runtime.handleInbound(authorizedMessage);
 
       const sessionFile = this.#sessionFile;
       if (sessionFile === undefined) throw new Error("OMP runtime did not report its current session file");

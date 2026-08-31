@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
   GatewayApplication,
   type GatewayApplicationStore,
@@ -90,13 +90,13 @@ class MemoryStore implements GatewayApplicationStore {
   readonly migrations = new Set<string>();
   closed = false;
   failBindings = 0;
+  resolvedPrincipal: Principal | undefined = { id: "operator", roles: ["operator"] };
 
   close() {
     this.closed = true;
   }
-
   resolvePrincipal(identity: TransportIdentity): Principal | undefined {
-    return identity.subject === "42" ? { id: "operator", roles: ["operator"] } : undefined;
+    return identity.subject === "42" || identity.subject === "web-user" ? this.resolvedPrincipal : undefined;
   }
 
   getCheckpoint(adapterName: string, key: string) {
@@ -694,10 +694,13 @@ describe("GatewayApplication", () => {
 
   test("replays persisted inbound work when the gateway starts", async () => {
     const store = new MemoryStore();
-    const recovered = inbound("recovered");
+    const recovered: InboundMessage = {
+      ...inbound("recovered"),
+      principal: { id: "operator", roles: ["stale-admin"] },
+    };
     expect(store.claimInboundMessage(recovered, 1)).toBe(true);
     const core = coreHarness([]);
-    const handled: string[] = [];
+    const handled: Array<{ readonly id: string; readonly roles: readonly string[] }> = [];
     const app = new GatewayApplication({
       config: gatewayConfig(),
       secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
@@ -710,7 +713,7 @@ describe("GatewayApplication", () => {
           },
           async stop() {},
           async handleInbound(message) {
-            handled.push(message.id);
+            handled.push({ id: message.id, roles: message.principal.roles });
           },
         }),
         createTelegramAdapter: () => adapter("telegram"),
@@ -723,9 +726,47 @@ describe("GatewayApplication", () => {
 
     await app.start();
     await waitFor(() => handled.length === 1);
-    expect(handled).toEqual(["recovered"]);
+    expect(handled).toEqual([{ id: "recovered", roles: ["operator"] }]);
     expect(store.pending.size).toBe(0);
     expect(store.claims).toContain("telegram/bot/recovered");
+    await app.stop();
+  });
+
+  test("discards recovered work after its transport identity is revoked", async () => {
+    const store = new MemoryStore();
+    expect(store.claimInboundMessage(inbound("revoked"), 1)).toBe(true);
+    store.resolvedPrincipal = undefined;
+    const core = coreHarness([]);
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    let dispatches = 0;
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound() {
+            dispatches += 1;
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await waitFor(() => store.pending.size === 0);
+    expect(dispatches).toBe(0);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("identity authorization changed"));
+    warning.mockRestore();
     await app.stop();
   });
 
@@ -808,6 +849,8 @@ describe("GatewayApplication", () => {
     const events: string[] = [];
     const store = new MemoryStore();
     const core = coreHarness(events);
+    expect(store.claimInboundMessage(inbound("recovered-during-start"), 1)).toBe(true);
+    let dispatches = 0;
     core.core.start = async () => {
       events.push("core-start");
       throw new Error("adapter failed");
@@ -818,7 +861,11 @@ describe("GatewayApplication", () => {
       seams: {
         createStore: () => store,
         createCore: core.create,
-        createRuntime: () => ({ async start() { events.push("runtime-start"); }, async stop() { events.push("runtime-stop"); }, async handleInbound() {} }),
+        createRuntime: () => ({
+          async start() { events.push("runtime-start"); },
+          async stop() { events.push("runtime-stop"); },
+          async handleInbound() { dispatches += 1; },
+        }),
         createTelegramAdapter: () => adapter("telegram"),
         createWebSocketAdapter: () => adapter("websocket"),
         acquireLock: () => {
@@ -836,6 +883,8 @@ describe("GatewayApplication", () => {
     await expect(app.start()).rejects.toThrow("adapter failed");
     expect(events).toEqual(["lock", "heartbeat", "runtime-start", "core-start", "core-stop", "runtime-stop", "heartbeat-stop", "unlock"]);
     expect(store.closed).toBe(true);
+    expect(dispatches).toBe(0);
+    expect(store.pending.has("telegram/bot/recovered-during-start")).toBe(true);
   });
 
   test("wires enabled automation into RPC and brackets it around transport availability", async () => {
