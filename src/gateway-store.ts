@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import type { ConversationAddress, Principal, TransportIdentity } from "./gateway-types";
+import type { ConversationAddress, InboundMessage, Principal, TransportIdentity } from "./gateway-types";
 import { isRecord } from "./type-guards";
 
 export type JsonPrimitive = boolean | number | string | null;
@@ -20,6 +20,12 @@ export interface PendingInteraction {
   readonly payload: JsonValue;
   readonly createdAt: number;
   readonly expiresAt?: number;
+}
+
+export interface PendingInboundMessage {
+  readonly message: InboundMessage;
+  readonly receivedAt: number;
+  readonly scheduled: boolean;
 }
 
 export type TurnLifecycleState = "queued" | "running" | "completed" | "stopped" | "failed" | "interrupted";
@@ -147,6 +153,67 @@ function validateAddress(address: ConversationAddress): void {
   requiredText(address.account, "conversation address account");
   requiredText(address.channel, "conversation address channel");
   if (address.thread !== undefined) requiredText(address.thread, "conversation address thread");
+}
+
+function validateReceipt(value: unknown, context: string): void {
+  if (!isRecord(value)) throw new Error(`${context} must be an object`);
+  requiredText(value.transport, `${context} transport`);
+  requiredText(value.messageId, `${context} messageId`);
+}
+
+function validateInboundMessage(value: unknown): asserts value is InboundMessage {
+  if (!isRecord(value)) throw new Error("inbound message must be an object");
+  requiredText(value.id, "inbound message id");
+  if (typeof value.sentAt !== "number" || !Number.isSafeInteger(value.sentAt) || value.sentAt < 0) {
+    throw new Error("inbound message sentAt must be a safe nonnegative integer");
+  }
+
+  const identity = value.identity;
+  if (!isRecord(identity)) throw new Error("inbound message identity must be an object");
+  requiredText(identity.transport, "inbound message identity transport");
+  requiredText(identity.account, "inbound message identity account");
+  requiredText(identity.subject, "inbound message identity subject");
+
+  const address = value.address;
+  if (!isRecord(address)) throw new Error("inbound message address must be an object");
+  requiredText(address.transport, "inbound message address transport");
+  requiredText(address.account, "inbound message address account");
+  requiredText(address.channel, "inbound message address channel");
+  if (address.thread !== undefined) requiredText(address.thread, "inbound message address thread");
+  if (identity.transport !== address.transport || identity.account !== address.account) {
+    throw new Error("inbound message identity and address must share transport and account");
+  }
+
+  const content = value.content;
+  if (!isRecord(content)) throw new Error("inbound message content must be an object");
+  if (content.text !== undefined && typeof content.text !== "string") {
+    throw new Error("inbound message content text must be a string");
+  }
+  if (content.attachments !== undefined) {
+    if (!Array.isArray(content.attachments)) throw new Error("inbound message attachments must be an array");
+    for (const attachment of content.attachments) {
+      if (!isRecord(attachment)) throw new Error("inbound message attachment must be an object");
+      requiredText(attachment.url, "inbound message attachment url");
+      if (attachment.name !== undefined && typeof attachment.name !== "string") {
+        throw new Error("inbound message attachment name must be a string");
+      }
+      if (attachment.mediaType !== undefined && typeof attachment.mediaType !== "string") {
+        throw new Error("inbound message attachment mediaType must be a string");
+      }
+    }
+  }
+
+  const principal = value.principal;
+  if (!isRecord(principal)) throw new Error("inbound message principal must be an object");
+  requiredText(principal.id, "inbound message principal id");
+  if (!Array.isArray(principal.roles) || !principal.roles.every((role) => typeof role === "string")) {
+    throw new Error("inbound message principal roles must be an array of strings");
+  }
+  if (value.replyTo !== undefined) validateReceipt(value.replyTo, "inbound message replyTo");
+  if (value.sourceReceipt !== undefined) validateReceipt(value.sourceReceipt, "inbound message sourceReceipt");
+  if (value.edited !== undefined && typeof value.edited !== "boolean") {
+    throw new Error("inbound message edited must be boolean");
+  }
 }
 
 function databasePath(path: string): string {
@@ -544,6 +611,20 @@ export class GatewayStore {
       CREATE INDEX IF NOT EXISTS inbound_messages_received_at
         ON inbound_messages (received_at);
 
+      CREATE TABLE IF NOT EXISTS pending_inbound_messages (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        transport TEXT NOT NULL,
+        account TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        received_at INTEGER NOT NULL,
+        scheduled INTEGER NOT NULL DEFAULT 0 CHECK (scheduled IN (0, 1)),
+        UNIQUE (transport, account, message_id),
+        FOREIGN KEY (transport, account, message_id)
+          REFERENCES inbound_messages (transport, account, message_id)
+          ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS scheduled_jobs (
         id TEXT PRIMARY KEY NOT NULL,
         principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
@@ -595,6 +676,14 @@ export class GatewayStore {
         completed_at INTEGER NOT NULL
       );
     `);
+    const pendingInboundColumns = this.#database
+      .query("PRAGMA table_info(pending_inbound_messages)")
+      .all() as SqlRow[];
+    if (!pendingInboundColumns.some((row) => row.name === "scheduled")) {
+      this.#database.exec(
+        "ALTER TABLE pending_inbound_messages ADD COLUMN scheduled INTEGER NOT NULL DEFAULT 0 CHECK (scheduled IN (0, 1))",
+      );
+    }
   }
 
   close(): void {
@@ -757,22 +846,73 @@ export class GatewayStore {
     return row === null ? undefined : decodeJson(row.value_json, "adapter checkpoint");
   }
 
-  claimInboundMessage(transport: string, account: string, messageId: string, receivedAt: number): boolean {
-    requiredText(transport, "inbound message transport");
-    requiredText(account, "inbound message account");
-    requiredText(messageId, "inbound message id");
+  claimInboundMessage(message: InboundMessage, receivedAt: number, scheduled = false): boolean {
+    validateInboundMessage(message);
     if (!Number.isSafeInteger(receivedAt)) {
       throw new Error("inbound message receivedAt must be an integer timestamp");
     }
+    const { transport, account } = message.address;
 
-    const result = this.#database
+    return this.#transaction(() => {
+      const result = this.#database
+        .query(
+          `INSERT INTO inbound_messages (transport, account, message_id, received_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(transport, account, message_id) DO NOTHING`,
+        )
+        .run(transport, account, message.id, receivedAt);
+      if (result.changes === 0) return false;
+
+      this.#database
+        .query(
+          `INSERT INTO pending_inbound_messages
+             (transport, account, message_id, payload_json, received_at, scheduled)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          transport,
+          account,
+          message.id,
+          encodeJson(message as unknown as JsonValue, "inbound message"),
+          receivedAt,
+          scheduled ? 1 : 0,
+        );
+      return true;
+    });
+  }
+
+  completeInboundMessage(transport: string, account: string, messageId: string): boolean {
+    requiredText(transport, "inbound message transport");
+    requiredText(account, "inbound message account");
+    requiredText(messageId, "inbound message id");
+    return this.#database
       .query(
-        `INSERT INTO inbound_messages (transport, account, message_id, received_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(transport, account, message_id) DO NOTHING`,
+        `DELETE FROM pending_inbound_messages
+         WHERE transport = ? AND account = ? AND message_id = ?`,
       )
-      .run(transport, account, messageId, receivedAt);
-    return result.changes > 0;
+      .run(transport, account, messageId).changes > 0;
+  }
+
+  listPendingInboundMessages(): PendingInboundMessage[] {
+    const rows = this.#database
+      .query(
+        `SELECT payload_json, received_at, scheduled
+         FROM pending_inbound_messages
+         ORDER BY sequence ASC`,
+      )
+      .all() as SqlRow[];
+    return rows.map((row) => {
+      const message = decodeJson(row.payload_json, "pending inbound message");
+      validateInboundMessage(message);
+      if (row.scheduled !== 0 && row.scheduled !== 1) {
+        throw new Error("corrupt stored pending inbound message: scheduled is not boolean");
+      }
+      return {
+        message,
+        receivedAt: storedTimestamp(row, "received_at", "pending inbound message"),
+        scheduled: row.scheduled === 1,
+      };
+    });
   }
 
   releaseInboundMessage(transport: string, account: string, messageId: string): boolean {
@@ -793,7 +933,28 @@ export class GatewayStore {
       throw new Error("inbound message prune before must be an integer timestamp");
     }
 
-    return this.#database.query("DELETE FROM inbound_messages WHERE received_at < ?").run(before).changes;
+    return this.#transaction(() => {
+      const pendingGuard = `
+        NOT EXISTS (
+          SELECT 1 FROM pending_inbound_messages AS pending
+          WHERE pending.transport = inbound.transport
+            AND pending.account = inbound.account
+            AND pending.message_id = inbound.message_id
+        )`;
+      const row = this.#database
+        .query(`
+          SELECT COUNT(*) AS message_count
+          FROM inbound_messages AS inbound
+          WHERE inbound.received_at < ? AND ${pendingGuard}
+        `)
+        .get(before) as SqlRow;
+      const count = storedCount(row, "message_count", "inbound message prune count");
+      this.#database.query(`
+        DELETE FROM inbound_messages AS inbound
+        WHERE inbound.received_at < ? AND ${pendingGuard}
+      `).run(before);
+      return count;
+    });
   }
 
   putTurnLifecycle(turn: TurnLifecycle): void {

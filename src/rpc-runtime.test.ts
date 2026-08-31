@@ -291,18 +291,32 @@ describe("RpcGatewayRuntime", () => {
     const second = message("second", "Handle this next");
     await runtime.handleInbound(first);
     const rpc = FakeOmpRpcClient.instances[0];
+    expect(runtime.isActiveConversation(first)).toBe(true);
+    expect(runtime.isActiveConversation(second)).toBe(false);
+    expect(runtime.canHandleInboundImmediately(message("first", "/steer correct this"))).toBe(true);
+    expect(runtime.canHandleInboundImmediately(message("first", "/abortbash"))).toBe(false);
+    expect(runtime.canHandleInboundImmediately(message("first", "/new"))).toBe(false);
+    expect(runtime.canHandleInboundImmediately(message("first", "/switch /sessions/other"))).toBe(false);
+    expect(runtime.canHandleInboundImmediately(message("second", "/status"))).toBe(true);
+    expect(runtime.canHandleInboundImmediately(second)).toBe(false);
 
     rpc.emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "first streaming" }] } });
     await settle();
-    const queued = runtime.handleInbound(second);
-    await queued;
+    let queuedSettled = false;
+    const queued = runtime.handleInbound(second).then(() => {
+      queuedSettled = true;
+    });
+    await settle();
 
+    expect(queuedSettled).toBe(false);
     expect(rpc.sent.filter((command) => command.type === "prompt")).toHaveLength(1);
     const acknowledgement = deliveries.find((call) => textFromContent(call.content)?.includes("finishing another conversation"));
     expect(acknowledgement).toMatchObject({ address: second.address, context: { principal: second.principal, origin: second.address } });
 
     rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "first final" }] }] });
     await waitFor(() => rpc.sent.filter((command) => command.type === "prompt").length === 2);
+    await queued;
+    expect(queuedSettled).toBe(true);
     expect(rpc.sent.filter((command) => command.type === "prompt")).toHaveLength(2);
     rpc.emit({ type: "agent_start" });
     rpc.emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "second streaming" }] } });
@@ -314,6 +328,28 @@ describe("RpcGatewayRuntime", () => {
     expect(firstFinal).toMatchObject({ address: first.address, context: { principal: first.principal, origin: first.address } });
     expect(secondFinal).toMatchObject({ address: second.address, context: { principal: second.principal, origin: second.address } });
     await runtime.stop();
+  });
+
+  test("handles abortbash immediately only when RPC bash is enabled", async () => {
+    const runtime = new RpcGatewayRuntime({ config: { ...config, allowRpcBash: true }, delivery: delivery() });
+    await runtime.start();
+    const active = message("first", "Build this");
+    await runtime.handleInbound(active);
+
+    expect(runtime.canHandleInboundImmediately(message("first", "/abortbash"))).toBe(true);
+    await runtime.stop();
+  });
+
+  test("rejects a queued receive when OMP stops before dispatch", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    await runtime.handleInbound(message("first", "Build this"));
+    const rpc = FakeOmpRpcClient.instances[0];
+    const queued = runtime.handleInbound(message("second", "Handle this next"));
+    await settle();
+
+    rpc.exit(new Error("OMP stopped before queued dispatch"));
+    await expect(queued).rejects.toThrow("OMP stopped before queued dispatch");
   });
 
   test("waits for an active turn to reach its terminal RPC event", async () => {

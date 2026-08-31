@@ -351,7 +351,7 @@ Private chats and forum topics map to stable gateway conversation addresses. Inc
 
 Telegram supports assistant message creation and editing, reactions, attachments, threads, confirmation buttons, single and multi-select buttons, reply-based text/editor input, notifications, URL buttons, and rendered status surfaces. Task cards use plain-language states such as `Queued`, `Working`, and `Done`; only active cards show a Stop button. Interaction responses remain bound to the original address and authorized principal. An expired, moved, or cross-user control is rejected.
 
-The gateway gives Telegram turns a mobile presentation contract: answer first, use short scannable paragraphs, omit internal harness narration, and acknowledge durable memory only after the memory write succeeds. When another authenticated conversation owns the single OMP session, the new conversation receives a queue acknowledgement and starts automatically when the active turn finishes.
+The gateway gives Telegram turns a mobile presentation contract: answer first, use short scannable paragraphs, omit internal harness narration, and acknowledge durable memory only after the memory write succeeds. When another authenticated conversation owns the single OMP session, the new conversation receives a queue acknowledgement and starts automatically when the active turn finishes. Each authenticated request is persisted in SQLite before its transport update can be checkpointed; dispatch failures retain that request for retry, and gateway restart replays pending work in receive order.
 
 ### WebSocket
 

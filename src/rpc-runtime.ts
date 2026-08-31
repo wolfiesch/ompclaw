@@ -271,6 +271,18 @@ function lifecycleLabel(state: TurnLifecycleState): string {
 }
 
 const CROSS_DELIVERY_COMMANDS = new Set(["start", "help", "status", "stop", "tasks", "todos", "jobs"]);
+const SAME_DELIVERY_IMMEDIATE_COMMANDS = new Set([
+  "start",
+  "help",
+  "status",
+  "stop",
+  "tasks",
+  "todos",
+  "jobs",
+  "steer",
+  "followup",
+  "abortbash",
+]);
 
 const TELEGRAM_PRESENTATION_CONTRACT = [
   "Telegram presentation is part of the trusted gateway contract:",
@@ -350,8 +362,7 @@ export class RpcGatewayRuntime {
     }
     if (differentConversation || (active === undefined && this.#queuedConversationCount > 0)) {
       await this.#send(delivery, "Got it. I’m finishing another conversation, then I’ll handle this next.");
-      this.#enqueueConversation(message, delivery, parsed);
-      return;
+      return this.#enqueueConversation(message, delivery, parsed);
     }
 
     if (parsed && (await this.#handleCommand(delivery, parsed.name, parsed.args))) return;
@@ -364,6 +375,26 @@ export class RpcGatewayRuntime {
 
   isBusy(): boolean {
     return this.#currentTurnBusy() || this.#queuedConversationCount > 0;
+  }
+
+  canHandleInboundImmediately(message: InboundMessage): boolean {
+    const parsed = parseSlashCommand(message.content.text);
+    if (parsed === undefined) return false;
+    const active = this.#activeTurn;
+    if (active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message))) {
+      return SAME_DELIVERY_IMMEDIATE_COMMANDS.has(parsed.name)
+        && (parsed.name !== "abortbash" || this.#options.config.allowRpcBash);
+    }
+    return CROSS_DELIVERY_COMMANDS.has(parsed.name);
+  }
+
+  isActiveConversation(message: InboundMessage): boolean {
+    const active = this.#activeTurn;
+    return active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message));
+  }
+
+  async notifyInboundQueued(message: InboundMessage): Promise<void> {
+    await this.#send(this.#deliveryFor(message), "Got it. I’m finishing another conversation, then I’ll handle this next.");
   }
 
   async waitUntilIdle(): Promise<void> {
@@ -397,23 +428,22 @@ export class RpcGatewayRuntime {
     message: InboundMessage,
     delivery: GatewayTurnTarget,
     parsed: ParsedCommand | undefined,
-  ): void {
+  ): Promise<void> {
     this.#queuedConversationCount += 1;
     const queued = this.#conversationQueue.then(async () => {
       await this.#waitUntilCurrentTurnIdle();
       if (parsed && (await this.#handleCommand(delivery, parsed.name, parsed.args))) return;
       await this.#startTurn(delivery, message);
       await this.#deliverPrompt(message, delivery);
-      await this.#waitUntilCurrentTurnIdle();
     });
-    this.#conversationQueue = queued
-      .catch(async (error: unknown) => {
-        const detail = error instanceof Error ? error.message : String(error);
-        await this.#send(delivery, `I couldn’t start that queued request: ${detail}`).catch(() => undefined);
-      })
-      .finally(() => {
-        this.#queuedConversationCount -= 1;
-      });
+    const settled = queued.finally(() => {
+      this.#queuedConversationCount -= 1;
+    });
+    this.#conversationQueue = settled.catch(async (error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      await this.#send(delivery, `I couldn’t start that queued request: ${detail}`).catch(() => undefined);
+    });
+    return settled;
   }
 
   async newSession(name?: string): Promise<boolean> {

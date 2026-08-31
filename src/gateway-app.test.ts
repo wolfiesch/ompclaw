@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
   GatewayApplication,
   type GatewayApplicationStore,
@@ -11,7 +11,7 @@ import {
 } from "./gateway-app";
 import { parseGatewayConfig, type GatewayConfig } from "./gateway-config";
 import type { GatewayCoreOptions } from "./gateway-core";
-import { GatewayStore, type ConversationBinding, type JsonValue } from "./gateway-store";
+import { GatewayStore, type ConversationBinding, type JsonValue, type ScheduledJob } from "./gateway-store";
 import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
 import type { RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import { identityBind, migrateTelegram, principalAdd, telegramAllow } from "./rpc-cli";
@@ -73,20 +73,30 @@ function inbound(id: string): InboundMessage {
   };
 }
 
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (predicate()) return;
+    await Bun.sleep(5);
+  }
+  throw new Error("condition was not met");
+}
+
 class MemoryStore implements GatewayApplicationStore {
   readonly claims = new Set<string>();
+  readonly pending = new Map<string, { readonly message: InboundMessage; readonly receivedAt: number; readonly scheduled: boolean }>();
   readonly checkpoint = new Map<string, JsonValue>();
   readonly bindings: ConversationBinding[] = [];
   readonly releases: string[] = [];
   readonly migrations = new Set<string>();
   closed = false;
+  failBindings = 0;
+  resolvedPrincipal: Principal | undefined = { id: "operator", roles: ["operator"] };
 
   close() {
     this.closed = true;
   }
-
   resolvePrincipal(identity: TransportIdentity): Principal | undefined {
-    return identity.subject === "42" ? { id: "operator", roles: ["operator"] } : undefined;
+    return identity.subject === "42" || identity.subject === "web-user" ? this.resolvedPrincipal : undefined;
   }
 
   getCheckpoint(adapterName: string, key: string) {
@@ -97,20 +107,34 @@ class MemoryStore implements GatewayApplicationStore {
     this.checkpoint.set(`${adapterName}/${key}`, value);
   }
 
-  claimInboundMessage(transport: string, account: string, messageId: string) {
-    const key = `${transport}/${account}/${messageId}`;
+  claimInboundMessage(message: InboundMessage, receivedAt: number, scheduled = false) {
+    const key = `${message.address.transport}/${message.address.account}/${message.id}`;
     if (this.claims.has(key)) return false;
     this.claims.add(key);
+    this.pending.set(key, { message, receivedAt, scheduled });
     return true;
+  }
+
+  completeInboundMessage(transport: string, account: string, messageId: string) {
+    return this.pending.delete(`${transport}/${account}/${messageId}`);
+  }
+
+  listPendingInboundMessages() {
+    return [...this.pending.values()];
   }
 
   releaseInboundMessage(transport: string, account: string, messageId: string) {
     const key = `${transport}/${account}/${messageId}`;
     this.releases.push(key);
+    this.pending.delete(key);
     return this.claims.delete(key);
   }
 
   bindConversation(binding: ConversationBinding) {
+    if (this.failBindings > 0) {
+      this.failBindings -= 1;
+      throw new Error("temporary binding failure");
+    }
     this.bindings.push(binding);
   }
 
@@ -284,6 +308,7 @@ describe("GatewayApplication", () => {
     await app.start();
     expect(await core.options().identityResolver({ transport: "telegram", account: "bot", subject: "42" })).toEqual({ id: "operator", roles: ["operator"] });
     await core.options().onInbound(inbound("message-1"));
+    await waitFor(() => store.bindings.length === 1);
 
     expect(runtimeOptions?.sessionFile).toBeUndefined();
     expect(store.checkpoint.get("omp/session_file")).toBe("/sessions/one");
@@ -396,6 +421,7 @@ describe("GatewayApplication", () => {
     await core.options().onInbound(otherRoot);
     await core.options().onInbound(webRoot);
     await core.options().onInbound(inbound("root-again"));
+    await waitFor(() => handled.length === 7);
 
     expect(created).toEqual(["First topic request", "Second topic request"]);
     expect(switched).toEqual(["/sessions/topic-1", "/sessions/root"]);
@@ -413,10 +439,80 @@ describe("GatewayApplication", () => {
     await app.stop();
   });
 
-  test("releases only a failed inbound claim so its exact id can be retried", async () => {
+  test("does not rebind an active topic when an immediate control overlaps a session switch", async () => {
+    const store = new MemoryStore();
+    const core = coreHarness([]);
+    const base = gatewayConfig();
+    const config = parseGatewayConfig({
+      ...base,
+      transports: {
+        telegram: {
+          enabled: true,
+          account: "bot",
+          tokenEnv: "TELEGRAM_BOT_TOKEN",
+          topicSessions: { enabled: true, createFromRoot: true },
+        },
+      },
+    });
+    const handled: string[] = [];
+    const app = new GatewayApplication({
+      config,
+      secrets: { telegramToken: "telegram", webSocketCredentials: [] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "topic-a",
+              sessionFile: "/sessions/topic-a",
+            });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            handled.push(message.id);
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "topic-c",
+              sessionFile: "/sessions/topic-c",
+            });
+          },
+          canHandleInboundImmediately: () => true,
+          isActiveConversation: () => true,
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+    const topicB: InboundMessage = {
+      ...inbound("topic-b-status"),
+      address: { transport: "telegram", account: "bot", channel: "-1001", thread: "20" },
+      content: { text: "/status" },
+    };
+
+    await app.start();
+    store.bindConversation({
+      address: topicB.address,
+      ompSessionPath: "/sessions/topic-a",
+      workspace: "/workspace/gateway",
+    });
+    await core.options().onInbound(topicB);
+    await waitFor(() => store.pending.size === 0);
+    expect(handled).toEqual(["topic-b-status"]);
+    expect(store.getConversationBinding(topicB.address)?.ompSessionPath).toBe("/sessions/topic-a");
+    await app.stop();
+  });
+
+  test("retains a failed inbound claim and retries it without Telegram redelivery", async () => {
     const store = new MemoryStore();
     const core = coreHarness([]);
     let attempts = 0;
+    const errors: unknown[] = [];
     const app = new GatewayApplication({
       config: gatewayConfig(),
       secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
@@ -438,16 +534,410 @@ describe("GatewayApplication", () => {
         acquireLock: () => ({ ok: true }),
         startLockHeartbeat: () => () => {},
         releaseLock: () => {},
+        inboundRetryDelayMs: 1,
+        onInboundDispatchError: (_message, error) => errors.push(error),
       },
     });
 
     await app.start();
-    await expect(core.options().onInbound(inbound("retry-me"))).rejects.toThrow("temporary OMP failure");
-    expect(store.releases).toEqual(["telegram/bot/retry-me"]);
-    expect(store.bindings).toEqual([]);
     await core.options().onInbound(inbound("retry-me"));
-    expect(attempts).toBe(2);
+    await waitFor(() => attempts === 2);
+    expect(errors).toHaveLength(1);
+    expect(store.releases).toEqual([]);
+    expect(store.pending.size).toBe(0);
+    expect(store.claims).toContain("telegram/bot/retry-me");
     expect(store.bindings).toHaveLength(1);
+    await core.options().onInbound(inbound("retry-me"));
+    await Bun.sleep(5);
+    expect(attempts).toBe(2);
+    await app.stop();
+  });
+
+  test("retries bookkeeping without dispatching a successful prompt twice", async () => {
+    const store = new MemoryStore();
+    store.failBindings = 1;
+    const core = coreHarness([]);
+    let dispatches = 0;
+    const errors: unknown[] = [];
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound() {
+            dispatches += 1;
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+        inboundRetryDelayMs: 1,
+        onInboundDispatchError: (_message, error) => errors.push(error),
+      },
+    });
+
+    await app.start();
+    await core.options().onInbound(inbound("completion-retry"));
+    await waitFor(() => store.pending.size === 0);
+    expect(dispatches).toBe(1);
+    expect(errors).toHaveLength(1);
+    expect(store.bindings).toHaveLength(1);
+    await app.stop();
+  });
+
+  test("lets later queued work pass a permanently failing inbound message", async () => {
+    const store = new MemoryStore();
+    const core = coreHarness([]);
+    const handled: string[] = [];
+    const errors: unknown[] = [];
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            if (message.id === "poison") throw new Error("permanent dispatch failure");
+            handled.push(message.id);
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+        inboundRetryDelayMs: 500,
+        onInboundDispatchError: (_message, error) => errors.push(error),
+      },
+    });
+
+    await app.start();
+    await core.options().onInbound(inbound("poison"));
+    await core.options().onInbound(inbound("healthy"));
+    await waitFor(() => handled.includes("healthy"));
+    expect(errors).toHaveLength(1);
+    expect(store.pending.has("telegram/bot/poison")).toBe(true);
+    expect(store.pending.has("telegram/bot/healthy")).toBe(false);
+    await app.stop();
+  });
+
+  test("acknowledges a queued conversation without blocking transport receipt", async () => {
+    const store = new MemoryStore();
+    const core = coreHarness([]);
+    const firstStarted = Promise.withResolvers<void>();
+    const finishFirst = Promise.withResolvers<void>();
+    const handled: string[] = [];
+    const queued: string[] = [];
+    let busy = false;
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            handled.push(message.id);
+            if (message.id === "first") {
+              busy = true;
+              firstStarted.resolve();
+              await finishFirst.promise;
+              busy = false;
+            }
+          },
+          isBusy: () => busy,
+          async waitUntilIdle() {
+            await finishFirst.promise;
+          },
+          async notifyInboundQueued(message) {
+            queued.push(message.id);
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await core.options().onInbound(inbound("first"));
+    await firstStarted.promise;
+    await core.options().onInbound(inbound("second"));
+    expect(handled).toEqual(["first"]);
+    expect(queued).toEqual(["second"]);
+    expect(store.pending.size).toBe(2);
+
+    finishFirst.resolve();
+    await waitFor(() => handled.length === 2 && store.pending.size === 0);
+    expect(handled).toEqual(["first", "second"]);
+    await app.stop();
+  });
+
+  test("replays persisted inbound work when the gateway starts", async () => {
+    const store = new MemoryStore();
+    const recovered: InboundMessage = {
+      ...inbound("recovered"),
+      principal: { id: "operator", roles: ["stale-admin"] },
+    };
+    expect(store.claimInboundMessage(recovered, 1)).toBe(true);
+    const core = coreHarness([]);
+    const handled: Array<{ readonly id: string; readonly roles: readonly string[] }> = [];
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            handled.push({ id: message.id, roles: message.principal.roles });
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await waitFor(() => handled.length === 1);
+    expect(handled).toEqual([{ id: "recovered", roles: ["operator"] }]);
+    expect(store.pending.size).toBe(0);
+    expect(store.claims).toContain("telegram/bot/recovered");
+    await app.stop();
+  });
+
+  test("re-evaluates immediate controls while replaying durable input", async () => {
+    const store = new MemoryStore();
+    const first = { ...inbound("recovered-prompt"), content: { text: "Build this" } };
+    const stop = { ...inbound("recovered-stop"), content: { text: "/stop" } };
+    expect(store.claimInboundMessage(first, 1)).toBe(true);
+    expect(store.claimInboundMessage(stop, 2)).toBe(true);
+    const core = coreHarness([]);
+    const idle = Promise.withResolvers<void>();
+    const handled: string[] = [];
+    let busy = false;
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            handled.push(message.id);
+            if (message.id === first.id) busy = true;
+            if (message.id === stop.id) {
+              busy = false;
+              idle.resolve();
+            }
+          },
+          isBusy: () => busy,
+          canHandleInboundImmediately: (message) => busy && message.content.text === "/stop",
+          async waitUntilIdle() {
+            await idle.promise;
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await waitFor(() => handled.length === 2 && store.pending.size === 0);
+    expect(handled).toEqual([first.id, stop.id]);
+    await app.stop();
+  });
+
+  test("revalidates authorization after waiting for an active turn", async () => {
+    const store = new MemoryStore();
+    const core = coreHarness([]);
+    const waiting = Promise.withResolvers<void>();
+    const idle = Promise.withResolvers<void>();
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    let dispatches = 0;
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound() {
+            dispatches += 1;
+          },
+          isBusy: () => true,
+          async waitUntilIdle() {
+            waiting.resolve();
+            await idle.promise;
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await core.options().onInbound(inbound("revoked-while-waiting"));
+    await waiting.promise;
+    store.resolvedPrincipal = undefined;
+    idle.resolve();
+    await waitFor(() => store.pending.size === 0);
+    expect(dispatches).toBe(0);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("identity authorization changed"));
+    warning.mockRestore();
+    await app.stop();
+  });
+
+  test("discards recovered work after its transport identity is revoked", async () => {
+    const store = new MemoryStore();
+    expect(store.claimInboundMessage(inbound("revoked"), 1)).toBe(true);
+    store.resolvedPrincipal = undefined;
+    const core = coreHarness([]);
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    let dispatches = 0;
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound() {
+            dispatches += 1;
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await waitFor(() => store.pending.size === 0);
+    expect(dispatches).toBe(0);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("identity authorization changed"));
+    warning.mockRestore();
+    await app.stop();
+  });
+
+  test("reconciles recovered scheduled work through the scheduler attempt lifecycle", async () => {
+    const base = gatewayConfig();
+    const config: GatewayConfig = {
+      ...base,
+      automation: { enabled: true, pollIntervalMs: 1_000, retryDelayMs: 15_000, maxAttempts: 3 },
+    };
+    const store = new GatewayStore(join(config.stateDir, "ompclaw.sqlite"));
+    store.upsertPrincipal({ id: "operator", roles: ["operator"] });
+    store.bindIdentity({ transport: "telegram", account: "bot", subject: "42" }, "operator");
+    const scheduledFor = 1_000;
+    const job: ScheduledJob = {
+      id: "scheduled-job",
+      principalId: "operator",
+      identity: { transport: "telegram", account: "bot", subject: "42" },
+      address: { transport: "telegram", account: "bot", channel: "42" },
+      name: "Recovered job",
+      prompt: "Finish the recovered work",
+      schedule: { kind: "at", at: scheduledFor },
+      enabled: true,
+      nextRunAt: scheduledFor,
+      attemptCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    store.createScheduledJob(job);
+    expect(store.claimInboundMessage({
+      ...inbound(`scheduled:${job.id}:${scheduledFor}`),
+      sentAt: scheduledFor,
+    }, 1, true)).toBe(true);
+    const core = coreHarness([]);
+    const scheduled: string[] = [];
+    const interactive: string[] = [];
+    const app = new GatewayApplication({
+      config,
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "scheduled",
+              sessionFile: "/sessions/scheduled",
+            });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            interactive.push(message.id);
+          },
+          async handleScheduled(message) {
+            scheduled.push(message.id);
+          },
+          isBusy: () => false,
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+        now: () => 2_000,
+      },
+    });
+
+    await app.start();
+    await waitFor(() => store.getScheduledJob(job.id)?.successCount === 1);
+    expect(scheduled).toEqual([`scheduled:${job.id}:${scheduledFor}`]);
+    expect(interactive).toEqual([]);
+    expect(store.listPendingInboundMessages()).toEqual([]);
     await app.stop();
   });
 
@@ -455,6 +945,8 @@ describe("GatewayApplication", () => {
     const events: string[] = [];
     const store = new MemoryStore();
     const core = coreHarness(events);
+    expect(store.claimInboundMessage(inbound("recovered-during-start"), 1)).toBe(true);
+    let dispatches = 0;
     core.core.start = async () => {
       events.push("core-start");
       throw new Error("adapter failed");
@@ -465,7 +957,11 @@ describe("GatewayApplication", () => {
       seams: {
         createStore: () => store,
         createCore: core.create,
-        createRuntime: () => ({ async start() { events.push("runtime-start"); }, async stop() { events.push("runtime-stop"); }, async handleInbound() {} }),
+        createRuntime: () => ({
+          async start() { events.push("runtime-start"); },
+          async stop() { events.push("runtime-stop"); },
+          async handleInbound() { dispatches += 1; },
+        }),
         createTelegramAdapter: () => adapter("telegram"),
         createWebSocketAdapter: () => adapter("websocket"),
         acquireLock: () => {
@@ -483,6 +979,8 @@ describe("GatewayApplication", () => {
     await expect(app.start()).rejects.toThrow("adapter failed");
     expect(events).toEqual(["lock", "heartbeat", "runtime-start", "core-start", "core-stop", "runtime-stop", "heartbeat-stop", "unlock"]);
     expect(store.closed).toBe(true);
+    expect(dispatches).toBe(0);
+    expect(store.pending.has("telegram/bot/recovered-during-start")).toBe(true);
   });
 
   test("wires enabled automation into RPC and brackets it around transport availability", async () => {

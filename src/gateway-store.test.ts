@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { GatewayStore } from "./gateway-store";
+import type { InboundMessage } from "./gateway-types";
 
 const directories: string[] = [];
 
@@ -19,6 +20,17 @@ afterEach(() => {
 
 const telegramOwner = { transport: "telegram", account: "default", subject: "42" } as const;
 const ownerAddress = { transport: "telegram", account: "default", channel: "42" } as const;
+
+function claimedInbound(id: string, transport = "telegram", account = "default"): InboundMessage {
+  return {
+    id,
+    sentAt: 1,
+    identity: { transport, account, subject: "42" },
+    address: { transport, account, channel: "42" },
+    content: { text: id },
+    principal: { id: "operator-42", roles: ["operator"] },
+  };
+}
 
 describe("GatewayStore", () => {
   test("persists principals, identity mappings, conversation bindings, checkpoints, and pending interactions across restart", () => {
@@ -151,52 +163,75 @@ describe("GatewayStore", () => {
     const first = new GatewayStore(path);
     const contender = new GatewayStore(path);
 
-    expect(first.claimInboundMessage("telegram", "default", "update-1", 100)).toBe(true);
-    expect(contender.claimInboundMessage("telegram", "default", "update-1", 101)).toBe(false);
+    expect(first.claimInboundMessage(claimedInbound("update-1"), 100, true)).toBe(true);
+    expect(contender.claimInboundMessage(claimedInbound("update-1"), 101)).toBe(false);
     const repeatedClaims = Array.from({ length: 16 }, (_, index) =>
-      (index % 2 === 0 ? first : contender).claimInboundMessage("telegram", "default", "update-2", 102),
+      (index % 2 === 0 ? first : contender).claimInboundMessage(claimedInbound("update-2"), 102),
     );
     expect(repeatedClaims.filter(Boolean)).toHaveLength(1);
-    expect(first.claimInboundMessage("telegram", "other-account", "update-1", 103)).toBe(true);
-    expect(first.claimInboundMessage("websocket", "default", "update-1", 104)).toBe(true);
+    expect(first.claimInboundMessage(claimedInbound("update-1", "telegram", "other-account"), 103)).toBe(true);
+    expect(first.claimInboundMessage(claimedInbound("update-1", "websocket"), 104)).toBe(true);
+    expect(first.listPendingInboundMessages().map(({ message }) => message.id)).toEqual([
+      "update-1",
+      "update-2",
+      "update-1",
+      "update-1",
+    ]);
+    expect(first.listPendingInboundMessages().map(({ scheduled }) => scheduled)).toEqual([true, false, false, false]);
     contender.close();
     first.close();
 
     const restarted = new GatewayStore(path);
-    expect(restarted.claimInboundMessage("telegram", "default", "update-1", 105)).toBe(false);
-    expect(restarted.claimInboundMessage("telegram", "other-account", "update-1", 106)).toBe(false);
-    expect(restarted.claimInboundMessage("websocket", "default", "update-1", 107)).toBe(false);
-    expect(restarted.claimInboundMessage("telegram", "default", "update-3", 108)).toBe(true);
+    expect(restarted.claimInboundMessage(claimedInbound("update-1"), 105)).toBe(false);
+    expect(restarted.claimInboundMessage(claimedInbound("update-1", "telegram", "other-account"), 106)).toBe(false);
+    expect(restarted.claimInboundMessage(claimedInbound("update-1", "websocket"), 107)).toBe(false);
+    expect(restarted.claimInboundMessage(claimedInbound("update-3"), 108)).toBe(true);
+    expect(restarted.listPendingInboundMessages()).toHaveLength(5);
+    expect(restarted.listPendingInboundMessages()[0]?.scheduled).toBe(true);
+    expect(restarted.completeInboundMessage("telegram", "default", "update-1")).toBe(true);
+    expect(restarted.completeInboundMessage("telegram", "default", "update-1")).toBe(false);
+    expect(restarted.listPendingInboundMessages().map(({ message }) => message.id)).toEqual([
+      "update-2",
+      "update-1",
+      "update-1",
+      "update-3",
+    ]);
     restarted.close();
   });
 
   test("releases only failed inbound claims so deliveries can retry", () => {
     const store = new GatewayStore(temporaryDatabase());
 
-    expect(store.claimInboundMessage("telegram", "default", "failed-handler", 100)).toBe(true);
-    expect(store.claimInboundMessage("telegram", "other-account", "failed-handler", 100)).toBe(true);
-    expect(store.claimInboundMessage("websocket", "default", "failed-handler", 100)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("failed-handler"), 100)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("failed-handler", "telegram", "other-account"), 100)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("failed-handler", "websocket"), 100)).toBe(true);
 
     expect(store.releaseInboundMessage("telegram", "default", "failed-handler")).toBe(true);
     expect(store.releaseInboundMessage("telegram", "default", "failed-handler")).toBe(false);
-    expect(store.claimInboundMessage("telegram", "default", "failed-handler", 101)).toBe(true);
-    expect(store.claimInboundMessage("telegram", "other-account", "failed-handler", 101)).toBe(false);
-    expect(store.claimInboundMessage("websocket", "default", "failed-handler", 101)).toBe(false);
+    expect(store.claimInboundMessage(claimedInbound("failed-handler"), 101)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("failed-handler", "telegram", "other-account"), 101)).toBe(false);
+    expect(store.claimInboundMessage(claimedInbound("failed-handler", "websocket"), 101)).toBe(false);
     store.close();
   });
 
-  test("prunes only inbound messages received strictly before the cutoff", () => {
+  test("prunes only completed inbound messages strictly before the cutoff", () => {
     const store = new GatewayStore(temporaryDatabase());
-    expect(store.claimInboundMessage("telegram", "default", "before", 99)).toBe(true);
-    expect(store.claimInboundMessage("telegram", "default", "at-cutoff", 100)).toBe(true);
-    expect(store.claimInboundMessage("telegram", "default", "after", 101)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("pending-old"), 98)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("before"), 99)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("at-cutoff"), 100)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("after"), 101)).toBe(true);
+    expect(store.completeInboundMessage("telegram", "default", "before")).toBe(true);
+    expect(store.completeInboundMessage("telegram", "default", "at-cutoff")).toBe(true);
+    expect(store.completeInboundMessage("telegram", "default", "after")).toBe(true);
 
     expect(store.pruneInboundMessages(100)).toBe(1);
-    expect(store.claimInboundMessage("telegram", "default", "before", 102)).toBe(true);
-    expect(store.claimInboundMessage("telegram", "default", "at-cutoff", 103)).toBe(false);
-    expect(store.claimInboundMessage("telegram", "default", "after", 104)).toBe(false);
+    expect(store.claimInboundMessage(claimedInbound("before"), 102)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("pending-old"), 102)).toBe(false);
+    expect(store.claimInboundMessage(claimedInbound("at-cutoff"), 103)).toBe(false);
+    expect(store.claimInboundMessage(claimedInbound("after"), 104)).toBe(false);
+    expect(store.listPendingInboundMessages().map(({ message }) => message.id)).toContain("pending-old");
     expect(store.pruneInboundMessages(101)).toBe(1);
-    expect(store.claimInboundMessage("telegram", "default", "at-cutoff", 105)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("at-cutoff"), 105)).toBe(true);
     store.close();
   });
 
@@ -272,11 +307,18 @@ describe("GatewayStore", () => {
   test("rejects malformed inbound deduplication and pending query inputs", () => {
     const store = new GatewayStore(temporaryDatabase());
 
-    expect(() => store.claimInboundMessage("", "default", "update-1", 1)).toThrow("inbound message transport");
-    expect(() => store.claimInboundMessage(null as never, "default", "update-1", 1)).toThrow("inbound message transport");
-    expect(() => store.claimInboundMessage("telegram", "", "update-1", 1)).toThrow("inbound message account");
-    expect(() => store.claimInboundMessage("telegram", "default", "", 1)).toThrow("inbound message id");
-    expect(() => store.claimInboundMessage("telegram", "default", "update-1", 1.5)).toThrow("receivedAt");
+    expect(() => store.claimInboundMessage(null as never, 1)).toThrow("inbound message must be an object");
+    expect(() => store.claimInboundMessage({
+      ...claimedInbound("update-1"),
+      address: { transport: "", account: "default", channel: "42" },
+    }, 1)).toThrow("address transport");
+    expect(() => store.claimInboundMessage({
+      ...claimedInbound("update-1"),
+      identity: { transport: "telegram", account: "", subject: "42" },
+      address: { transport: "telegram", account: "", channel: "42" },
+    }, 1)).toThrow("identity account");
+    expect(() => store.claimInboundMessage({ ...claimedInbound("update-1"), id: "" }, 1)).toThrow("inbound message id");
+    expect(() => store.claimInboundMessage(claimedInbound("update-1"), 1.5)).toThrow("receivedAt");
     expect(() => store.pruneInboundMessages(Number.MAX_SAFE_INTEGER + 1)).toThrow("prune before");
     expect(() => store.releaseInboundMessage("", "default", "update-1")).toThrow("inbound message transport");
     expect(() => store.releaseInboundMessage(null as never, "default", "update-1")).toThrow("inbound message transport");

@@ -57,15 +57,20 @@ export async function pruneInbox(dir: string, options: PruneInboxOptions = {}): 
 }
 
 /** Persist one bounded attachment with private permissions and enforce inbox quota. */
-export async function storeInboxFile(dir: string, filename: string, bytes: Uint8Array): Promise<string> {
+export async function storeInboxFile(
+  dir: string,
+  filename: string,
+  bytes: Uint8Array,
+  preserve: ReadonlySet<string> = new Set(),
+): Promise<string> {
   if (bytes.byteLength > INBOX_MAX_FILE_BYTES) {
     throw new Error(`Telegram attachment is too large (${bytes.byteLength} bytes, max ${INBOX_MAX_FILE_BYTES})`);
   }
-  await pruneInbox(dir);
+  await pruneInbox(dir, { preserve });
   const path = join(dir, filename);
   await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
   try {
-    const result = await pruneInbox(dir, { preserve: new Set([path]) });
+    const result = await pruneInbox(dir, { preserve: new Set([...preserve, path]) });
     if (result.totalBytes > INBOX_MAX_TOTAL_BYTES) {
       throw new Error(`Telegram inbox quota exceeded (${result.totalBytes} bytes, max ${INBOX_MAX_TOTAL_BYTES})`);
     }

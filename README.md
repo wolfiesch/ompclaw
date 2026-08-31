@@ -139,7 +139,7 @@ The command reports `Installed and started <manager> service: <path>`. It instal
 
 - One authenticated OMP RPC process with serialized session switching, streamed assistant updates, and a final response routed only to the active authenticated conversation.
 - OMP commands for steering, follow-up, abort, models, thinking, session controls, queue policy, compaction, retries, subagents, history, branching, exports, and login.
-- Telegram long polling with durable update checkpoints, concise mobile presentation, voice transcription, message editing, buttons, file intake, reactions, topics, and interactive OMP UI.
+- Telegram long polling with durable update checkpoints and an SQLite-backed inbound work queue, concise mobile presentation, voice transcription, message editing, buttons, file intake, reactions, topics, and interactive OMP UI.
 - Optional per-topic OMP sessions with persistent conversation bindings and authorized root-message topic creation.
 - An authenticated versioned WebSocket protocol with client identity and conversation address derived from configured credential metadata, not client-supplied fields.
 - SQLite-backed principals, transport identities, conversation bindings, OMP session checkpointing, inbound deduplication, UI state, durable scheduled jobs, and legacy Telegram migration markers.
