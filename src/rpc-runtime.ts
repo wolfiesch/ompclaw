@@ -636,7 +636,7 @@ export class RpcGatewayRuntime {
       this.#wakeIdleWaiters();
       active?.scheduledCompletion?.resolve();
       await this.#refreshState();
-      await this.#reactToSource(active, "👍");
+      void this.#reactToSource(active, "👍");
       return;
     }
     if (frame.type === "agent_end" && frame.isTerminal !== false) {
@@ -656,7 +656,7 @@ export class RpcGatewayRuntime {
         if (this.#status.state) this.#status.state.isStreaming = false;
         this.#wakeIdleWaiters();
         await this.#refreshState();
-        await this.#reactToSource(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
+        void this.#reactToSource(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
       }
       return;
     }
@@ -686,7 +686,7 @@ export class RpcGatewayRuntime {
         await this.#setTurnLifecycle("completed");
         this.#clearActiveDelivery(delivery, true);
         await this.#refreshState();
-        await this.#reactToSource(active, "👍");
+        void this.#reactToSource(active, "👍");
       }
     } catch (error) {
       await this.#setTurnLifecycle("failed", { error: error instanceof Error ? error.message : String(error) });
@@ -1174,7 +1174,7 @@ export class RpcGatewayRuntime {
         ...delivery,
         ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
       };
-      await this.#reactToSource(this.#activeTurn, "👀");
+      void this.#reactToSource(this.#activeTurn, "👀");
       return;
     }
     const now = this.#now();
@@ -1198,7 +1198,7 @@ export class RpcGatewayRuntime {
       ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
     };
     this.#queueTurnCard(this.#activeTurn);
-    await this.#reactToSource(this.#activeTurn, "👀");
+    void this.#reactToSource(this.#activeTurn, "👀");
   }
 
   async #setTurnLifecycle(

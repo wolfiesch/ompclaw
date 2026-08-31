@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- Complete Telegram receipt reactions for OMP-handled commands that do not start an agent without allowing optional reaction retries to keep a completed turn busy.
+- Deliver Telegram receipt reactions for every prompt outcome without allowing optional reaction retries to gate prompt dispatch, RPC frame processing, or completed-turn cleanup.
 
 ## 0.6.2 (2026-08-31)
 
