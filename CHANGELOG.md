@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - Present Telegram turns as an ongoing conversation with immediate receipt reactions, source-linked Markdown responses, and task status that clears after successful completion.
 
+### Fixed
+
+- Complete Telegram receipt reactions for OMP-handled commands that do not start an agent.
+
 ## 0.6.2 (2026-08-31)
 
 ### Fixed

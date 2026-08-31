@@ -30,6 +30,7 @@ class FakeOmpRpcClient {
   readonly writes: RpcRecord[] = [];
   running = false;
   failNextGetState = false;
+  promptAgentInvoked = true;
   state: RpcSessionState = {
     isStreaming: false,
     isCompacting: false,
@@ -83,7 +84,7 @@ class FakeOmpRpcClient {
       this.state = { ...this.state, sessionId: "new-session", sessionFile: "/sessions/new.jsonl" };
       return this.#response(command, { cancelled: false });
     }
-    if (command.type === "prompt") return this.#response(command, { agentInvoked: true });
+    if (command.type === "prompt") return this.#response(command, { agentInvoked: this.promptAgentInvoked });
     return this.#response(command, {});
   }
 
@@ -365,6 +366,20 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("finishes the source reaction when the prompt response skips the agent", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0];
+    rpc.promptAgentInvoked = false;
+    const sourceReceipt = { transport: "test", messageId: "source-no-agent" };
+
+    await runtime.handleInbound({ ...message("companion", "Handle without an agent"), sourceReceipt });
+
+    expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
+    expect(runtime.isBusy()).toBe(false);
+    await runtime.stop();
+  });
+
   test("handles abortbash immediately only when RPC bash is enabled", async () => {
     const runtime = new RpcGatewayRuntime({ config: { ...config, allowRpcBash: true }, delivery: delivery() });
     await runtime.start();
@@ -410,10 +425,11 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
-  test("releases idle waiters when a terminal prompt result cannot refresh state", async () => {
+  test("finishes the source reaction when a terminal prompt event skips the agent", async () => {
     const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
     await runtime.start();
-    await runtime.handleInbound(message("first", "Run a command"));
+    const sourceReceipt = { transport: "test", messageId: "source-prompt-result" };
+    await runtime.handleInbound({ ...message("first", "Run a command"), sourceReceipt });
     const rpc = FakeOmpRpcClient.instances[0];
     rpc.emit({ type: "agent_start" });
     await settle();
@@ -424,6 +440,7 @@ describe("RpcGatewayRuntime", () => {
     await waiting;
 
     expect(rpc.state.isStreaming).toBe(false);
+    expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
     await runtime.stop();
   });
 
