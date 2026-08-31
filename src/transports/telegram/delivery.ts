@@ -118,6 +118,12 @@ function unchangedMessage(error: unknown): boolean {
   return error instanceof TgError && error.code === 400 && /message is not modified/i.test(error.message);
 }
 
+function missingDeleteTarget(error: unknown): boolean {
+  return error instanceof TgError
+    && error.code === 400
+    && /message (?:to delete )?not found/i.test(error.message);
+}
+
 function draftsUnavailable(error: unknown): boolean {
   return error instanceof TgError
     && error.code === 400
@@ -316,6 +322,7 @@ export class Outbound {
             message_id: messageId(target),
           }, signal, address);
         } catch (error) {
+          if (missingDeleteTarget(error)) continue;
           retainedCount = index + 1;
           this.#log?.warn(
             `[telegram] stale control card chunk ${target.messageId} could not be deleted and will be retained: ${error instanceof Error ? error.message : String(error)}`,

@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - Fail Telegram startup when command registration exposes invalid bot credentials instead of reporting a healthy but unusable poller.
 - Track, update, and remove every part of multipart control cards so status text and controls remain consistent.
 - Retain and refresh old control-card chunks when Telegram no longer permits deleting them.
+- Treat already-absent Telegram card messages as successfully removed so stale receipts cannot poison later updates.
 
 ## 0.6.1 (2026-08-31)
 
