@@ -17,7 +17,7 @@ import {
   type TgMessage,
   type TgMessageGenerationStopped,
   type TgUpdate,
-  withRateLimit,
+  withTelegramRetry,
 } from "../../api";
 import type { GatewayStore, PendingInteraction } from "../../gateway-store";
 import type {
@@ -366,7 +366,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   async #registerCommands(signal?: AbortSignal): Promise<void> {
     if (this.#commands.length === 0) return;
     try {
-      await withRateLimit(
+      await withTelegramRetry(
         () => this.#callTelegram("setMyCommands", { commands: this.#commands }, { signal }),
         { log: this.#logger, signal },
       );
@@ -1077,7 +1077,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 
   async #request(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     signal?.throwIfAborted();
-    return withRateLimit(() => this.#callTelegram(method, payload, { signal }), { signal, log: this.#logger });
+    return withTelegramRetry(() => this.#callTelegram(method, payload, { signal }), { signal, log: this.#logger });
   }
 
   #checkpointCompletedUpdates(): void {

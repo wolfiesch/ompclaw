@@ -2,7 +2,7 @@ import { randomInt } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { extname } from "node:path";
-import { TgError, tg, tgUpload, type Logger, withRateLimit } from "./api";
+import { TgError, tg, tgUpload, type Logger, withTelegramRetry } from "./api";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -533,7 +533,7 @@ export class Outbound {
 
   async #request(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     signal?.throwIfAborted();
-    return withRateLimit(() => this.#callTelegram(method, payload, { signal }), { signal, log: this.#logger });
+    return withTelegramRetry(() => this.#callTelegram(method, payload, { signal }), { signal, log: this.#logger });
   }
 
   async #upload(
@@ -543,6 +543,6 @@ export class Outbound {
     signal?: AbortSignal,
   ): Promise<unknown> {
     signal?.throwIfAborted();
-    return withRateLimit(() => this.#uploadTelegram(method, fields, file, { signal }), { signal, log: this.#logger });
+    return withTelegramRetry(() => this.#uploadTelegram(method, fields, file, { signal }), { signal, log: this.#logger });
   }
 }

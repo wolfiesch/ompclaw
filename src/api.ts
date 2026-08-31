@@ -50,18 +50,53 @@ export function isMissingThreadError(err: unknown): boolean {
   return err instanceof TgError && err.code === 400 && /message thread not found|topic_id_invalid/i.test(err.message);
 }
 
-/** Attempts to re-send a request Telegram rate-limited before giving up on it. */
-const RATE_LIMIT_RETRIES = 3;
+/** Maximum retries after a retryable Telegram request failure. */
+const TELEGRAM_RETRIES = 3;
 /** Upper bound on one `retry_after` wait, so a long ban cannot stall a turn indefinitely. */
 const MAX_RETRY_WAIT_MS = 30_000;
+const TRANSIENT_RETRY_BASE_MS = 500;
+const TRANSIENT_NETWORK_ERROR = /fetch failed|network|socket|connection.*closed|econnreset|etimedout|unexpected eof/i;
+
+function transientRetryDelay(err: unknown, attempt: number): number | undefined {
+  if (err instanceof TgError) {
+    if (err.retryAfter != null || err.code === 429) {
+      return Math.min((err.retryAfter ?? 1) * 1000 + 250, MAX_RETRY_WAIT_MS);
+    }
+    if (err.code === 408 || err.code >= 500) {
+      return Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** attempt, MAX_RETRY_WAIT_MS);
+    }
+    return undefined;
+  }
+  if (!(err instanceof Error)) return undefined;
+  if (err.name !== "TimeoutError" && !TRANSIENT_NETWORK_ERROR.test(`${err.name}: ${err.message}`)) return undefined;
+  return Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** attempt, MAX_RETRY_WAIT_MS);
+}
+
+async function waitForRetry(waitMs: number, pause: (ms: number) => Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    await pause(waitMs);
+    return;
+  }
+  signal.throwIfAborted();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    await Promise.race([pause(waitMs), aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
 
 /**
- * Run a Telegram request, waiting out `retry_after` when Telegram rate-limits
- * it. Every text delivery path goes through this: without it a 429 on part 2 of
- * a split message throws, the caller gives up, and the reader silently keeps a
- * truncated reply. `sleep` is a test seam.
+ * Retry Telegram rate limits, server faults, timeouts, and transient network
+ * disconnects. The Bot API has no idempotency key, so a response-lost send can
+ * duplicate; bounded at-least-once delivery is preferable to dropping a
+ * completed agent response.
  */
-export async function withRateLimit<T>(
+export async function withTelegramRetry<T>(
   op: () => Promise<T>,
   options: { sleep?: (ms: number) => Promise<void>; log?: Logger; signal?: AbortSignal } = {},
 ): Promise<T> {
@@ -72,17 +107,11 @@ export async function withRateLimit<T>(
       return await op();
     } catch (err) {
       options.signal?.throwIfAborted();
-      const retryAfter = err instanceof TgError && (err.retryAfter != null || err.code === 429) ? (err.retryAfter ?? 1) : undefined;
-      if (retryAfter == null || attempt >= RATE_LIMIT_RETRIES) throw err;
-      options.log?.debug(`[telegram] rate limited — retrying in ${retryAfter}s`);
-      const wait = pause(Math.min(retryAfter * 1000 + 250, MAX_RETRY_WAIT_MS));
-      if (!options.signal) await wait;
-      else {
-        await Promise.race([
-          wait,
-          new Promise<never>((_, reject) => options.signal!.addEventListener("abort", () => reject(options.signal!.reason), { once: true })),
-        ]);
-      }
+      const waitMs = transientRetryDelay(err, attempt);
+      if (waitMs == null || attempt >= TELEGRAM_RETRIES) throw err;
+      const reason = err instanceof TgError && (err.retryAfter != null || err.code === 429) ? "rate limited" : "request interrupted";
+      options.log?.warn(`[telegram] ${reason}; retrying in ${waitMs}ms`);
+      await waitForRetry(waitMs, pause, options.signal);
     }
   }
 }
