@@ -140,6 +140,17 @@ describe("GatewayStore", () => {
     store.close();
   });
 
+  test("migrates the legacy Telegram checkpoint to the account-scoped numeric key", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    store.setCheckpoint("telegram", "update_id", "314");
+
+    expect(store.migrateTelegramUpdateCheckpoint("default")).toBe(true);
+    expect(store.getCheckpoint("telegram", "update_id:default")).toBe(314);
+    expect(store.getCheckpoint("telegram", "update_id")).toBeUndefined();
+    expect(store.migrateTelegramUpdateCheckpoint("default")).toBe(false);
+    store.close();
+  });
+
   test("supports the pending interaction lifecycle", () => {
     const store = new GatewayStore(temporaryDatabase());
     const pending = {
@@ -477,7 +488,7 @@ describe("GatewayStore", () => {
       ompSessionPath: "/sessions/exact.jsonl",
       workspace,
     });
-    expect(store.getCheckpoint("telegram", "update_id")).toBe("314");
+    expect(store.getCheckpoint("telegram", "update_id:default")).toBe(314);
     expect(readFileSync(accessPath, "utf8")).toBe(accessBefore);
     expect(readFileSync(rpcStatePath, "utf8")).toBe(rpcBefore);
 

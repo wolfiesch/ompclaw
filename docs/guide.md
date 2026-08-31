@@ -375,4 +375,3 @@ The server accepts a connection at `GET /` only after HTTP WebSocket upgrade. It
 - [README quickstart](../README.md)
 - [RPC and transport reference](rpc-service.md)
 - [Security policy](../SECURITY.md)
-- [Upstream attribution](../NOTICE)

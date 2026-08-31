@@ -8,10 +8,9 @@
 
 Use it when a trusted operator needs remote access to an OMP workspace without placing transport credentials in OMP configuration or handing clients an OMP process directly. Telegram and WebSocket are authenticated adapters around the same serialized runtime. HTTP is health-only.
 
-- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.5.1`
+- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.6.0`
 - **Repository:** [`wolfiesch/ompclaw`](https://github.com/wolfiesch/ompclaw)
 - **License:** [MIT](LICENSE)
-- **Upstream provenance:** [TerrifiedBug/omp-telegram](https://github.com/TerrifiedBug/omp-telegram), preserved in [NOTICE](NOTICE)
 
 ## User quickstart
 
@@ -152,6 +151,6 @@ Read the [operator guide](docs/guide.md) for configuration, migration, operation
 
 Package installation above is for operators. Source checkout, development conventions, and verification commands are intentionally separate in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## License and notice
+## License
 
-`ompclaw` is MIT licensed. It includes and adapts work from TerrifiedBug's MIT-licensed `omp-telegram`; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+`ompclaw` is MIT licensed; see [LICENSE](LICENSE).

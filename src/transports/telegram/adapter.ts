@@ -3,23 +3,9 @@ import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import {
-  Poller,
-  acquireLock,
-  downloadFileBytes,
-  releaseLock,
-  startLockHeartbeat,
-  tg,
-  type Logger,
-  type TgCallbackQuery,
-  type TgMessage,
-  type TgMessageGenerationStopped,
-  type TgUpdate,
-  withTelegramRetry,
-} from "../../api";
-import type { GatewayStore, PendingInteraction } from "../../gateway-store";
+import type { GatewayStore, JsonValue, PendingInteraction } from "../../gateway-store";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -35,21 +21,38 @@ import type {
   UiResponse,
   UiResponseFor,
 } from "../../gateway-types";
-import { INBOX_MAX_FILE_BYTES, storeInboxFile } from "../../inbox";
-import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } from "../../outbound";
+import {
+  acquireLock,
+  downloadFileBytes,
+  Poller,
+  releaseLock,
+  startLockHeartbeat,
+  tg,
+  type Logger,
+  type TgCallbackQuery,
+  type TgFileBase,
+  type TgMessage,
+  type TgMessageGenerationStopped,
+  type TgUpdate,
+  withTelegramRetry,
+} from "./bot-api";
+import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } from "./delivery";
+import { MAX_INBOUND_ATTACHMENT_BYTES, saveInboxAttachment } from "./inbox";
 
-const execFileAsync = promisify(execFile);
-const DEFAULT_UI_TIMEOUT_MS = 5 * 60 * 1000;
-const CALLBACK_PREFIX = "ompui";
-const TASK_STOP_CALLBACK = "ompctl:stop";
+const executeFile = promisify(execFile);
+const INTERACTION_LIFETIME_MS = 5 * 60 * 1_000;
+const INTERACTION_CALLBACK = "ompui";
+const STOP_CALLBACK = "ompctl:stop";
 const SELECT_PAGE_SIZE = 8;
-const TOPIC_NAME_MAX_LENGTH = 128;
+const TOPIC_NAME_LIMIT = 128;
+
+type InteractiveRequest = Extract<UiRequest, { type: "confirm" | "select" | "input" | "editor" }>;
+type InteractiveResponse = Extract<UiResponse, { type: "confirm" | "select" | "input" | "editor" }>;
 
 export interface TelegramPoller {
   start(
     token: string,
-    onUpdate: (update: TgUpdate) => void | Promise<void>,
-    onFatal: (reason: string) => void,
+    handleUpdate: (update: TgUpdate) => void | Promise<void>,
     logger?: Logger,
   ): void;
   stop(): void;
@@ -85,180 +88,224 @@ export interface TelegramTransportAdapterOptions {
   readonly createTopicsFromRoot?: boolean;
 }
 
-type PendingKind = "confirm" | "select" | "input" | "editor";
+interface MediaSelection {
+  readonly telegramId: string;
+  readonly stableId: string;
+  readonly displayName: string;
+  readonly mediaType: string;
+  readonly declaredBytes?: number;
+  readonly transcribable: boolean;
+}
 
-interface PendingUi {
+interface InteractiveState {
   readonly id: string;
-  readonly kind: PendingKind;
+  readonly request: InteractiveRequest;
   readonly address: ConversationAddress;
-  readonly title: string;
-  readonly delivery: DeliveryContext;
-  readonly options: readonly string[];
+  readonly context: DeliveryContext;
+  readonly principalId: string;
+  readonly choices: readonly string[];
   readonly labels: readonly string[];
-  readonly descriptions: readonly (string | undefined)[];
-  readonly multiSelect: boolean;
+  readonly notes: readonly (string | undefined)[];
   readonly selected: Set<number>;
-  readonly resolve: (response: UiResponse) => void;
+  readonly settle: (value: InteractiveResponse) => void;
+  readonly reject: (error: Error) => void;
+  readonly multiple: boolean;
   page: number;
-  message?: OutboundReceipt;
-  timer?: NodeJS.Timeout;
-  removeAbortListener?: () => void;
+  prompt?: OutboundReceipt;
+  timeout?: NodeJS.Timeout;
+  detachAbort?: () => void;
 }
 
-interface PendingDraft {
-  readonly address: ConversationAddress;
-  readonly delivery: DeliveryContext;
-}
-
-interface Surface {
+interface ControlCard {
   title: string;
   editorText: string;
   readonly statuses: Map<string, string>;
   readonly widgets: Map<string, readonly string[]>;
-  message?: OutboundReceipt;
-  delivery?: DeliveryContext;
-  stopControlVisible?: boolean;
+  receipt?: OutboundReceipt;
+  context?: DeliveryContext;
+  stopVisible: boolean;
 }
 
-interface MediaSpec {
-  readonly fileId: string;
-  readonly uniqueId: string;
-  readonly name: string;
-  readonly mediaType: string;
-  readonly size?: number;
-  readonly voice: boolean;
+interface DraftRoute {
+  readonly address: ConversationAddress;
+  readonly context: DeliveryContext;
 }
 
 function sameAddress(left: ConversationAddress, right: ConversationAddress): boolean {
-  return (
-    left.transport === right.transport &&
-    left.account === right.account &&
-    left.channel === right.channel &&
-    left.thread === right.thread
-  );
+  return left.transport === right.transport
+    && left.account === right.account
+    && left.channel === right.channel
+    && left.thread === right.thread;
 }
 
-function sourceFor(update: TgUpdate): TgMessage | undefined {
-  if (update.message) return update.message;
-  if (update.edited_message) return { ...update.edited_message, edited_flag: true };
-  return undefined;
-}
-
-function addressFor(
-  message: Pick<TgMessage, "chat" | "is_topic_message" | "message_thread_id">,
-  account: string,
-  threadOverride?: number,
-): ConversationAddress {
-  const thread = threadOverride ?? (message.is_topic_message ? message.message_thread_id : undefined);
+function telegramAddress(message: Pick<TgMessage, "chat" | "is_topic_message" | "message_thread_id">, account: string, thread?: number): ConversationAddress {
+  const topic = thread ?? (message.is_topic_message ? message.message_thread_id : undefined);
   return {
     transport: "telegram",
     account,
     channel: String(message.chat.id),
-    ...(thread === undefined ? {} : { thread: String(thread) }),
+    ...(topic === undefined ? {} : { thread: String(topic) }),
   };
 }
 
-function topicName(source: string): string {
-  const normalized = source.replace(/\s+/g, " ").trim();
-  return [...normalized].slice(0, TOPIC_NAME_MAX_LENGTH).join("") || "New OMP session";
-}
-
-function identityFor(userId: number, account: string): InboundEnvelope["identity"] {
+function telegramIdentity(userId: number, account: string): InboundEnvelope["identity"] {
   return { transport: "telegram", account, subject: String(userId) };
 }
 
-function safeFilename(name: string): string {
-  const finalSegment = name.replaceAll("\\", "/").split("/").at(-1) ?? "attachment";
-  const normalized = finalSegment.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "");
-  return (normalized || "attachment").slice(0, 120);
+function updateMessage(update: TgUpdate): TgMessage | undefined {
+  return update.message ?? update.edited_message;
 }
 
-function mediaFor(message: TgMessage): MediaSpec | undefined {
-  const photo = message.photo?.at(-1);
-  if (photo) {
-    return {
-      fileId: photo.file_id,
-      uniqueId: photo.file_unique_id,
-      name: `photo-${photo.file_unique_id}.jpg`,
-      mediaType: "image/jpeg",
-      size: photo.file_size,
-      voice: false,
-    };
-  }
+function safeFilename(candidate: string): string {
+  const leaf = basename(candidate.replaceAll("\\", "/"));
+  const cleaned = leaf.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "");
+  return (cleaned || "attachment.bin").slice(0, 180);
+}
+
+function topicName(text: string): string {
+  const singleLine = text.replace(/\s+/g, " ").trim() || "New conversation";
+  return Array.from(singleLine).slice(0, TOPIC_NAME_LIMIT).join("");
+}
+
+function isBotCommand(text: string | undefined): boolean {
+  return /^\/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(text?.trimStart() ?? "");
+}
+
+function storedTopicThread(value: JsonValue | undefined, messageId: number): number | undefined {
+  if (value === null || typeof value !== "object" || !("messageId" in value) || !("threadId" in value)) return undefined;
+  return value.messageId === messageId && typeof value.threadId === "number" ? value.threadId : undefined;
+}
+
+function bestPhoto(photos: readonly TgFileBase[]): TgFileBase | undefined {
+  return photos.reduce<TgFileBase | undefined>((winner, candidate) => {
+    if (winner === undefined) return candidate;
+    return (candidate.file_size ?? 0) >= (winner.file_size ?? 0) ? candidate : winner;
+  }, undefined);
+}
+
+function mediaFrom(message: TgMessage): MediaSelection | undefined {
   if (message.document) {
     return {
-      fileId: message.document.file_id,
-      uniqueId: message.document.file_unique_id,
-      name: message.document.file_name ?? `document-${message.document.file_unique_id}`,
+      telegramId: message.document.file_id,
+      stableId: message.document.file_unique_id,
+      displayName: message.document.file_name ?? "document.bin",
       mediaType: message.document.mime_type ?? "application/octet-stream",
-      size: message.document.file_size,
-      voice: false,
-    };
-  }
-  if (message.audio) {
-    return {
-      fileId: message.audio.file_id,
-      uniqueId: message.audio.file_unique_id,
-      name: message.audio.file_name ?? `audio-${message.audio.file_unique_id}.mp3`,
-      mediaType: message.audio.mime_type ?? "audio/mpeg",
-      size: message.audio.file_size,
-      voice: false,
-    };
-  }
-  if (message.video) {
-    return {
-      fileId: message.video.file_id,
-      uniqueId: message.video.file_unique_id,
-      name: message.video.file_name ?? `video-${message.video.file_unique_id}.mp4`,
-      mediaType: message.video.mime_type ?? "video/mp4",
-      size: message.video.file_size,
-      voice: false,
+      declaredBytes: message.document.file_size,
+      transcribable: false,
     };
   }
   if (message.voice) {
     return {
-      fileId: message.voice.file_id,
-      uniqueId: message.voice.file_unique_id,
-      name: `voice-${message.voice.file_unique_id}.ogg`,
+      telegramId: message.voice.file_id,
+      stableId: message.voice.file_unique_id,
+      displayName: "voice.ogg",
       mediaType: message.voice.mime_type ?? "audio/ogg",
-      size: message.voice.file_size,
-      voice: true,
+      declaredBytes: message.voice.file_size,
+      transcribable: true,
+    };
+  }
+  if (message.audio) {
+    return {
+      telegramId: message.audio.file_id,
+      stableId: message.audio.file_unique_id,
+      displayName: message.audio.file_name ?? "audio.mp3",
+      mediaType: message.audio.mime_type ?? "audio/mpeg",
+      declaredBytes: message.audio.file_size,
+      transcribable: true,
     };
   }
   if (message.video_note) {
     return {
-      fileId: message.video_note.file_id,
-      uniqueId: message.video_note.file_unique_id,
-      name: `video-note-${message.video_note.file_unique_id}.mp4`,
+      telegramId: message.video_note.file_id,
+      stableId: message.video_note.file_unique_id,
+      displayName: "video-note.mp4",
       mediaType: "video/mp4",
-      size: message.video_note.file_size,
-      voice: false,
+      declaredBytes: message.video_note.file_size,
+      transcribable: true,
+    };
+  }
+  if (message.video) {
+    return {
+      telegramId: message.video.file_id,
+      stableId: message.video.file_unique_id,
+      displayName: message.video.file_name ?? "video.mp4",
+      mediaType: message.video.mime_type ?? "video/mp4",
+      declaredBytes: message.video.file_size,
+      transcribable: false,
+    };
+  }
+  if (message.animation) {
+    return {
+      telegramId: message.animation.file_id,
+      stableId: message.animation.file_unique_id,
+      displayName: message.animation.file_name ?? "animation.gif",
+      mediaType: message.animation.mime_type ?? "image/gif",
+      declaredBytes: message.animation.file_size,
+      transcribable: false,
     };
   }
   if (message.sticker) {
     return {
-      fileId: message.sticker.file_id,
-      uniqueId: message.sticker.file_unique_id,
-      name: `sticker-${message.sticker.file_unique_id}.webp`,
-      mediaType: "image/webp",
-      size: message.sticker.file_size,
-      voice: false,
+      telegramId: message.sticker.file_id,
+      stableId: message.sticker.file_unique_id,
+      displayName: message.sticker.is_animated ? "sticker.tgs" : message.sticker.is_video ? "sticker.webm" : "sticker.webp",
+      mediaType: message.sticker.is_animated ? "application/x-tgsticker" : message.sticker.is_video ? "video/webm" : "image/webp",
+      declaredBytes: message.sticker.file_size,
+      transcribable: false,
+    };
+  }
+  const photo = bestPhoto(message.photo ?? []);
+  if (photo) {
+    return {
+      telegramId: photo.file_id,
+      stableId: photo.file_unique_id,
+      displayName: "photo.jpg",
+      mediaType: "image/jpeg",
+      declaredBytes: photo.file_size,
+      transcribable: false,
     };
   }
   return undefined;
 }
 
-function isPublicIdentityCommand(text: string | undefined): boolean {
+function identityHelp(text: string | undefined): boolean {
   return /^\/(?:start|whoami)(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(text ?? "");
 }
 
-function callbackData(id: string, action: string): string {
-  return `${CALLBACK_PREFIX}:${id}:${action}`;
+function callback(id: string, action: string): string {
+  return `${INTERACTION_CALLBACK}:${id}:${action}`;
 }
 
-/** Transport-neutral gateway adapter for Telegram Bot API long polling. */
+function cardKey(address: ConversationAddress): string {
+  return `${address.channel}\n${address.thread ?? ""}`;
+}
+
+function activeTask(text: string | undefined): boolean {
+  return /^(?:Queued|Working)(?:\n|$)/.test(text ?? "");
+}
+
+function assertRemoteFilePath(value: string): void {
+  if (value.startsWith("/") || value.includes("\\") || value.split("/").includes("..")) {
+    throw new Error("Telegram returned an unsafe file path");
+  }
+}
+
+function menuCommands(input: readonly { readonly command: string; readonly description: string }[]): readonly { command: string; description: string }[] {
+  const unique = new Set<string>();
+  const result: { command: string; description: string }[] = [];
+  for (const item of input) {
+    const command = item.command.trim().replace(/^\//, "");
+    const description = item.description.trim().slice(0, 256);
+    if (!/^[a-z0-9_]{1,32}$/.test(command) || description.length === 0 || unique.has(command)) continue;
+    unique.add(command);
+    result.push({ command, description });
+    if (result.length === 100) break;
+  }
+  return result;
+}
+
 export class TelegramTransportAdapter implements TransportAdapter {
-  readonly id: string;
+  readonly id = "telegram";
   readonly capabilities: TransportCapabilities = {
     streamingUpdates: true,
     buttons: true,
@@ -267,131 +314,140 @@ export class TelegramTransportAdapter implements TransportAdapter {
     attachments: true,
     reactions: true,
     threads: true,
-    // Logical input bound; Outbound enforces Telegram's 4096-code-unit native segments.
     maxMessageLength: Number.MAX_SAFE_INTEGER,
   };
 
   readonly #token: string;
   readonly #account: string;
-  readonly #checkpointKey: string;
   readonly #stateDir: string;
   readonly #inboxDir: string;
   readonly #store: TelegramTransportAdapterOptions["store"];
-  readonly #logger?: Logger;
+  readonly #log: Logger | undefined;
   readonly #poller: TelegramPoller;
-  readonly #callTelegram: TelegramCall;
+  readonly #call: TelegramCall;
   readonly #download: (token: string, filePath: string) => Promise<Uint8Array>;
-  readonly #acquireLock: NonNullable<TelegramApiSeams["acquireLock"]>;
-  readonly #releaseLock: NonNullable<TelegramApiSeams["releaseLock"]>;
-  readonly #startLockHeartbeat: NonNullable<TelegramApiSeams["startLockHeartbeat"]>;
-  readonly #now: () => number;
-  readonly #randomId: () => string;
-  readonly #transcribeCommand?: readonly string[];
-  readonly #transcribe?: TelegramApiSeams["transcribe"];
-  readonly #uiTimeoutMs: number;
-  readonly #commands: readonly { readonly command: string; readonly description: string }[];
-  readonly #createTopicsFromRoot: boolean;
+  readonly #claimLock: NonNullable<TelegramApiSeams["acquireLock"]>;
+  readonly #dropLock: NonNullable<TelegramApiSeams["releaseLock"]>;
+  readonly #heartbeat: NonNullable<TelegramApiSeams["startLockHeartbeat"]>;
+  readonly #clock: () => number;
+  readonly #newId: () => string;
+  readonly #transcriptionCommand: readonly string[] | undefined;
+  readonly #transcriptionOverride: TelegramApiSeams["transcribe"];
+  readonly #interactionLifetime: number;
+  readonly #commands: readonly { command: string; description: string }[];
+  readonly #topicsFromRoot: boolean;
   readonly #outbound: Outbound;
-  readonly #pending = new Map<string, PendingUi>();
-  readonly #surfaces = new Map<string, Surface>();
-  readonly #drafts = new Map<number, PendingDraft>();
-  readonly #inflight = new Map<number, Promise<void>>();
-  readonly #receivedUpdateIds: number[] = [];
-  readonly #completedUpdateIds = new Set<number>();
-  #startContext: TransportStartContext | undefined;
-  #releaseHeartbeat: (() => void) | undefined;
+  readonly #interactions = new Map<string, InteractiveState>();
+  readonly #draftRoutes = new Map<number, DraftRoute>();
+  readonly #cards = new Map<string, ControlCard>();
+  readonly #activeUpdates = new Set<number>();
+  readonly #updateTasks = new Set<Promise<void>>();
+
+  #context: TransportStartContext | undefined;
   #lockPath: string | undefined;
-  #stopping = false;
+  #stopHeartbeat: (() => void) | undefined;
+  #stopTask: Promise<void> | undefined;
 
   constructor(options: TelegramTransportAdapterOptions) {
-    if (!options.token) throw new Error("Telegram bot token is required");
-    if (!options.stateDir) throw new Error("Telegram stateDir is required");
+    if (options.token.length === 0) throw new Error("Telegram bot token is required");
+    if (options.stateDir.length === 0) throw new Error("Telegram stateDir is required");
     this.#token = options.token;
     this.#account = options.account ?? "default";
-    this.id = "telegram";
-    this.#checkpointKey = this.#account === "default" ? "update_id" : `update_id:${this.#account}`;
     this.#stateDir = resolve(options.stateDir);
-    this.#inboxDir = resolve(this.#stateDir, "inbox");
+    this.#inboxDir = join(this.#stateDir, "inbox", "telegram", this.#account.replace(/[^A-Za-z0-9._-]/g, "_"));
     this.#store = options.store;
-    this.#logger = options.logger;
+    this.#log = options.logger;
     this.#poller = options.api?.poller ?? new Poller();
-    this.#callTelegram =
-      options.api?.callTelegram ??
-      ((method, payload, requestOptions) => tg(this.#token, method, payload, { signal: requestOptions?.signal }));
+    this.#call = options.api?.callTelegram ?? ((method, payload = {}, request = {}) =>
+      tg(this.#token, method, payload, { signal: request.signal }));
     this.#download = options.api?.downloadFileBytes ?? downloadFileBytes;
-    this.#acquireLock = options.api?.acquireLock ?? acquireLock;
-    this.#releaseLock = options.api?.releaseLock ?? releaseLock;
-    this.#startLockHeartbeat = options.api?.startLockHeartbeat ?? startLockHeartbeat;
-    this.#now = options.api?.now ?? Date.now;
-    this.#randomId = options.api?.randomId ?? (() => randomBytes(12).toString("base64url"));
-    this.#transcribeCommand = options.transcribeCommand;
-    this.#transcribe = options.api?.transcribe;
-    this.#uiTimeoutMs = options.uiTimeoutMs ?? DEFAULT_UI_TIMEOUT_MS;
-    this.#createTopicsFromRoot = options.createTopicsFromRoot ?? false;
-    this.#commands = (options.commands ?? [])
-      .filter(({ command, description }) => /^[a-z0-9_]{1,32}$/.test(command) && description.trim().length > 0)
-      .slice(0, 100)
-      .map(({ command, description }) => ({ command, description: description.trim().slice(0, 256) }));
+    this.#claimLock = options.api?.acquireLock ?? acquireLock;
+    this.#dropLock = options.api?.releaseLock ?? releaseLock;
+    this.#heartbeat = options.api?.startLockHeartbeat ?? startLockHeartbeat;
+    this.#clock = options.api?.now ?? Date.now;
+    this.#newId = options.api?.randomId ?? (() => randomBytes(18).toString("base64url"));
+    this.#transcriptionCommand = options.transcribeCommand;
+    this.#transcriptionOverride = options.api?.transcribe;
+    this.#interactionLifetime = options.uiTimeoutMs ?? INTERACTION_LIFETIME_MS;
+    this.#commands = menuCommands(options.commands ?? []);
+    this.#topicsFromRoot = options.createTopicsFromRoot ?? false;
     this.#outbound = new Outbound({
       token: this.#token,
       account: this.#account,
-      logger: this.#logger,
-      callTelegram: this.#callTelegram,
+      authorizeAddress: (address, context) => this.#deliveryAllowed(address, context),
+      logger: this.#log,
+      callTelegram: this.#call,
       uploadTelegram: options.api?.uploadTelegram,
-      authorizeAddress: (address, delivery) => this.#authorizes(address, delivery),
     });
   }
 
   async start(context: TransportStartContext): Promise<void> {
-    if (this.#startContext !== undefined) throw new Error(`Telegram adapter ${this.id} is already started`);
-    await mkdir(this.#stateDir, { recursive: true, mode: 0o700 });
-    const lockPath = resolve(this.#stateDir, `telegram-${safeFilename(this.#account)}.poll.lock`);
-    const claimed = this.#acquireLock(lockPath);
-    if (!claimed.ok) throw new Error(`Telegram account ${this.#account} is already being polled by process ${claimed.holder}`);
-
-    this.#stopping = false;
-    this.#startContext = context;
-    this.#lockPath = lockPath;
-    this.#releaseHeartbeat = this.#startLockHeartbeat(lockPath);
-    context.signal?.addEventListener("abort", () => void this.stop(), { once: true });
-    await this.#registerCommands(context.signal);
-    this.#poller.start(
-      this.#token,
-      (update) => this.handleUpdate(update),
-      (reason) => this.#logger?.error(`[telegram] ${reason}`),
-      this.#logger,
-    );
-  }
-
-  async #registerCommands(signal?: AbortSignal): Promise<void> {
-    if (this.#commands.length === 0) return;
+    if (this.#context !== undefined) throw new Error("Telegram transport is already started");
+    await mkdir(this.#inboxDir, { recursive: true, mode: 0o700 });
+    const lock = join(this.#stateDir, `telegram-${this.#account.replace(/[^A-Za-z0-9._-]/g, "_")}.poll.lock`);
+    const ownership = this.#claimLock(lock);
+    if (!ownership.ok) throw new Error(`Telegram account is already polled by process ${ownership.holder}`);
+    this.#lockPath = lock;
+    this.#context = context;
+    this.#stopHeartbeat = this.#heartbeat(lock);
     try {
-      await withTelegramRetry(
-        () => this.#callTelegram("setMyCommands", { commands: this.#commands }, { signal }),
-        { log: this.#logger, signal },
+      if (this.#commands.length > 0) {
+        await this.#telegram("setMyCommands", { commands: this.#commands }, context.signal);
+      }
+      this.#poller.start(
+        this.#token,
+        (update) => this.#trackUpdate(update),
+        this.#log,
       );
+      if (context.signal) {
+        const abort = (): void => { void this.stop(); };
+        context.signal.addEventListener("abort", abort, { once: true });
+      }
     } catch (error) {
-      this.#logger?.warn(
-        `[telegram] could not register bot command menu: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      this.#releaseRuntimeOwnership();
+      this.#context = undefined;
+      throw error;
     }
   }
 
   async stop(): Promise<void> {
-    if (this.#stopping) return;
-    this.#stopping = true;
-    this.#poller.stop();
-    await this.#poller.done();
-    await Promise.allSettled([...this.#inflight.values()]);
-    await Promise.allSettled([...this.#pending.values()].map((pending) => this.#finish(pending, undefined, true)));
-    this.#pending.clear();
-    this.#drafts.clear();
-    this.#releaseHeartbeat?.();
-    this.#releaseHeartbeat = undefined;
-    if (this.#lockPath) this.#releaseLock(this.#lockPath);
-    this.#lockPath = undefined;
-    this.#startContext = undefined;
-    this.#stopping = false;
+    if (this.#context === undefined) return;
+    if (this.#stopTask) return this.#stopTask;
+    this.#stopTask = (async () => {
+      this.#poller.stop();
+      await Promise.allSettled([this.#poller.done(), ...this.#updateTasks]);
+      for (const state of [...this.#interactions.values()]) {
+        this.#finishInteraction(state, this.#cancelledResponse(state.request));
+      }
+      this.#cards.clear();
+      this.#draftRoutes.clear();
+      this.#releaseRuntimeOwnership();
+      this.#context = undefined;
+      this.#stopTask = undefined;
+    })();
+    return this.#stopTask;
+  }
+
+  async handleUpdate(update: TgUpdate): Promise<void> {
+    const context = this.#requireContext();
+    const checkpoint = this.#store.getCheckpoint(this.id, `update_id:${this.#account}`);
+    if (typeof checkpoint === "number" && update.update_id <= checkpoint) return;
+    if (this.#activeUpdates.has(update.update_id)) return;
+    this.#activeUpdates.add(update.update_id);
+    try {
+      if (update.callback_query) await this.#handleCallback(update.callback_query, update.update_id, context);
+      else {
+        const stopped = update.stopped_message_generation;
+        if (stopped) await this.#handleDraftStop(stopped, update.update_id, context);
+        else {
+          const message = updateMessage(update);
+          if (message) await this.#handleMessage(message, update, context);
+        }
+      }
+      this.#store.setCheckpoint(this.id, `update_id:${this.#account}`, update.update_id);
+    } finally {
+      this.#activeUpdates.delete(update.update_id);
+    }
   }
 
   async send(
@@ -401,8 +457,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
     signal?: AbortSignal,
   ): Promise<OutboundReceipt> {
     const sent = await this.#outbound.send(address, content, context, signal);
-    const draftId = telegramDraftId(sent);
-    if (draftId !== undefined) this.#drafts.set(draftId, { address, delivery: context });
+    const draft = telegramDraftId(sent);
+    if (draft !== undefined) this.#draftRoutes.set(draft, { address, context });
     return sent;
   }
 
@@ -413,13 +469,14 @@ export class TelegramTransportAdapter implements TransportAdapter {
     context: DeliveryContext,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt> {
-    const updated = await this.#outbound.update(address, receipt, content, context, signal);
-    const priorDraftId = telegramDraftId(receipt);
-    const nextDraftId = telegramDraftId(updated);
-    if (priorDraftId !== undefined && nextDraftId === undefined) this.#drafts.delete(priorDraftId);
-    if (nextDraftId !== undefined) this.#drafts.set(nextDraftId, { address, delivery: context });
-    return updated;
+    const next = await this.#outbound.update(address, receipt, content, context, signal);
+    const priorDraft = telegramDraftId(receipt);
+    const nextDraft = telegramDraftId(next);
+    if (priorDraft !== undefined && nextDraft === undefined) this.#draftRoutes.delete(priorDraft);
+    if (nextDraft !== undefined) this.#draftRoutes.set(nextDraft, { address, context });
+    return next;
   }
+
   async finalize(
     address: ConversationAddress,
     receipt: OutboundReceipt | undefined,
@@ -430,8 +487,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
     try {
       return await this.#outbound.finalize(address, receipt, content, context, signal);
     } finally {
-      const draftId = telegramDraftId(receipt);
-      if (draftId !== undefined) this.#drafts.delete(draftId);
+      const draft = telegramDraftId(receipt);
+      if (draft !== undefined) this.#draftRoutes.delete(draft);
     }
   }
 
@@ -445,667 +502,585 @@ export class TelegramTransportAdapter implements TransportAdapter {
     await this.#outbound.react(address, receipt, reaction, context, signal);
   }
 
-  async presentUi<Request extends UiRequest>(
+  presentUi<Request extends UiRequest>(
     address: ConversationAddress,
     request: Request,
     context: DeliveryContext,
     signal?: AbortSignal,
-  ): Promise<UiResponseFor<Request>> {
-    this.#assertStarted();
-    if (!this.#authorizes(address, context)) throw new Error("Telegram UI target is not authorized for this delivery context");
+  ): Promise<UiResponseFor<Request>>;
+  async presentUi(
+    address: ConversationAddress,
+    request: UiRequest,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<UiResponse> {
+    await this.#assertUiOrigin(address, context);
     signal?.throwIfAborted();
-
     if (request.type === "notify") {
       await this.#outbound.sendMessage(address, request.message, context, {}, signal);
-      return { type: "notify", acknowledged: true } as UiResponseFor<Request>;
+      return { type: "notify", acknowledged: true };
     }
     if (request.type === "open_url") {
-      await this.#outbound.sendMessage(address, request.label ?? "Open the requested URL", context, {
-        replyMarkup: { inline_keyboard: [[{ text: request.label ?? "Open URL", url: request.url }]] },
+      await this.#outbound.sendMessage(address, request.label ?? request.url, context, {
+        replyMarkup: { inline_keyboard: [[{ text: request.label ?? "Open link", url: request.url }]] },
       }, signal);
-      return { type: "open_url", opened: true } as UiResponseFor<Request>;
+      return { type: "open_url", opened: true };
     }
     if (request.type === "status" || request.type === "widget" || request.type === "title" || request.type === "editor_text") {
-      await this.#presentSurface(address, request, context, signal);
-      return { type: request.type, acknowledged: true } as UiResponseFor<Request>;
+      await this.#updateControlCard(address, request, context, signal);
+      if (request.type === "status") return { type: "status", acknowledged: true };
+      if (request.type === "widget") return { type: "widget", acknowledged: true };
+      if (request.type === "title") return { type: "title", acknowledged: true };
+      return { type: "editor_text", acknowledged: true };
     }
-    return (await this.#createPending(address, request, context, signal)) as UiResponseFor<Request>;
+    if (request.type === "select" && request.options.length === 0) {
+      return { type: "select", selected: [] };
+    }
+    return this.#openInteraction(address, request, context, signal);
   }
 
-  /** Handles one Telegram update; public for deterministic adapter tests and webhook bridges. */
-  async handleUpdate(update: TgUpdate): Promise<void> {
-    const checkpoint = this.#checkpoint();
-    if (this.#completedUpdateIds.has(update.update_id)) return;
-    if (update.update_id <= checkpoint) return;
-    const inFlight = this.#inflight.get(update.update_id);
-    if (inFlight) return inFlight;
-
-    const work = this.#handleUpdate(update);
-    this.#inflight.set(update.update_id, work);
-    if (!this.#receivedUpdateIds.includes(update.update_id)) {
-      const insertAt = this.#receivedUpdateIds.findIndex((id) => id > update.update_id);
-      if (insertAt === -1) this.#receivedUpdateIds.push(update.update_id);
-      else this.#receivedUpdateIds.splice(insertAt, 0, update.update_id);
-    }
-    try {
-      await work;
-      this.#completedUpdateIds.add(update.update_id);
-      // Persist only the completed prefix: a later success must never skip an
-      // earlier failed update when the process restarts.
-      this.#checkpointCompletedUpdates();
-    } finally {
-      this.#inflight.delete(update.update_id);
-    }
-  }
-
-  statusText(): string {
-    const surfaces = [...this.#surfaces.values()];
-    if (surfaces.length === 0) return "Telegram UI ready";
-    return surfaces.map((surface) => this.#surfaceText(surface)).join("\n\n");
-  }
-
-  async #handleUpdate(update: TgUpdate): Promise<void> {
-    if (update.stopped_message_generation) {
-      await this.#handleGenerationStopped(update.stopped_message_generation, update.update_id);
-      return;
-    }
-    if (update.callback_query) {
-      if (await this.#handleCallback(update.callback_query)) return;
-      return;
-    }
-    const message = sourceFor(update);
-    if (!message || message.from?.is_bot || !message.from) return;
-    const context = this.#assertStarted();
-    if (await this.#handleReply(message)) return;
-
-    const identity = identityFor(message.from.id, this.#account);
+  async #handleMessage(message: TgMessage, update: TgUpdate, context: TransportStartContext): Promise<void> {
+    if (!message.from || message.from.is_bot) return;
+    const identity = telegramIdentity(message.from.id, this.#account);
     const principal = await context.resolveIdentity(identity, context.signal);
-    if (isPublicIdentityCommand(message.text) && principal === undefined) {
-      await this.#sendUnknownIdentityGuidance(message);
+    let address = telegramAddress(message, this.#account);
+    if (!principal) {
+      if (identityHelp(message.text)) await this.#sendIdentityHelp(message);
       return;
     }
-
-    const attachment = await this.#attachmentFor(message, context.signal);
-    const transcript = attachment?.voice ? await this.#transcript(attachment.path, context.signal) : undefined;
-    const text = [message.text ?? message.caption, transcript].filter((value): value is string => Boolean(value)).join("\n\n") || undefined;
-    const thread = principal === undefined
-      ? undefined
-      : await this.#createRootTopic(message, text ?? attachment?.attachment.name, context.signal);
-    const address = addressFor(message, this.#account, thread);
+    if (await this.#captureReply(message, principal.id, address)) return;
+    if (this.#topicsFromRoot && message.chat.is_forum && !message.is_topic_message && !isBotCommand(message.text)) {
+      const routeKey = `forum-topic:${message.chat.id}`;
+      let threadId = storedTopicThread(this.#store.getCheckpoint(this.id, routeKey), message.message_id);
+      if (threadId === undefined) {
+        const created = await this.#telegram("createForumTopic", {
+          chat_id: message.chat.id,
+          name: topicName(message.text ?? message.caption ?? ""),
+        }, context.signal);
+        if (created !== null && typeof created === "object" && "message_thread_id" in created && typeof created.message_thread_id === "number") {
+          threadId = created.message_thread_id;
+          this.#store.setCheckpoint(this.id, routeKey, { messageId: message.message_id, threadId });
+        }
+      }
+      if (threadId !== undefined) address = telegramAddress(message, this.#account, threadId);
+    }
+    const attachment = await this.#saveIncomingMedia(message, context.signal).catch((error) => {
+      if (context.signal?.aborted) throw error;
+      this.#log?.warn(`[telegram] attachment retrieval failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    });
+    const transcript = attachment?.transcribable
+      ? await this.#transcribe(attachment.localPath, context.signal).catch((error) => {
+          if (context.signal?.aborted) throw error;
+          this.#log?.warn(`[telegram] transcription failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`);
+          return undefined;
+        })
+      : undefined;
+    const textParts = [message.text ?? message.caption, transcript].filter((part): part is string => typeof part === "string" && part.length > 0);
+    const messageAttachment: MessageAttachment | undefined = attachment === undefined ? undefined : {
+      url: pathToFileURL(attachment.localPath).href,
+      name: attachment.displayName,
+      mediaType: attachment.mediaType,
+    };
     const envelope: InboundEnvelope = {
       id: `telegram:${this.#account}:${message.chat.id}:${message.message_id}`,
-      sentAt: message.date * 1000,
+      sentAt: message.date * 1_000,
       identity,
       address,
       content: {
-        ...(text === undefined ? {} : { text }),
-        ...(attachment === undefined ? {} : { attachments: [attachment.attachment] }),
+        ...(textParts.length === 0 ? {} : { text: textParts.join("\n\n") }),
+        ...(messageAttachment === undefined ? {} : { attachments: [messageAttachment] }),
       },
-      ...(message.reply_to_message === undefined ? {} : { replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) } }),
+      ...(message.reply_to_message === undefined ? {} : {
+        replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) },
+      }),
       sourceReceipt: { transport: "telegram", messageId: String(message.message_id) },
-      edited: message.edited_flag === true,
+      edited: update.edited_message !== undefined,
     };
+    if (envelope.content.text === undefined && envelope.content.attachments === undefined) return;
     await context.receive(envelope, context.signal);
   }
 
-  async #createRootTopic(message: TgMessage, source: string | undefined, signal?: AbortSignal): Promise<number | undefined> {
-    if (
-      !this.#createTopicsFromRoot ||
-      message.chat.type !== "supergroup" ||
-      message.chat.is_forum !== true ||
-      message.is_topic_message === true ||
-      message.message_thread_id !== undefined ||
-      source === undefined ||
-      message.text?.trimStart().startsWith("/")
-    ) return undefined;
-
-    const checkpointKey = `root_topic:${message.chat.id}:${message.message_id}`;
-    const checkpoint = this.#store.getCheckpoint(this.id, checkpointKey);
-    if (typeof checkpoint === "number" && Number.isSafeInteger(checkpoint) && checkpoint > 0) return checkpoint;
-    if (checkpoint !== undefined) {
-      this.#logger?.warn(`[telegram] Ignoring invalid root topic checkpoint ${checkpointKey}`);
-      return undefined;
+  async #handleCallback(query: TgCallbackQuery, updateId: number, context: TransportStartContext): Promise<void> {
+    const acknowledge = (text?: string, alert = false): Promise<unknown> => this.#telegram("answerCallbackQuery", {
+      callback_query_id: query.id,
+      ...(text === undefined ? {} : { text }),
+      ...(alert ? { show_alert: true } : {}),
+    }, context.signal);
+    if (!query.message || !query.data) {
+      await acknowledge("This control is no longer available.");
+      return;
     }
-
-    try {
-      const created = await this.#callTelegram(
-        "createForumTopic",
-        { chat_id: message.chat.id, name: topicName(source) },
-        { signal },
-      ) as { readonly message_thread_id?: unknown };
-      const threadId = created.message_thread_id;
-      if (typeof threadId !== "number" || !Number.isSafeInteger(threadId) || threadId <= 0) {
-        throw new Error("Telegram returned an invalid forum topic identifier");
-      }
-      this.#store.setCheckpoint(this.id, checkpointKey, threadId);
-      return threadId;
-    } catch (error) {
-      this.#logger?.warn(`[telegram] Unable to create a forum topic: ${error instanceof Error ? error.message : String(error)}`);
-      return undefined;
-    }
-  }
-
-  async #handleGenerationStopped(stopped: TgMessageGenerationStopped, updateId: number): Promise<void> {
-    if (stopped.chat.type !== "private") return;
-    const pending = this.#drafts.get(stopped.draft_id);
-    if (!pending) return;
-    const address: ConversationAddress = {
-      transport: "telegram",
-      account: this.#account,
-      channel: String(stopped.chat.id),
-      ...(stopped.message_thread_id === undefined ? {} : { thread: String(stopped.message_thread_id) }),
-    };
-    if (!sameAddress(address, pending.address)) return;
-
-    const context = this.#assertStarted();
-    const identity = identityFor(stopped.chat.id, this.#account);
+    const identity = telegramIdentity(query.from.id, this.#account);
     const principal = await context.resolveIdentity(identity, context.signal);
-    if (principal?.id !== pending.delivery.principal.id) return;
-
-    this.#drafts.delete(stopped.draft_id);
-    await context.receive(
-      {
-        id: `telegram:${this.#account}:draft-stop:${stopped.draft_id}:${updateId}`,
-        sentAt: this.#now(),
+    if (!principal) {
+      await acknowledge("Not authorized.", true);
+      return;
+    }
+    const address = telegramAddress(query.message, this.#account);
+    if (query.data === STOP_CALLBACK) {
+      const card = this.#cards.get(cardKey(address));
+      if (!card?.receipt || card.receipt.messageId !== String(query.message.message_id)) {
+        await acknowledge("This control has expired.");
+        return;
+      }
+      if (card.context?.principal.id !== principal.id) {
+        await acknowledge("This control belongs to another user.", true);
+        return;
+      }
+      await context.receive({
+        id: `telegram:${this.#account}:callback:${updateId}`,
+        sentAt: this.#clock(),
         identity,
         address,
         content: { text: "/stop" },
-      },
-      context.signal,
-    );
+        sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
+        edited: false,
+      }, context.signal);
+      await acknowledge("Stopping…");
+      return;
+    }
+    const prefix = `${INTERACTION_CALLBACK}:`;
+    if (!query.data.startsWith(prefix)) {
+      await acknowledge("Unknown control.");
+      return;
+    }
+    const remainder = query.data.slice(prefix.length);
+    const separator = remainder.indexOf(":");
+    if (separator < 1) {
+      await acknowledge("Invalid control.");
+      return;
+    }
+    const id = remainder.slice(0, separator);
+    const action = remainder.slice(separator + 1);
+    const state = this.#interactions.get(id);
+    if (!state) {
+      await acknowledge("This prompt has expired.");
+      return;
+    }
+    if (state.principalId !== principal.id || !sameAddress(state.address, address)) {
+      await acknowledge("This prompt belongs to another user.", true);
+      return;
+    }
+    await this.#applyInteractionAction(state, action, query, acknowledge);
   }
 
-  async #handleCallback(query: TgCallbackQuery): Promise<boolean> {
-    const data = query.data;
-    if (data === TASK_STOP_CALLBACK) return this.#handleTaskStop(query);
-    if (!data?.startsWith(`${CALLBACK_PREFIX}:`)) return false;
-    const [, id, action] = data.split(":", 3);
-    const pending = id === undefined ? undefined : this.#pending.get(id);
-    if (!pending || !query.message || !pending.message) {
-      await this.#answerCallback(query.id, "This control has expired.", true);
-      return true;
-    }
-    const address = addressFor(query.message, this.#account);
-    if (!sameAddress(address, pending.address) || query.message.message_id !== Number(pending.message.messageId)) {
-      await this.#answerCallback(query.id, "This control is unavailable.", true);
-      return true;
-    }
-
-    const context = this.#assertStarted();
-    const resolved = await context.resolveIdentity(identityFor(query.from.id, this.#account), context.signal);
-    if (resolved === undefined || resolved.id !== pending.delivery.principal.id) {
-      await this.#answerCallback(query.id, "This control belongs to another user.", true);
-      return true;
-    }
-
-    if (pending.kind === "confirm") {
-      if (action !== "yes" && action !== "no") {
-        await this.#answerCallback(query.id, "Invalid response.", true);
-        return true;
-      }
-      await this.#answerCallback(query.id);
-      await this.#finish(pending, { type: "confirm", confirmed: action === "yes" });
-      return true;
-    }
-    if (pending.kind !== "select") {
-      await this.#answerCallback(query.id, "Reply to the prompt instead.", true);
-      return true;
-    }
-    if (action === "previous" || action === "next") {
-      const pageCount = Math.ceil(pending.options.length / SELECT_PAGE_SIZE);
-      pending.page = Math.max(0, Math.min(pageCount - 1, pending.page + (action === "next" ? 1 : -1)));
-      await this.#answerCallback(query.id);
-      pending.message = await this.#outbound.update(
-        pending.address,
-        pending.message,
-        { text: this.#selectText(pending), format: "text" },
-        pending.delivery,
-        context.signal,
-      );
-      await this.#outbound.setReplyMarkup(
-        pending.address,
-        pending.message,
-        this.#keyboard(pending),
-        pending.delivery,
-        context.signal,
-      );
-      return true;
-    }
-    if (pending.multiSelect && action === "done") {
-      await this.#answerCallback(query.id, "Saved");
-      await this.#finish(pending, {
-        type: "select",
-        selected: [...pending.selected].sort((left, right) => left - right).map((index) => pending.options[index]),
-      });
-      return true;
-    }
-    if (pending.multiSelect && action === "cancel") {
-      await this.#answerCallback(query.id, "Cancelled");
-      await this.#finish(pending, undefined, true);
-      return true;
-    }
-    const index = Number(action);
-    if (!Number.isSafeInteger(index) || index < 0 || index >= pending.options.length) {
-      await this.#answerCallback(query.id, "Invalid option.", true);
-      return true;
-    }
-    if (!pending.multiSelect) {
-      await this.#answerCallback(query.id);
-      await this.#finish(pending, { type: "select", selected: [pending.options[index]] });
-      return true;
-    }
-    if (pending.selected.has(index)) pending.selected.delete(index);
-    else pending.selected.add(index);
-    await this.#answerCallback(query.id, pending.selected.has(index) ? "Selected" : "Removed");
-    await this.#outbound.setReplyMarkup(pending.address, pending.message, this.#keyboard(pending), pending.delivery, context.signal);
-    return true;
-  }
-
-  async #handleTaskStop(query: TgCallbackQuery): Promise<boolean> {
-    if (!query.message) {
-      await this.#answerCallback(query.id, "This control has expired.", true);
-      return true;
-    }
-    const address = addressFor(query.message, this.#account);
-    const surface = this.#surfaces.get(`${address.channel}:${address.thread ?? ""}`);
-    const task = surface?.statuses.get("Task");
-    if (
-      !surface?.message ||
-      query.message.message_id !== Number(surface.message.messageId) ||
-      !task ||
-      !/^(Queued|Working)(?:\n|$)/.test(task)
-    ) {
-      await this.#answerCallback(query.id, "This task is no longer running.", true);
-      return true;
-    }
-    const context = this.#assertStarted();
-    const identity = identityFor(query.from.id, this.#account);
+  async #handleDraftStop(event: TgMessageGenerationStopped, updateId: number, context: TransportStartContext): Promise<void> {
+    const route = this.#draftRoutes.get(event.draft_id);
+    if (!route) return;
+    const identity = telegramIdentity(event.chat.id, this.#account);
     const principal = await context.resolveIdentity(identity, context.signal);
-    if (!principal || principal.id !== surface.delivery?.principal.id) {
-      await this.#answerCallback(query.id, "This control belongs to another user.", true);
-      return true;
-    }
+    if (!principal || principal.id !== route.context.principal.id) return;
+    const address = telegramAddress(event, this.#account, event.message_thread_id);
+    if (!sameAddress(address, route.address)) return;
+    this.#draftRoutes.delete(event.draft_id);
     await context.receive({
-      id: `telegram:${this.#account}:task-stop:${query.id}`,
-      sentAt: this.#now(),
+      id: `telegram:${this.#account}:draft-stop:${event.draft_id}:${updateId}`,
+      sentAt: this.#clock(),
       identity,
       address,
       content: { text: "/stop" },
+      edited: false,
     }, context.signal);
-    await this.#answerCallback(query.id, "Stop requested");
-    return true;
   }
 
-  async #handleReply(message: TgMessage): Promise<boolean> {
-    const replyId = message.reply_to_message?.message_id;
-    if (replyId === undefined || !message.from) return false;
-    const address = addressFor(message, this.#account);
-    const pending = [...this.#pending.values()].find(
-      (candidate) =>
-        (candidate.kind === "input" || candidate.kind === "editor") &&
-        candidate.message?.messageId === String(replyId) &&
-        sameAddress(candidate.address, address),
-    );
-    if (!pending) return false;
-
-    const context = this.#assertStarted();
-    const resolved = await context.resolveIdentity(identityFor(message.from.id, this.#account), context.signal);
-    if (resolved === undefined) return false;
-    if (resolved.id !== pending.delivery.principal.id) {
-      await this.#outbound.sendMessage(address, "This prompt belongs to another authorized user.", pending.delivery, {}, context.signal);
-      return true;
+  async #saveIncomingMedia(message: TgMessage, signal?: AbortSignal): Promise<{
+    readonly localPath: string;
+    readonly displayName: string;
+    readonly mediaType: string;
+    readonly transcribable: boolean;
+  } | undefined> {
+    const media = mediaFrom(message);
+    if (!media) return undefined;
+    if (media.declaredBytes !== undefined && media.declaredBytes > MAX_INBOUND_ATTACHMENT_BYTES) {
+      this.#log?.warn(`[telegram] ignored ${media.displayName}: declared size ${media.declaredBytes} exceeds the inbound limit`);
+      return undefined;
     }
-    const value = message.text ?? message.caption;
-    if (!value) return true;
-    await this.#finish(
-      pending,
-      pending.kind === "input"
-        ? { type: "input", cancelled: false, value }
-        : { type: "editor", cancelled: false, value },
-    );
-    return true;
-  }
-
-  async #createPending(
-    address: ConversationAddress,
-    request: Extract<UiRequest, { readonly type: PendingKind }>,
-    delivery: DeliveryContext,
-    signal?: AbortSignal,
-  ): Promise<UiResponse> {
-    if (request.type === "select" && request.options.length === 0) return { type: "select", selected: [] };
-    const deferred = Promise.withResolvers<UiResponse>();
-    const pending: PendingUi = {
-      id: this.#randomId(),
-      kind: request.type,
-      address,
-      title: request.title,
-      delivery,
-      options: request.type === "select" ? request.options.map((option) => option.value) : [],
-      labels: request.type === "select" ? request.options.map((option) => option.label) : [],
-      descriptions: request.type === "select" ? request.options.map((option) => option.description) : [],
-      multiSelect: request.type === "select" && request.multiSelect === true,
-      selected: new Set(),
-      page: 0,
-      resolve: deferred.resolve,
-    };
-    const body = pending.kind === "select" ? this.#selectText(pending) : this.#pendingText(request);
-    const replyMarkup =
-      pending.kind === "input" || pending.kind === "editor"
-        ? { force_reply: true, selective: true, input_field_placeholder: body.slice(0, 64) }
-        : this.#keyboard(pending);
-
-    const sent = await this.#outbound.sendMessage(address, body, delivery, { replyMarkup }, signal);
-    pending.message = sent;
-    this.#store.putPendingInteraction(this.#storedPending(pending));
-    this.#pending.set(pending.id, pending);
-    if (this.#uiTimeoutMs > 0) {
-      pending.timer = setTimeout(() => void this.#finish(pending, undefined, true), this.#uiTimeoutMs);
-      pending.timer.unref?.();
+    const file = await this.#telegram("getFile", { file_id: media.telegramId }, signal);
+    if (file === null || typeof file !== "object" || !("file_path" in file) || typeof file.file_path !== "string") {
+      throw new Error("Telegram getFile returned no file path");
     }
-    const onAbort = () => void this.#finish(pending, undefined, true);
-    if (signal?.aborted) void this.#finish(pending, undefined, true);
-    else signal?.addEventListener("abort", onAbort, { once: true });
-    pending.removeAbortListener = () => signal?.removeEventListener("abort", onAbort);
-    return deferred.promise;
-  }
-
-  async #presentSurface(
-    address: ConversationAddress,
-    request: Extract<UiRequest, { readonly type: "status" | "widget" | "title" | "editor_text" }>,
-    delivery: DeliveryContext,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const key = `${address.channel}:${address.thread ?? ""}`;
-    let surface = this.#surfaces.get(key);
-    if (!surface) {
-      surface = { title: "OMP", editorText: "", statuses: new Map(), widgets: new Map() };
-      this.#surfaces.set(key, surface);
-    }
-    surface.delivery = delivery;
-    if (request.type === "status") {
-      if (request.text === undefined) surface.statuses.delete(request.key);
-      else surface.statuses.set(request.key, request.text);
-    } else if (request.type === "widget") {
-      if (request.lines === undefined) surface.widgets.delete(request.key);
-      else surface.widgets.set(request.key, request.lines);
-    } else if (request.type === "title") surface.title = request.title;
-    else surface.editorText = request.text;
-
-    const text = this.#surfaceText(surface);
-    const stopControlVisible = /^(Queued|Working)(?:\n|$)/.test(surface.statuses.get("Task") ?? "");
-    const replyMarkup = stopControlVisible
-      ? { inline_keyboard: [[{ text: "Stop", callback_data: TASK_STOP_CALLBACK }]] }
-      : { inline_keyboard: [] };
-    if (surface.message) {
-      try {
-        surface.message = await this.#outbound.update(address, surface.message, { text, format: "text" }, delivery, signal);
-      } catch (error) {
-        this.#logger?.warn(`[telegram] could not edit UI surface: ${error instanceof Error ? error.message : String(error)}`);
-        surface.message = undefined;
-      }
-      if (surface.message) {
-        if (surface.stopControlVisible !== stopControlVisible) {
-          try {
-            await this.#outbound.setReplyMarkup(address, surface.message, replyMarkup, delivery, signal);
-          } catch (error) {
-            this.#logger?.warn(`[telegram] could not edit UI controls: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        }
-        surface.stopControlVisible = stopControlVisible;
-        return;
-      }
-    }
-    surface.message = await this.#outbound.sendMessage(address, text, delivery, { replyMarkup }, signal);
-    surface.stopControlVisible = stopControlVisible;
-  }
-
-
-  #surfaceText(surface: Surface): string {
-    const lines: string[] = [];
-    if (surface.title && surface.title !== "OMP") lines.push(surface.title);
-    for (const [key, text] of surface.statuses) lines.push(key === "Task" ? text : `${key}: ${text}`);
-    for (const [key, widget] of surface.widgets) lines.push(`${key}\n${widget.join("\n")}`);
-    if (surface.editorText) lines.push(`Suggested reply\n${surface.editorText}`);
-    return (lines.join("\n\n") || "Ready").slice(0, 4096);
-  }
-
-  #pendingText(request: Extract<UiRequest, { readonly type: PendingKind }>): string {
-    if (request.type === "confirm") return [request.title, request.message].filter(Boolean).join("\n\n");
-    if (request.type === "select") return request.title;
-    if (request.type === "input") {
-      return [request.title, request.prompt ?? request.placeholder ?? "Reply to this message.", request.initialValue].filter(Boolean).join("\n\n");
-    }
-    return [request.title, request.initialValue, "Reply to this message with the edited text."].filter(Boolean).join("\n\n");
-  }
-
-  #selectText(pending: PendingUi): string {
-    const pageCount = Math.max(1, Math.ceil(pending.options.length / SELECT_PAGE_SIZE));
-    const start = pending.page * SELECT_PAGE_SIZE;
-    const end = Math.min(pending.options.length, start + SELECT_PAGE_SIZE);
-    const lines = [
-      pending.title,
-      ...(pageCount > 1 ? [`Page ${pending.page + 1} of ${pageCount}`] : []),
-    ];
-    for (let index = start; index < end; index++) {
-      const description = pending.descriptions[index];
-      lines.push(`${index + 1}. ${pending.labels[index] ?? pending.options[index]}${description ? `: ${description}` : ""}`);
-    }
-    return lines.join("\n\n").slice(0, 4096);
-  }
-
-  #keyboard(pending: PendingUi): Record<string, unknown> {
-    if (pending.kind === "confirm") {
-      return {
-        inline_keyboard: [
-          [
-            { text: "Confirm", callback_data: callbackData(pending.id, "yes") },
-            { text: "Cancel", callback_data: callbackData(pending.id, "no") },
-          ],
-        ],
-      };
-    }
-    const start = pending.page * SELECT_PAGE_SIZE;
-    const end = Math.min(pending.options.length, start + SELECT_PAGE_SIZE);
-    const rows: Array<Array<{ text: string; callback_data: string }>> = pending.options.slice(start, end).map((value, offset) => {
-      const index = start + offset;
-      return [
-        {
-          text: `${pending.multiSelect && pending.selected.has(index) ? "✓ " : ""}${(pending.labels[index] ?? value).slice(0, 48)}`,
-          callback_data: callbackData(pending.id, String(index)),
-        },
-      ];
+    assertRemoteFilePath(file.file_path);
+    const bytes = await this.#download(this.#token, file.file_path);
+    const displayName = safeFilename(media.displayName);
+    const diskName = `${this.#newId()}-${safeFilename(media.stableId)}-${displayName}`;
+    const localPath = await saveInboxAttachment(this.#inboxDir, {
+      filename: diskName,
+      bytes,
+      protect: this.#protectedInboxPaths(),
     });
-    if (pending.options.length > SELECT_PAGE_SIZE) {
-      const navigation: Array<{ text: string; callback_data: string }> = [];
-      if (pending.page > 0) navigation.push({ text: "Previous", callback_data: callbackData(pending.id, "previous") });
-      if ((pending.page + 1) * SELECT_PAGE_SIZE < pending.options.length) {
-        navigation.push({ text: "Next", callback_data: callbackData(pending.id, "next") });
-      }
-      rows.push(navigation);
-    }
-    if (pending.multiSelect) {
-      rows.push([
-        { text: "Done", callback_data: callbackData(pending.id, "done") },
-        { text: "Cancel", callback_data: callbackData(pending.id, "cancel") },
-      ]);
-    }
-    return { inline_keyboard: rows };
+    return { localPath, displayName, mediaType: media.mediaType, transcribable: media.transcribable };
   }
 
-  async #finish(pending: PendingUi, response: UiResponse | undefined, cancelled = false): Promise<void> {
-    if (!this.#pending.delete(pending.id)) return;
-    clearTimeout(pending.timer);
-    pending.removeAbortListener?.();
-    this.#store.deletePendingInteraction(pending.id);
-    if (pending.message) {
-      await this.#outbound
-        .setReplyMarkup(pending.address, pending.message, { inline_keyboard: [] }, pending.delivery)
-        .catch(() => undefined);
-    }
-    if (cancelled) {
-      if (pending.kind === "confirm") pending.resolve({ type: "confirm", confirmed: false });
-      else if (pending.kind === "select") pending.resolve({ type: "select", selected: [] });
-      else if (pending.kind === "input") pending.resolve({ type: "input", cancelled: true });
-      else pending.resolve({ type: "editor", cancelled: true });
-      return;
-    }
-    if (response) pending.resolve(response);
-  }
-
-  #storedPending(pending: PendingUi): PendingInteraction {
-    const createdAt = this.#now();
-    return {
-      id: pending.id,
-      address: pending.address,
-      kind: pending.kind,
-      payload: {
-        principalId: pending.delivery.principal.id,
-        messageId: pending.message?.messageId ?? "",
-        options: [...pending.options],
-        multiSelect: pending.multiSelect,
-      },
-      createdAt,
-      expiresAt: this.#uiTimeoutMs > 0 ? createdAt + this.#uiTimeoutMs : undefined,
-    };
-  }
-
-  async #attachmentFor(
-    message: TgMessage,
-    signal?: AbortSignal,
-  ): Promise<{ readonly attachment: MessageAttachment; readonly path: string; readonly voice: boolean } | undefined> {
-    const media = mediaFor(message);
-    if (!media || (media.size !== undefined && media.size > INBOX_MAX_FILE_BYTES)) {
-      if (media) this.#logger?.warn(`[telegram] ignored oversized ${media.name}`);
-      return undefined;
-    }
-    try {
-      signal?.throwIfAborted();
-      const rawFile = await this.#request("getFile", { file_id: media.fileId }, signal);
-      if (!rawFile || typeof rawFile !== "object" || !("file_path" in rawFile) || typeof rawFile.file_path !== "string") {
-        throw new Error("Telegram getFile returned no file_path");
-      }
-      const bytes = await this.#download(this.#token, rawFile.file_path);
-      const extension = extname(media.name) || extname(rawFile.file_path) || ".bin";
-      const name = `${this.#now()}-${safeFilename(media.uniqueId)}${extension}`;
-      const path = await storeInboxFile(this.#inboxDir, name, bytes, this.#pendingInboxPaths());
-      return {
-        path,
-        voice: media.voice,
-        attachment: { url: pathToFileURL(path).href, name: safeFilename(media.name), mediaType: media.mediaType },
-      };
-    } catch (error) {
-      this.#logger?.warn(`[telegram] media download failed: ${error instanceof Error ? error.message : String(error)}`);
-      return undefined;
-    }
-  }
-
-  #pendingInboxPaths(): ReadonlySet<string> {
+  #protectedInboxPaths(): ReadonlySet<string> {
     const paths = new Set<string>();
-    for (const { message } of this.#store.listPendingInboundMessages()) {
-      for (const attachment of message.content.attachments ?? []) {
+    for (const pending of this.#store.listPendingInboundMessages()) {
+      for (const attachment of pending.message.content.attachments ?? []) {
         try {
           const url = new URL(attachment.url);
-          if (url.protocol === "file:") paths.add(fileURLToPath(url));
+          if (url.protocol === "file:") paths.add(resolve(url.pathname));
         } catch {
-          // Malformed URLs cannot name inbox files.
+          continue;
         }
       }
     }
     return paths;
   }
 
-  async #transcript(path: string, signal?: AbortSignal): Promise<string | undefined> {
-    if (!this.#transcribeCommand || this.#transcribeCommand.length === 0) return undefined;
+  async #transcribe(path: string, signal?: AbortSignal): Promise<string | undefined> {
+    const command = this.#transcriptionCommand;
+    if (!command || command.length === 0) return undefined;
     try {
-      const output = this.#transcribe
-        ? await this.#transcribe(this.#transcribeCommand, path, signal)
-        : await this.#runTranscription(this.#transcribeCommand, path, signal);
+      const output = this.#transcriptionOverride
+        ? await this.#transcriptionOverride(command, path, signal)
+        : await this.#runTranscriber(command, path, signal);
       const trimmed = output.trim();
-      return trimmed ? `[Voice transcript: ${trimmed}]` : undefined;
+      return trimmed.length === 0 ? undefined : `[Voice transcript: ${trimmed}]`;
     } catch (error) {
-      this.#logger?.warn(`[telegram] voice transcription failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#log?.warn(`[telegram] transcription failed: ${error instanceof Error ? error.message : String(error)}`);
       return undefined;
     }
   }
 
-  async #runTranscription(command: readonly string[], file: string, signal?: AbortSignal): Promise<string> {
-    const needsOutputDirectory = command.some((part) => part.includes("{outputDir}"));
-    const outputDirectory = needsOutputDirectory
-      ? await mkdtemp(join(tmpdir(), "ompclaw-transcript-"))
-      : undefined;
+  async #runTranscriber(command: readonly string[], path: string, signal?: AbortSignal): Promise<string> {
+    const needsDirectory = command.some((part) => part.includes("{outputDir}"));
+    const directory = needsDirectory ? await mkdtemp(join(tmpdir(), "ompclaw-transcript-")) : undefined;
     try {
-      const [executable, ...args] = command.map((part) => part
-        .replaceAll("{file}", file)
-        .replaceAll("{outputDir}", outputDirectory ?? ""));
-      if (!executable) throw new Error("Telegram transcription command is empty");
-      const result = await execFileAsync(executable, args, {
+      const expanded = command.map((part) => part.replaceAll("{file}", path).replaceAll("{outputDir}", directory ?? ""));
+      const program = expanded[0];
+      if (!program) throw new Error("Telegram transcription command is empty");
+      const completed = await executeFile(program, expanded.slice(1), {
         encoding: "utf8",
         timeout: 120_000,
         maxBuffer: 1024 * 1024,
         signal,
       });
-      if (outputDirectory === undefined) return result.stdout;
-      const transcriptPath = join(outputDirectory, `${basename(file, extname(file))}.txt`);
-      return await readFile(transcriptPath, { encoding: "utf8", signal });
+      if (!directory) return completed.stdout;
+      return readFile(join(directory, `${basename(path, extname(path))}.txt`), "utf8");
     } finally {
-      if (outputDirectory !== undefined) {
-        await rm(outputDirectory, { recursive: true, force: true }).catch(() => undefined);
+      if (directory) await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  #openInteraction(
+    address: ConversationAddress,
+    request: InteractiveRequest,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<InteractiveResponse> {
+    return new Promise<InteractiveResponse>((resolvePromise, rejectPromise) => {
+      const id = this.#newId();
+      const choices = request.type === "select" ? request.options.map((option) => option.value) : [];
+      const labels = request.type === "select" ? request.options.map((option) => option.label) : [];
+      const notes = request.type === "select" ? request.options.map((option) => option.description) : [];
+      const state: InteractiveState = {
+        id,
+        request,
+        address,
+        context,
+        principalId: context.principal.id,
+        choices,
+        labels,
+        notes,
+        selected: new Set<number>(),
+        settle: resolvePromise,
+        reject: rejectPromise,
+        multiple: request.type === "select" && request.multiSelect === true,
+        page: 0,
+      };
+      this.#interactions.set(id, state);
+      this.#store.putPendingInteraction(this.#pendingInteraction(state));
+      state.timeout = setTimeout(() => this.#finishInteraction(state, this.#cancelledResponse(request)), this.#interactionLifetime);
+      state.timeout.unref?.();
+      if (signal) {
+        const abort = (): void => this.#finishInteraction(state, this.#cancelledResponse(request));
+        signal.addEventListener("abort", abort, { once: true });
+        state.detachAbort = () => signal.removeEventListener("abort", abort);
       }
-    }
+      void this.#sendInteractionPrompt(state, signal).catch((error) => this.#failInteraction(state, error));
+    });
   }
 
-  async #sendUnknownIdentityGuidance(message: TgMessage): Promise<void> {
-    const address = addressFor(message, this.#account);
-    const context: DeliveryContext = {
-      principal: { id: `telegram-unresolved:${this.#account}:${message.from!.id}`, roles: [] },
-      origin: address,
+  #pendingInteraction(state: InteractiveState): PendingInteraction {
+    const payload: JsonValue = {
+      title: state.request.title,
+      principalId: state.principalId,
+      choices: state.choices,
+      multiple: state.multiple,
     };
-    await this.#outbound.sendMessage(
-      address,
-      `This gateway identifies Telegram users by numeric ID. Your user_id: ${message.from!.id}. Ask an administrator to authorize that ID.`,
-      context,
-    );
+    return {
+      id: state.id,
+      address: state.address,
+      kind: state.request.type,
+      payload,
+      createdAt: this.#clock(),
+      expiresAt: this.#clock() + this.#interactionLifetime,
+    };
   }
 
-  async #answerCallback(id: string, text?: string, showAlert = false): Promise<void> {
-    await this.#request("answerCallbackQuery", {
-      callback_query_id: id,
-      ...(text === undefined ? {} : { text }),
-      ...(showAlert ? { show_alert: true } : {}),
-    }).catch(() => undefined);
-  }
-
-  async #request(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    signal?.throwIfAborted();
-    return withTelegramRetry(() => this.#callTelegram(method, payload, { signal }), { signal, log: this.#logger });
-  }
-
-  #checkpointCompletedUpdates(): void {
-    let completedCount = 0;
-    let latest: number | undefined;
-    for (const updateId of this.#receivedUpdateIds) {
-      if (!this.#completedUpdateIds.has(updateId)) break;
-      completedCount += 1;
-      latest = updateId;
+  async #sendInteractionPrompt(state: InteractiveState, signal?: AbortSignal): Promise<void> {
+    const request = state.request;
+    if (request.type === "confirm") {
+      state.prompt = await this.#outbound.sendMessage(state.address, `${request.title}\n\n${request.message}`, state.context, {
+        replyMarkup: { inline_keyboard: [[
+          { text: request.confirmLabel ?? "Confirm", callback_data: callback(state.id, "accept") },
+          { text: request.cancelLabel ?? "Cancel", callback_data: callback(state.id, "reject") },
+        ]] },
+      }, signal);
+      return;
     }
-    if (latest === undefined) return;
-    this.#store.setCheckpoint(this.id, this.#checkpointKey, latest);
-    const persisted = this.#receivedUpdateIds.splice(0, completedCount);
-    for (const updateId of persisted) this.#completedUpdateIds.delete(updateId);
+    if (request.type === "select") {
+      state.prompt = await this.#outbound.sendMessage(state.address, this.#selectPrompt(state), state.context, {
+        replyMarkup: this.#selectKeyboard(state),
+      }, signal);
+      return;
+    }
+    const prompt = request.type === "input" ? request.prompt : undefined;
+    const initial = request.initialValue;
+    const lines = [request.title, prompt, initial ? `Current value:\n${initial}` : undefined].filter((part): part is string => Boolean(part));
+    state.prompt = await this.#outbound.sendMessage(state.address, lines.join("\n\n"), state.context, {
+      replyMarkup: { force_reply: true, selective: true },
+    }, signal);
   }
 
-  #checkpoint(): number {
-    const value = this.#store.getCheckpoint(this.id, this.#checkpointKey);
-    if (typeof value === "number" && Number.isSafeInteger(value)) return value;
-    if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
-    return -1;
-  }
-  #authorizes(address: ConversationAddress, delivery: DeliveryContext): boolean {
-    return address.transport === "telegram" && address.account === this.#account && sameAddress(address, delivery.origin);
+  #selectPrompt(state: InteractiveState): string {
+    const request = state.request;
+    if (request.type !== "select") return request.title;
+    const start = state.page * SELECT_PAGE_SIZE;
+    const end = Math.min(start + SELECT_PAGE_SIZE, state.labels.length);
+    const options = state.labels.slice(start, end).map((label, relative) => {
+      const index = start + relative;
+      const marker = state.selected.has(index) ? "[selected]" : "[ ]";
+      const note = state.notes[index];
+      return `${marker} ${label}${note ? `\n${note}` : ""}`;
+    });
+    return [request.title, ...options].join("\n\n");
   }
 
-  #assertStarted(): TransportStartContext {
-    if (!this.#startContext) throw new Error(`Telegram adapter ${this.id} is not started`);
-    return this.#startContext;
+  #selectKeyboard(state: InteractiveState): Record<string, unknown> {
+    const start = state.page * SELECT_PAGE_SIZE;
+    const end = Math.min(start + SELECT_PAGE_SIZE, state.labels.length);
+    const rows: Record<string, string>[][] = [];
+    for (let index = start; index < end; index += 1) {
+      rows.push([{
+        text: `${state.selected.has(index) ? "✓ " : ""}${state.labels[index]}`.slice(0, 64),
+        callback_data: callback(state.id, `pick-${index}`),
+      }]);
+    }
+    const pages = Math.max(1, Math.ceil(state.labels.length / SELECT_PAGE_SIZE));
+    if (pages > 1) {
+      rows.push([
+        { text: "Previous", callback_data: callback(state.id, "previous") },
+        { text: `${state.page + 1}/${pages}`, callback_data: callback(state.id, "noop") },
+        { text: "Next", callback_data: callback(state.id, "next") },
+      ]);
+    }
+    if (state.multiple) {
+      rows.push([
+        { text: "Done", callback_data: callback(state.id, "done") },
+        { text: "Cancel", callback_data: callback(state.id, "cancel") },
+      ]);
+    }
+    return { inline_keyboard: rows };
+  }
+
+  async #applyInteractionAction(
+    state: InteractiveState,
+    action: string,
+    query: TgCallbackQuery,
+    acknowledge: (text?: string, alert?: boolean) => Promise<unknown>,
+  ): Promise<void> {
+    if (state.request.type === "confirm") {
+      if (action !== "accept" && action !== "reject") {
+        await acknowledge("Invalid response.");
+        return;
+      }
+      this.#finishInteraction(state, { type: "confirm", confirmed: action === "accept" });
+      await acknowledge(action === "accept" ? "Confirmed" : "Cancelled");
+      return;
+    }
+    if (state.request.type !== "select") {
+      await acknowledge("Reply to the prompt instead.");
+      return;
+    }
+    if (action === "noop") {
+      await acknowledge();
+      return;
+    }
+    if (action === "previous" || action === "next") {
+      const pageCount = Math.max(1, Math.ceil(state.choices.length / SELECT_PAGE_SIZE));
+      state.page = Math.max(0, Math.min(pageCount - 1, state.page + (action === "next" ? 1 : -1)));
+      await this.#refreshSelection(state);
+      await acknowledge();
+      return;
+    }
+    if (action === "cancel") {
+      this.#finishInteraction(state, { type: "select", selected: [] });
+      await acknowledge("Cancelled");
+      return;
+    }
+    if (action === "done") {
+      this.#finishInteraction(state, { type: "select", selected: [...state.selected].sort((a, b) => a - b).map((index) => state.choices[index]!) });
+      await acknowledge("Selected");
+      return;
+    }
+    const picked = /^pick-(\d+)$/.exec(action);
+    const index = picked ? Number(picked[1]) : -1;
+    if (!Number.isSafeInteger(index) || index < 0 || index >= state.choices.length) {
+      await acknowledge("Invalid option.");
+      return;
+    }
+    if (!state.multiple) {
+      this.#finishInteraction(state, { type: "select", selected: [state.choices[index]!] });
+      await acknowledge(state.labels[index]);
+      return;
+    }
+    if (state.selected.has(index)) state.selected.delete(index);
+    else state.selected.add(index);
+    await this.#refreshSelection(state);
+    await acknowledge();
+    void query;
+  }
+
+  async #refreshSelection(state: InteractiveState): Promise<void> {
+    if (!state.prompt) return;
+    await this.#outbound.update(state.address, state.prompt, { text: this.#selectPrompt(state) }, state.context);
+    await this.#outbound.setReplyMarkup(state.address, state.prompt, this.#selectKeyboard(state), state.context);
+  }
+
+  async #captureReply(message: TgMessage, principalId: string, address: ConversationAddress): Promise<boolean> {
+    if (!message.reply_to_message || typeof message.text !== "string") return false;
+    for (const state of this.#interactions.values()) {
+      if (state.request.type !== "input" && state.request.type !== "editor") continue;
+      if (state.principalId !== principalId || !sameAddress(state.address, address)) continue;
+      if (state.prompt?.messageId !== String(message.reply_to_message.message_id)) continue;
+      this.#finishInteraction(state, state.request.type === "input"
+        ? { type: "input", cancelled: false, value: message.text }
+        : { type: "editor", cancelled: false, value: message.text });
+      return true;
+    }
+    return false;
+  }
+
+  #cancelledResponse(request: InteractiveRequest): InteractiveResponse {
+    if (request.type === "confirm") return { type: "confirm", confirmed: false };
+    if (request.type === "select") return { type: "select", selected: [] };
+    if (request.type === "input") return { type: "input", cancelled: true };
+    return { type: "editor", cancelled: true };
+  }
+
+  #finishInteraction(state: InteractiveState, response: InteractiveResponse): void {
+    if (!this.#interactions.delete(state.id)) return;
+    if (state.timeout) clearTimeout(state.timeout);
+    state.detachAbort?.();
+    this.#store.deletePendingInteraction(state.id);
+    if (state.prompt) void this.#outbound.setReplyMarkup(state.address, state.prompt, { inline_keyboard: [] }, state.context).catch(() => undefined);
+    state.settle(response);
+  }
+
+  #failInteraction(state: InteractiveState, error: unknown): void {
+    if (!this.#interactions.delete(state.id)) return;
+    if (state.timeout) clearTimeout(state.timeout);
+    state.detachAbort?.();
+    this.#store.deletePendingInteraction(state.id);
+    state.reject(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  async #updateControlCard(
+    address: ConversationAddress,
+    request: Extract<UiRequest, { type: "status" | "widget" | "title" | "editor_text" }>,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const key = cardKey(address);
+    const card = this.#cards.get(key) ?? {
+      title: "OmpClaw control center",
+      editorText: "",
+      statuses: new Map<string, string>(),
+      widgets: new Map<string, readonly string[]>(),
+      stopVisible: false,
+    };
+    if (request.type === "title") card.title = request.title;
+    if (request.type === "editor_text") card.editorText = request.text;
+    if (request.type === "status") {
+      if (request.text === undefined) card.statuses.delete(request.key);
+      else card.statuses.set(request.key, request.text);
+    }
+    if (request.type === "widget") {
+      if (request.lines === undefined || request.lines.length === 0) card.widgets.delete(request.key);
+      else card.widgets.set(request.key, request.lines);
+    }
+    card.context = context;
+    card.stopVisible = [...card.statuses.values()].some(activeTask);
+    this.#cards.set(key, card);
+    const body = this.#renderCard(card);
+    const markup = card.stopVisible ? { inline_keyboard: [[{ text: "Stop", callback_data: STOP_CALLBACK }]] } : { inline_keyboard: [] };
+    if (!card.receipt) {
+      card.receipt = await this.#outbound.sendMessage(address, body, context, { replyMarkup: markup }, signal);
+      return;
+    }
+    await this.#outbound.update(address, card.receipt, { text: body }, context, signal);
+    await this.#outbound.setReplyMarkup(address, card.receipt, markup, context, signal);
+  }
+
+  #renderCard(card: ControlCard): string {
+    const sections: string[] = [card.title];
+    for (const [name, value] of card.statuses) sections.push(`${name}\n${value}`);
+    for (const [name, lines] of card.widgets) sections.push(`${name}\n${lines.join("\n")}`);
+    if (card.editorText) sections.push(`Suggested reply\n${card.editorText}`);
+    return sections.join("\n\n");
+  }
+
+  async #sendIdentityHelp(message: TgMessage): Promise<void> {
+    const address = telegramAddress(message, this.#account);
+    const principal = { id: `telegram-unresolved:${message.from?.id ?? "unknown"}`, roles: [] };
+    await this.#outbound.sendMessage(address, [
+      `Telegram user ID: ${message.from?.id ?? "unknown"}`,
+      `Chat ID: ${message.chat.id}`,
+      address.thread ? `Topic ID: ${address.thread}` : undefined,
+      "Ask the gateway operator to authorize this numeric user ID.",
+    ].filter((line): line is string => line !== undefined).join("\n"), { principal, origin: address });
+  }
+
+  async #assertUiOrigin(address: ConversationAddress, context: DeliveryContext): Promise<void> {
+    if (!this.#deliveryAllowed(address, context)) throw new Error("Telegram UI target is not authorized for this delivery context");
+  }
+
+  #deliveryAllowed(address: ConversationAddress, context: DeliveryContext): boolean {
+    return address.transport === "telegram"
+      && address.account === this.#account
+      && context.origin.transport === "telegram"
+      && context.origin.account === this.#account
+      && sameAddress(address, context.origin);
+  }
+
+  #trackUpdate(update: TgUpdate): Promise<void> {
+    const task = this.handleUpdate(update).catch((error) => {
+      this.#log?.error(`[telegram] update ${update.update_id} failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    });
+    this.#updateTasks.add(task);
+    void task.then(
+      () => this.#updateTasks.delete(task),
+      () => this.#updateTasks.delete(task),
+    );
+    return task;
+  }
+
+
+  async #telegram(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+    return withTelegramRetry(() => this.#call(method, payload, { signal }), { signal, log: this.#log });
+  }
+
+  #releaseRuntimeOwnership(): void {
+    this.#stopHeartbeat?.();
+    this.#stopHeartbeat = undefined;
+    if (this.#lockPath) this.#dropLock(this.#lockPath);
+    this.#lockPath = undefined;
+  }
+
+  #requireContext(): TransportStartContext {
+    if (!this.#context) throw new Error("Telegram transport is not started");
+    return this.#context;
   }
 }

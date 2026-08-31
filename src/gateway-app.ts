@@ -1,6 +1,6 @@
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { acquireLock, releaseLock, startLockHeartbeat } from "./api";
+import { acquireLock, releaseLock, startLockHeartbeat } from "./transports/telegram/bot-api";
 import {
   gatewayRpcRuntimeConfig,
   resolveGatewaySecrets,
@@ -43,6 +43,7 @@ export interface GatewayApplicationStore extends Partial<GatewayScheduledJobStor
   getConversationBinding(address: InboundMessage["address"]): ConversationBinding | undefined;
   getSharedConversationSessionPath?(): string | undefined;
   migrateTelegramTopicSessions?(account: string): number;
+  migrateTelegramUpdateCheckpoint?(account: string): boolean;
   putPendingInteraction: GatewayStore["putPendingInteraction"];
   deletePendingInteraction: GatewayStore["deletePendingInteraction"];
 }
@@ -171,6 +172,7 @@ export class GatewayApplication {
       const store = (this.#seams.createStore ?? ((path: string) => new GatewayStore(path)))(this.#databasePath);
       this.#store = store;
       const telegram = this.#config.transports.telegram;
+      if (telegram?.enabled) store.migrateTelegramUpdateCheckpoint?.(telegram.account);
       const topicSessions = telegram?.enabled === true && telegram.topicSessions.enabled;
       if (topicSessions) store.migrateTelegramTopicSessions?.(telegram.account);
       const checkpoint = store.getCheckpoint("omp", "session_file");

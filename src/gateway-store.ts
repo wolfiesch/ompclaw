@@ -846,6 +846,37 @@ export class GatewayStore {
     return row === null ? undefined : decodeJson(row.value_json, "adapter checkpoint");
   }
 
+  migrateTelegramUpdateCheckpoint(account: string): boolean {
+    requiredText(account, "Telegram account");
+    if (account !== "default") return false;
+    return this.#transaction(() => {
+      const scopedKey = `update_id:${account}`;
+      const scoped = this.getCheckpoint("telegram", scopedKey);
+      const legacy = this.getCheckpoint("telegram", "update_id");
+      if (scoped !== undefined) {
+        if (typeof scoped !== "number" || !Number.isSafeInteger(scoped) || scoped < 0) {
+          throw new Error(`Telegram checkpoint ${scopedKey} must be a non-negative integer`);
+        }
+        if (legacy !== undefined) {
+          this.#database.query("DELETE FROM adapter_checkpoints WHERE adapter = 'telegram' AND checkpoint_key = 'update_id'").run();
+        }
+        return false;
+      }
+      if (legacy === undefined) return false;
+      const migrated = typeof legacy === "number"
+        ? legacy
+        : typeof legacy === "string" && /^\d+$/.test(legacy)
+          ? Number(legacy)
+          : Number.NaN;
+      if (!Number.isSafeInteger(migrated) || migrated < 0) {
+        throw new Error("legacy Telegram update checkpoint must be a non-negative integer");
+      }
+      this.setCheckpoint("telegram", scopedKey, migrated);
+      this.#database.query("DELETE FROM adapter_checkpoints WHERE adapter = 'telegram' AND checkpoint_key = 'update_id'").run();
+      return true;
+    });
+  }
+
   claimInboundMessage(message: InboundMessage, receivedAt: number, scheduled = false): boolean {
     validateInboundMessage(message);
     if (!Number.isSafeInteger(receivedAt)) {
@@ -1267,7 +1298,7 @@ export class GatewayStore {
       this.upsertPrincipal(principal);
       this.bindIdentity(identity, principal.id);
       this.bindConversation(binding);
-      if (lastUpdateId !== undefined) this.setCheckpoint("telegram", "update_id", String(lastUpdateId));
+      if (lastUpdateId !== undefined) this.setCheckpoint("telegram", "update_id:default", lastUpdateId);
       this.#database
         .query("INSERT INTO migration_markers (marker, completed_at) VALUES (?, ?)")
         .run(LEGACY_TELEGRAM_STATE_MIGRATION, Date.now());
