@@ -26,6 +26,23 @@ function systemdQuote(value: string): string {
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }
 
+function systemdPath(value: string): string {
+  let escaped = "";
+  for (const byte of Buffer.from(value)) {
+    const safe =
+      (byte >= 0x30 && byte <= 0x39) ||
+      (byte >= 0x41 && byte <= 0x5a) ||
+      (byte >= 0x61 && byte <= 0x7a) ||
+      byte === 0x2f ||
+      byte === 0x2d ||
+      byte === 0x2e ||
+      byte === 0x3a ||
+      byte === 0x5f;
+    escaped += safe ? String.fromCharCode(byte) : `\\x${byte.toString(16).padStart(2, "0")}`;
+  }
+  return escaped;
+}
+
 function resolveCommand(command: string): string {
   if (command.includes("/")) return command;
   for (const directory of (process.env.PATH ?? "").split(delimiter)) {
@@ -74,6 +91,33 @@ function servicePath(program: string): string {
 
 function serviceArguments(paths: GatewayServicePaths): string[] {
   return [resolveCommand(GATEWAY_COMMAND), "run", "--config", paths.configPath, "--env-file", paths.envFile];
+}
+
+export function renderSystemdUnit(
+  config: Pick<GatewayConfig, "workspace" | "stateDir">,
+  args: readonly string[],
+): string {
+  return `[Unit]
+Description=OmpClaw authenticated OMP gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${systemdPath(config.workspace)}
+ExecStart=${args.map(systemdQuote).join(" ")}
+Environment=${systemdQuote(`PATH=${servicePath(args[0]!)}`)}
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${systemdQuote(config.stateDir)} ${systemdQuote(config.workspace)}
+
+[Install]
+WantedBy=default.target
+`;
 }
 
 const MANAGER_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4));
@@ -134,27 +178,7 @@ export function installRpcService(
     const dir = join(homedir(), ".config", "systemd", "user");
     const path = join(dir, SYSTEMD_UNIT);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const unit = `[Unit]
-Description=OmpClaw authenticated OMP gateway
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${systemdQuote(config.workspace)}
-ExecStart=${args.map(systemdQuote).join(" ")}
-Environment=${systemdQuote(`PATH=${servicePath(args[0]!)}`)}
-Restart=on-failure
-RestartSec=5
-UMask=0077
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=${systemdQuote(config.stateDir)} ${systemdQuote(config.workspace)}
-
-[Install]
-WantedBy=default.target
-`;
+    const unit = renderSystemdUnit(config, args);
     writeFileSync(path, unit, { mode: 0o600 });
     runManager("systemctl", ["--user", "daemon-reload"]);
     runManager("systemctl", ["--user", "enable", "--now", SYSTEMD_UNIT]);
