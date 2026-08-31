@@ -29,6 +29,7 @@ class FakeOmpRpcClient {
   readonly sent: RpcCommandInput[] = [];
   readonly writes: RpcRecord[] = [];
   running = false;
+  failNextGetState = false;
   state: RpcSessionState = {
     isStreaming: false,
     isCompacting: false,
@@ -68,7 +69,13 @@ class FakeOmpRpcClient {
 
   async send(command: RpcCommandInput): Promise<RpcResponse> {
     this.sent.push(command);
-    if (command.type === "get_state") return this.#response(command, this.state);
+    if (command.type === "get_state") {
+      if (this.failNextGetState) {
+        this.failNextGetState = false;
+        throw new Error("state refresh failed");
+      }
+      return this.#response(command, this.state);
+    }
     if (command.type === "get_available_commands") return this.#response(command, { commands: [{ name: "custom", description: "Custom command" }] });
     if (command.type === "get_available_models") return this.#response(command, { models: [{ provider: "provider", id: "model" }] });
     if (command.type === "get_subagents") return this.#response(command, { subagents: [] });
@@ -298,6 +305,9 @@ describe("RpcGatewayRuntime", () => {
     await runtime.start();
     await runtime.handleInbound(message("first", "Build this"));
     const rpc = FakeOmpRpcClient.instances[0];
+    rpc.emit({ type: "agent_start" });
+    await settle();
+    expect(rpc.state.isStreaming).toBe(true);
     let idle = false;
     const waiting = runtime.waitUntilIdle().then(() => {
       idle = true;
@@ -305,6 +315,7 @@ describe("RpcGatewayRuntime", () => {
 
     await settle();
     expect(idle).toBe(false);
+    rpc.failNextGetState = true;
     rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
     await waiting;
 
