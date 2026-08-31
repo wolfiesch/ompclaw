@@ -651,8 +651,7 @@ export class RpcGatewayRuntime {
       const terminalState = this.#terminalState(frame.messages);
       let finalDelivered = false;
       try {
-        await this.#finalizeAssistantText(finalAssistantText(frame.messages));
-        finalDelivered = true;
+        finalDelivered = await this.#finalizeAssistantText(finalAssistantText(frame.messages));
         await this.#setTurnLifecycle(terminalState);
         active?.scheduledCompletion?.resolve();
       } catch (error) {
@@ -663,14 +662,14 @@ export class RpcGatewayRuntime {
         this.#activeTurn = undefined;
         if (this.#status.state) this.#status.state.isStreaming = false;
         this.#wakeIdleWaiters();
-        await this.#refreshState();
-        this.#queueSourceReaction(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
         try {
           if (finalDelivered) await this.#options.updates?.commitArmed();
           else await this.#options.updates?.discardArmed();
         } catch (error) {
           this.#log.error(`[ompclaw update] failed to finalize armed update: ${error instanceof Error ? error.message : String(error)}`);
         }
+        await this.#refreshState();
+        this.#queueSourceReaction(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
       }
       return;
     }
@@ -1355,9 +1354,9 @@ export class RpcGatewayRuntime {
     active.previewText = text;
   }
 
-  async #finalizeAssistantText(text: string): Promise<void> {
+  async #finalizeAssistantText(text: string): Promise<boolean> {
     const active = this.#activeTurn;
-    if (!active || text.trim().length === 0 || active.finalText === text) return;
+    if (!active || text.trim().length === 0 || active.finalText === text) return false;
     const receipts = await this.#options.delivery.finalize(
       active.address,
       active.receipt,
@@ -1367,6 +1366,7 @@ export class RpcGatewayRuntime {
     active.receipt = receipts[0] ?? active.receipt;
     active.previewText = text;
     active.finalText = text;
+    return true;
   }
 
   async #handleHostToolCall(call: RpcHostToolCall): Promise<void> {

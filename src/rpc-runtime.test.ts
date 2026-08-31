@@ -416,6 +416,71 @@ describe("RpcGatewayRuntime", () => {
     await failed.stop();
   });
 
+  test("commits activation even when the post-turn state refresh fails", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const runtime = new RpcGatewayRuntime(
+      { config, delivery: delivery(), updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
+    await runtime.start();
+    await runtime.handleInbound(message("update-refresh-failure", "Activate"));
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    rpc.failNextGetState = true;
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Activation scheduled" }] }],
+    });
+    await waitFor(() => calls.includes("commit"));
+
+    expect(calls).toEqual(["commit"]);
+    await runtime.stop();
+  });
+
+  test("discards activation when the terminal response is empty", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    await runtime.start();
+    await runtime.handleInbound(message("update-empty-final", "Activate"));
+    FakeOmpRpcClient.instances[0]!.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "" }] }],
+    });
+    await waitFor(() => calls.includes("discard"));
+
+    expect(calls).toEqual(["discard"]);
+    await runtime.stop();
+  });
+
   test("dispatches a prompt without waiting for the receipt acknowledgement", async () => {
     const acknowledgement = Promise.withResolvers<void>();
     let acknowledgementStarted = false;

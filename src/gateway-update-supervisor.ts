@@ -43,11 +43,16 @@ export class GatewayUpdateSupervisor {
   #stopping = false;
   #restartAttempt = 0;
   readonly #stopRequested = Promise.withResolvers<void>();
+  #replacementRequested = false;
 
   constructor(args: SupervisorArgs, seams: GatewayUpdateSupervisorSeams = {}) {
     this.#args = args;
     this.#seams = seams;
     this.#paths = gatewayUpdatePaths(args.stateDir);
+  }
+
+  get replacementRequested(): boolean {
+    return this.#replacementRequested;
   }
 
   stop(): void {
@@ -138,11 +143,14 @@ export class GatewayUpdateSupervisor {
       };
       writeUpdateResult(this.#paths.result, result);
       this.#seams.onResult?.(result);
+      this.#replacementRequested = true;
+      this.stop();
       this.#restartAttempt = 0;
       return candidate;
     }
 
     await this.#stopChild();
+    switchCurrentRelease(this.#paths, previous.path);
     this.#recordRollback(requestId, candidate, previous, `Candidate did not become ready within ${this.#args.healthTimeoutMs} ms.`);
     if (!this.#stopping) this.#child = this.#spawnRelease(previous);
     this.#restartAttempt = 0;
@@ -235,7 +243,9 @@ async function sleep(milliseconds: number): Promise<void> {
 
 if (import.meta.main) {
   const supervisor = new GatewayUpdateSupervisor(parseSupervisorArgs(process.argv.slice(2)));
-  supervisor.run().catch((error: unknown) => {
+  supervisor.run().then(() => {
+    if (supervisor.replacementRequested) process.exitCode = 75;
+  }).catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   });

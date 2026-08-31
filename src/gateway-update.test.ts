@@ -205,6 +205,7 @@ describe("transactional gateway updates", () => {
     await resultReady.promise;
     supervisor.stop();
     await running;
+    expect(supervisor.replacementRequested).toBe(true);
 
     expect(readUpdateResult(gatewayUpdatePaths(stateDir).result)).toMatchObject({
       status: "succeeded",
@@ -267,6 +268,7 @@ describe("transactional gateway updates", () => {
     await resultReady.promise;
     supervisor.stop();
     await running;
+    expect(supervisor.replacementRequested).toBe(true);
 
     expect(spawns).toEqual([
       `${candidate.id}:none`,
@@ -276,7 +278,7 @@ describe("transactional gateway updates", () => {
     expect(currentGatewayRelease(gatewayUpdatePaths(stateDir)).id).toBe(candidate.id);
   });
 
-  test("supervisor rolls back a candidate that never becomes ready", async () => {
+  test("supervisor restores the previous current link when recovered candidate fails", async () => {
     const root = temporaryDirectory();
     const repository = join(root, "repository");
     const stateDir = join(root, "state");
@@ -293,6 +295,7 @@ describe("transactional gateway updates", () => {
       principal: { id: "operator-42", roles: ["operator"] },
     });
     await coordinator.commitArmed();
+    coordinator.bootstrap(candidate);
 
     const resultReady = Promise.withResolvers<void>();
     const supervisor = new GatewayUpdateSupervisor({
@@ -322,6 +325,7 @@ describe("transactional gateway updates", () => {
     await resultReady.promise;
     supervisor.stop();
     await running;
+    expect(supervisor.replacementRequested).toBe(false);
 
     const result = readUpdateResult(gatewayUpdatePaths(stateDir).result);
     expect(result).toMatchObject({
