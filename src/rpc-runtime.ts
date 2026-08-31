@@ -90,6 +90,7 @@ interface ParsedCommand {
 }
 
 const RUNTIME_COMMANDS = [
+  ["home", "Open the OmpClaw control center"],
   ["status", "Session, model, queue, and runtime state"],
   ["stop", "Abort the current OMP run"],
   ["new", "Start a new OMP session"],
@@ -121,6 +122,23 @@ const RUNTIME_COMMANDS = [
   ["login", "Show or start provider login"],
   ["help", "Show gateway command help"],
 ] as const;
+
+export interface RuntimeCommandMenuItem {
+  readonly command: string;
+  readonly description: string;
+}
+
+/** Commands safe to publish through a transport's native command menu. */
+export function runtimeCommandMenu(allowRpcBash = false): RuntimeCommandMenuItem[] {
+  const commands: RuntimeCommandMenuItem[] = RUNTIME_COMMANDS.map(([command, description]) => ({ command, description }));
+  if (allowRpcBash) {
+    commands.push(
+      { command: "shell", description: "Execute an OMP RPC bash command" },
+      { command: "abortbash", description: "Abort the active RPC bash command" },
+    );
+  }
+  return commands;
+}
 
 const THINKING_LEVELS: Record<string, true> = {
   inherit: true,
@@ -181,8 +199,7 @@ function parseSlashCommand(text: string | undefined): ParsedCommand | undefined 
 }
 
 function runtimeHelp(allowRpcBash: boolean): string {
-  const lines = RUNTIME_COMMANDS.map(([command, description]) => `/${command} — ${description}`);
-  if (allowRpcBash) lines.push("/shell — execute an OMP RPC bash command (explicitly enabled)", "/abortbash — abort RPC bash");
+  const lines = runtimeCommandMenu(allowRpcBash).map(({ command, description }) => `/${command} - ${description}`);
   lines.push("", "Any other available OMP slash command is passed through to the session.");
   return lines.join("\n");
 }
@@ -543,6 +560,7 @@ export class RpcGatewayRuntime {
     };
     try {
       if (name === "help") await reply(runtimeHelp(this.#options.config.allowRpcBash));
+      else if (name === "home") await this.#homeCommand(delivery);
       else if (name === "status") await reply(await this.statusText());
       else if (name === "stop") {
         await this.#sendRpc({ type: "abort" });
@@ -562,10 +580,10 @@ export class RpcGatewayRuntime {
         await this.#sendRpc({ type: "compact", ...(args ? { customInstructions: args } : {}) }, 120_000);
         await this.#refreshState();
         await reply("Compaction complete.");
-      } else if (name === "model") await this.#modelCommand(args, reply);
-      else if (name === "thinking") await this.#thinkingCommand(args, reply);
-      else if (name === "fast") await this.#booleanCommand("set_fast_mode", args, this.#status.state?.fastModeEnabled, reply);
-      else if (name === "autocompact") await this.#booleanCommand("set_auto_compaction", args, this.#status.state?.autoCompactionEnabled, reply);
+      } else if (name === "model") await this.#modelCommand(delivery, args, reply);
+      else if (name === "thinking") await this.#thinkingCommand(delivery, args, reply);
+      else if (name === "fast") await this.#booleanCommand(delivery, "set_fast_mode", args, this.#status.state?.fastModeEnabled, reply);
+      else if (name === "autocompact") await this.#booleanCommand(delivery, "set_auto_compaction", args, this.#status.state?.autoCompactionEnabled, reply);
       else if (name === "retry") await this.#retryCommand(args, reply);
       else if (name === "queue") await this.#queueCommand(args, reply);
       else if (name === "tasks") await reply(this.#tasksText(delivery.address));
@@ -644,54 +662,131 @@ export class RpcGatewayRuntime {
     return true;
   }
 
-  async #modelCommand(args: string, reply: (text: string) => Promise<void>): Promise<void> {
-    if (!args) {
+  async #homeCommand(delivery: GatewayTurnTarget): Promise<void> {
+    await this.#refreshState();
+    const state = this.#status.state;
+    const model = `${state?.model?.provider ?? "?"}/${state?.model?.id ?? "?"}`;
+    const response = await this.#options.delivery.presentUi(
+      delivery.address,
+      {
+        type: "select",
+        title: "OmpClaw control center",
+        options: [
+          { value: "status", label: "Status", description: `${state?.isStreaming ? "Running" : "Idle"} · ${model}` },
+          { value: "model", label: "Model", description: model },
+          { value: "thinking", label: "Reasoning", description: state?.thinkingLevel ?? "inherit" },
+          { value: "fast", label: "Fast mode", description: state?.fastModeEnabled ? "on" : "off" },
+          { value: "autocompact", label: "Auto-compaction", description: state?.autoCompactionEnabled ? "on" : "off" },
+          { value: "tasks", label: "Tasks", description: "Recent durable task state" },
+          { value: "jobs", label: "Scheduled jobs", description: "List durable automations" },
+          { value: "new", label: "New session", description: "Start with a clean context" },
+          { value: "stop", label: "Stop", description: "Abort the active run" },
+        ],
+      },
+      delivery.deliveryContext,
+    );
+    const command = response.selected[0];
+    if (command !== undefined) await this.#handleCommand(delivery, command, "");
+  }
+
+  async #modelCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    let selection = args;
+    if (!selection) {
       const data = await this.#requestData<{ models: Array<{ provider?: string; id?: string }> }>({ type: "get_available_models" });
-      const models = data.models.map((model) => `${model.provider ?? "?"}/${model.id ?? "?"}`);
-      await reply(`Current: ${this.#status.state?.model?.provider ?? "?"}/${this.#status.state?.model?.id ?? "?"}\n\nAvailable models:\n${models.join("\n")}`);
-      return;
+      const models = data.models.filter(
+        (model): model is { provider: string; id: string } =>
+          typeof model.provider === "string" && typeof model.id === "string",
+      );
+      const response = await this.#options.delivery.presentUi(
+        delivery.address,
+        {
+          type: "select",
+          title: `Select model · current ${this.#status.state?.model?.provider ?? "?"}/${this.#status.state?.model?.id ?? "?"}`,
+          options: models.map((model) => ({
+            value: `${model.provider}/${model.id}`,
+            label: model.id,
+            description: model.provider,
+          })),
+        },
+        delivery.deliveryContext,
+      );
+      selection = response.selected[0] ?? "";
+      if (!selection) return;
     }
-    const split = args.indexOf("/");
-    if (split <= 0 || split === args.length - 1) {
+    const split = selection.indexOf("/");
+    if (split <= 0 || split === selection.length - 1) {
       await reply("Usage: /model <provider>/<model-id>");
       return;
     }
-    await this.#sendRpc({ type: "set_model", provider: args.slice(0, split), modelId: args.slice(split + 1) });
+    await this.#sendRpc({ type: "set_model", provider: selection.slice(0, split), modelId: selection.slice(split + 1) });
     await this.#refreshState();
-    await reply(`Model: ${args}`);
+    await reply(`Model: ${selection}`);
   }
 
-  async #thinkingCommand(args: string, reply: (text: string) => Promise<void>): Promise<void> {
-    if (!args) {
-      await reply(`Thinking: ${this.#status.state?.thinkingLevel ?? "inherit"}\nLevels: ${Object.keys(THINKING_LEVELS).join(", ")}`);
-      return;
+  async #thinkingCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    let selection = args;
+    if (!selection) {
+      const response = await this.#options.delivery.presentUi(
+        delivery.address,
+        {
+          type: "select",
+          title: `Select reasoning · current ${this.#status.state?.thinkingLevel ?? "inherit"}`,
+          options: Object.keys(THINKING_LEVELS).map((level) => ({ value: level, label: level })),
+        },
+        delivery.deliveryContext,
+      );
+      selection = response.selected[0] ?? "";
+      if (!selection) return;
     }
-    if (!THINKING_LEVELS[args]) {
+    if (!THINKING_LEVELS[selection]) {
       await reply(`Unknown level. Use: ${Object.keys(THINKING_LEVELS).join(", ")}`);
       return;
     }
-    await this.#sendRpc({ type: "set_thinking_level", level: args });
+    await this.#sendRpc({ type: "set_thinking_level", level: selection });
     await this.#refreshState();
-    await reply(`Thinking: ${args}`);
+    await reply(`Thinking: ${selection}`);
   }
 
   async #booleanCommand(
+    delivery: GatewayTurnTarget,
     command: "set_fast_mode" | "set_auto_compaction",
     args: string,
     current: boolean | undefined,
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
-    if (!args) {
-      await reply(`${command === "set_fast_mode" ? "Fast mode" : "Auto-compaction"}: ${current ? "on" : "off"}`);
-      return;
+    let selection = args;
+    const label = command === "set_fast_mode" ? "Fast mode" : "Auto-compaction";
+    if (!selection) {
+      const response = await this.#options.delivery.presentUi(
+        delivery.address,
+        {
+          type: "select",
+          title: `${label} · current ${current ? "on" : "off"}`,
+          options: [
+            { value: "on", label: "On" },
+            { value: "off", label: "Off" },
+          ],
+        },
+        delivery.deliveryContext,
+      );
+      selection = response.selected[0] ?? "";
+      if (!selection) return;
     }
-    if (args !== "on" && args !== "off") {
+    if (selection !== "on" && selection !== "off") {
       await reply(`Usage: /${command === "set_fast_mode" ? "fast" : "autocompact"} <on|off>`);
       return;
     }
-    const response = await this.#sendRpc({ type: command, enabled: args === "on" });
+    const response = await this.#sendRpc({ type: command, enabled: selection === "on" });
     await this.#refreshState();
-    await reply(response.data ? valueText(response.data) : `${args}.`);
+    await reply(response.data ? valueText(response.data) : `${label}: ${selection}.`);
   }
 
   async #retryCommand(args: string, reply: (text: string) => Promise<void>): Promise<void> {

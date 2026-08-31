@@ -77,6 +77,7 @@ async function fixture(options: {
   readonly resolveIdentity?: TransportStartContext["resolveIdentity"];
   readonly transcribe?: boolean;
   readonly uiTimeoutMs?: number;
+  readonly commands?: readonly { readonly command: string; readonly description: string }[];
 } = {}) {
   const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-telegram-"));
   temporaryPaths.push(stateDir);
@@ -103,6 +104,7 @@ async function fixture(options: {
     stateDir,
     store,
     uiTimeoutMs: options.uiTimeoutMs,
+    commands: options.commands,
     transcribeCommand: options.transcribe ? ["not-used", "{file}"] : undefined,
     api: {
       poller: fakePoller,
@@ -171,6 +173,21 @@ function callbackData(payload: Record<string, unknown>): string {
 }
 
 describe("TelegramTransportAdapter outbound delivery", () => {
+  test("registers the native Telegram command menu at startup", async () => {
+    const commands = [
+      { command: "home", description: "Open the control center" },
+      { command: "status", description: "Show runtime status" },
+    ];
+    const { adapter, calls } = await fixture({ commands });
+
+    expect(calls[0]).toEqual({
+      method: "setMyCommands",
+      payload: { commands },
+      responseMessageId: 100,
+    });
+    await adapter.stop();
+  });
+
   test("advertises and performs streaming message updates", async () => {
     const { adapter, calls } = await fixture();
     expect(adapter.capabilities.streamingUpdates).toBe(true);
@@ -393,6 +410,58 @@ describe("TelegramTransportAdapter inbound conversion", () => {
     await adapter.stop();
   });
 });
+
+  test("paginates large native select controls and resolves a later page", async () => {
+    const { adapter, calls, store, waitForCall } = await fixture();
+    const options = Array.from({ length: 10 }, (_, index) => ({
+      value: `value-${index}`,
+      label: `Option ${index + 1}`,
+      description: `Description ${index + 1}`,
+    }));
+    const sendFrom = calls.length;
+    const stored = store.waitForPending();
+    const sentCall = waitForCall(sendFrom, (call) => call.method === "sendMessage");
+    const response = adapter.presentUi(
+      privateAddress,
+      { type: "select", title: "Choose model", options },
+      delivery(privateAddress),
+    );
+    const sent = await sentCall;
+    await stored;
+    const firstKeyboard = inlineKeyboard(sent.payload);
+    expect(firstKeyboard).toHaveLength(9);
+    expect(firstKeyboard[0]?.[0]?.text).toBe("Option 1");
+    expect(firstKeyboard[8]?.[0]?.text).toBe("Next");
+
+    await adapter.handleUpdate({
+      update_id: 20,
+      callback_query: {
+        id: "next-page",
+        from: { id: 42 },
+        data: String(firstKeyboard[8]?.[0]?.callback_data),
+        message: { message_id: sent.responseMessageId!, chat: { id: 42, type: "private" } },
+      },
+    });
+    const pageEdit = calls.findLast((call) => call.method === "editMessageText");
+    expect(pageEdit?.payload.text).toContain("Page 2 of 2");
+    expect(pageEdit?.payload.text).toContain("9. Option 9: Description 9");
+    const markupEdit = calls.findLast((call) => call.method === "editMessageReplyMarkup");
+    const secondKeyboard = inlineKeyboard(markupEdit?.payload ?? {});
+    expect(secondKeyboard[0]?.[0]?.text).toBe("Option 9");
+    expect(secondKeyboard[2]?.[0]?.text).toBe("Previous");
+
+    await adapter.handleUpdate({
+      update_id: 21,
+      callback_query: {
+        id: "pick-page-two",
+        from: { id: 42 },
+        data: String(secondKeyboard[0]?.[0]?.callback_data),
+        message: { message_id: sent.responseMessageId!, chat: { id: 42, type: "private" } },
+      },
+    });
+    await expect(response).resolves.toEqual({ type: "select", selected: ["value-8"] });
+    await adapter.stop();
+  });
 
 describe("TelegramTransportAdapter UI", () => {
   test("presents every UI request class using messages, controls, replies, and bounded surface edits", async () => {

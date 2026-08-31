@@ -103,7 +103,7 @@ mock.module("./rpc-client", () => ({
 }));
 
 // The mocked client must be registered before the runtime module is evaluated.
-const { RpcGatewayRuntime } = await import("./rpc-runtime");
+const { RpcGatewayRuntime, runtimeCommandMenu } = await import("./rpc-runtime");
 
 interface DeliveryCall {
   readonly method: "send" | "update" | "finalize" | "react" | "presentUi";
@@ -443,6 +443,45 @@ describe("RpcGatewayRuntime", () => {
     expect(completed).toBe(true);
     expect(deliveries.some((call) => textFromContent(call.content) === "Scheduled result")).toBe(true);
     expect(runtime.isBusy()).toBe(false);
+    await runtime.stop();
+  });
+
+  test("publishes native commands and drives model selection through the home control center", async () => {
+    expect(runtimeCommandMenu().map(({ command }) => command)).toContain("home");
+    expect(runtimeCommandMenu().map(({ command }) => command)).not.toContain("shell");
+    expect(runtimeCommandMenu(true).map(({ command }) => command)).toContain("shell");
+    present = async (request) => {
+      const selected =
+        request.type !== "select"
+          ? undefined
+          : request.title === "OmpClaw control center"
+            ? ["model"]
+            : request.title.startsWith("Select model")
+              ? ["provider/model"]
+              : [];
+      return (selected === undefined
+        ? defaultUiResponse(request)
+        : { type: "select", selected }) as UiResponseFor<typeof request>;
+    };
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    await runtime.handleInbound(message("commands", "/home"));
+
+    const rpc = FakeOmpRpcClient.instances[0];
+    expect(rpc.sent).toContainEqual(expect.objectContaining({
+      type: "set_model",
+      provider: "provider",
+      modelId: "model",
+    }));
+    expect(
+      deliveries
+        .filter((call) => call.method === "presentUi")
+        .map((call) => call.request?.type === "select" ? call.request.title : undefined),
+    ).toEqual([
+      "OmpClaw control center",
+      "Select model · current provider/model",
+    ]);
+    expect(deliveries.some((call) => textFromContent(call.content) === "Model: provider/model")).toBe(true);
     await runtime.stop();
   });
 

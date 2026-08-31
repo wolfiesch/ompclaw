@@ -41,6 +41,7 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_UI_TIMEOUT_MS = 5 * 60 * 1000;
 const CALLBACK_PREFIX = "ompui";
 const TASK_STOP_CALLBACK = "ompctl:stop";
+const SELECT_PAGE_SIZE = 8;
 
 export interface TelegramPoller {
   start(
@@ -75,6 +76,7 @@ export interface TelegramTransportAdapterOptions {
   readonly logger?: Logger;
   readonly api?: TelegramApiSeams;
   readonly uiTimeoutMs?: number;
+  readonly commands?: readonly { readonly command: string; readonly description: string }[];
 }
 
 type PendingKind = "confirm" | "select" | "input" | "editor";
@@ -83,11 +85,15 @@ interface PendingUi {
   readonly id: string;
   readonly kind: PendingKind;
   readonly address: ConversationAddress;
+  readonly title: string;
   readonly delivery: DeliveryContext;
   readonly options: readonly string[];
+  readonly labels: readonly string[];
+  readonly descriptions: readonly (string | undefined)[];
   readonly multiSelect: boolean;
   readonly selected: Set<number>;
   readonly resolve: (response: UiResponse) => void;
+  page: number;
   message?: OutboundReceipt;
   timer?: NodeJS.Timeout;
   removeAbortListener?: () => void;
@@ -267,6 +273,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #transcribeCommand?: readonly string[];
   readonly #transcribe?: TelegramApiSeams["transcribe"];
   readonly #uiTimeoutMs: number;
+  readonly #commands: readonly { readonly command: string; readonly description: string }[];
   readonly #outbound: Outbound;
   readonly #pending = new Map<string, PendingUi>();
   readonly #surfaces = new Map<string, Surface>();
@@ -303,6 +310,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#transcribeCommand = options.transcribeCommand;
     this.#transcribe = options.api?.transcribe;
     this.#uiTimeoutMs = options.uiTimeoutMs ?? DEFAULT_UI_TIMEOUT_MS;
+    this.#commands = (options.commands ?? [])
+      .filter(({ command, description }) => /^[a-z0-9_]{1,32}$/.test(command) && description.trim().length > 0)
+      .slice(0, 100)
+      .map(({ command, description }) => ({ command, description: description.trim().slice(0, 256) }));
     this.#outbound = new Outbound({
       token: this.#token,
       account: this.#account,
@@ -325,12 +336,27 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#lockPath = lockPath;
     this.#releaseHeartbeat = this.#startLockHeartbeat(lockPath);
     context.signal?.addEventListener("abort", () => void this.stop(), { once: true });
+    await this.#registerCommands(context.signal);
     this.#poller.start(
       this.#token,
       (update) => this.handleUpdate(update),
       (reason) => this.#logger?.error(`[telegram] ${reason}`),
       this.#logger,
     );
+  }
+
+  async #registerCommands(signal?: AbortSignal): Promise<void> {
+    if (this.#commands.length === 0) return;
+    try {
+      await withRateLimit(
+        () => this.#callTelegram("setMyCommands", { commands: this.#commands }, { signal }),
+        { log: this.#logger, signal },
+      );
+    } catch (error) {
+      this.#logger?.warn(
+        `[telegram] could not register bot command menu: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async stop(): Promise<void> {
@@ -568,6 +594,26 @@ export class TelegramTransportAdapter implements TransportAdapter {
       await this.#answerCallback(query.id, "Reply to the prompt instead.", true);
       return true;
     }
+    if (action === "previous" || action === "next") {
+      const pageCount = Math.ceil(pending.options.length / SELECT_PAGE_SIZE);
+      pending.page = Math.max(0, Math.min(pageCount - 1, pending.page + (action === "next" ? 1 : -1)));
+      await this.#answerCallback(query.id);
+      pending.message = await this.#outbound.update(
+        pending.address,
+        pending.message,
+        { text: this.#selectText(pending), format: "text" },
+        pending.delivery,
+        context.signal,
+      );
+      await this.#outbound.setReplyMarkup(
+        pending.address,
+        pending.message,
+        this.#keyboard(pending),
+        pending.delivery,
+        context.signal,
+      );
+      return true;
+    }
     if (pending.multiSelect && action === "done") {
       await this.#answerCallback(query.id, "Saved");
       await this.#finish(pending, {
@@ -675,17 +721,21 @@ export class TelegramTransportAdapter implements TransportAdapter {
       id: this.#randomId(),
       kind: request.type,
       address,
+      title: request.title,
       delivery,
       options: request.type === "select" ? request.options.map((option) => option.value) : [],
+      labels: request.type === "select" ? request.options.map((option) => option.label) : [],
+      descriptions: request.type === "select" ? request.options.map((option) => option.description) : [],
       multiSelect: request.type === "select" && request.multiSelect === true,
       selected: new Set(),
+      page: 0,
       resolve: deferred.resolve,
     };
-    const body = this.#pendingText(request);
+    const body = pending.kind === "select" ? this.#selectText(pending) : this.#pendingText(request);
     const replyMarkup =
       pending.kind === "input" || pending.kind === "editor"
         ? { force_reply: true, selective: true, input_field_placeholder: body.slice(0, 64) }
-        : this.#keyboard(pending, request.type === "select" ? request.options.map((option) => option.label) : undefined);
+        : this.#keyboard(pending);
 
     const sent = await this.#outbound.sendMessage(address, body, delivery, { replyMarkup }, signal);
     pending.message = sent;
@@ -763,19 +813,29 @@ export class TelegramTransportAdapter implements TransportAdapter {
 
   #pendingText(request: Extract<UiRequest, { readonly type: PendingKind }>): string {
     if (request.type === "confirm") return [request.title, request.message].filter(Boolean).join("\n\n");
-    if (request.type === "select") {
-      return [
-        request.title,
-        ...request.options.map((option, index) => `${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ""}`),
-      ].join("\n\n");
-    }
+    if (request.type === "select") return request.title;
     if (request.type === "input") {
       return [request.title, request.prompt ?? request.placeholder ?? "Reply to this message.", request.initialValue].filter(Boolean).join("\n\n");
     }
     return [request.title, request.initialValue, "Reply to this message with the edited text."].filter(Boolean).join("\n\n");
   }
 
-  #keyboard(pending: PendingUi, labels?: readonly string[]): Record<string, unknown> {
+  #selectText(pending: PendingUi): string {
+    const pageCount = Math.max(1, Math.ceil(pending.options.length / SELECT_PAGE_SIZE));
+    const start = pending.page * SELECT_PAGE_SIZE;
+    const end = Math.min(pending.options.length, start + SELECT_PAGE_SIZE);
+    const lines = [
+      pending.title,
+      ...(pageCount > 1 ? [`Page ${pending.page + 1} of ${pageCount}`] : []),
+    ];
+    for (let index = start; index < end; index++) {
+      const description = pending.descriptions[index];
+      lines.push(`${index + 1}. ${pending.labels[index] ?? pending.options[index]}${description ? `: ${description}` : ""}`);
+    }
+    return lines.join("\n\n").slice(0, 4096);
+  }
+
+  #keyboard(pending: PendingUi): Record<string, unknown> {
     if (pending.kind === "confirm") {
       return {
         inline_keyboard: [
@@ -786,12 +846,25 @@ export class TelegramTransportAdapter implements TransportAdapter {
         ],
       };
     }
-    const rows = pending.options.map((value, index) => [
-      {
-        text: `${pending.multiSelect && pending.selected.has(index) ? "✓ " : ""}${(labels?.[index] ?? value).slice(0, 48)}`,
-        callback_data: callbackData(pending.id, String(index)),
-      },
-    ]);
+    const start = pending.page * SELECT_PAGE_SIZE;
+    const end = Math.min(pending.options.length, start + SELECT_PAGE_SIZE);
+    const rows: Array<Array<{ text: string; callback_data: string }>> = pending.options.slice(start, end).map((value, offset) => {
+      const index = start + offset;
+      return [
+        {
+          text: `${pending.multiSelect && pending.selected.has(index) ? "✓ " : ""}${(pending.labels[index] ?? value).slice(0, 48)}`,
+          callback_data: callbackData(pending.id, String(index)),
+        },
+      ];
+    });
+    if (pending.options.length > SELECT_PAGE_SIZE) {
+      const navigation: Array<{ text: string; callback_data: string }> = [];
+      if (pending.page > 0) navigation.push({ text: "Previous", callback_data: callbackData(pending.id, "previous") });
+      if ((pending.page + 1) * SELECT_PAGE_SIZE < pending.options.length) {
+        navigation.push({ text: "Next", callback_data: callbackData(pending.id, "next") });
+      }
+      rows.push(navigation);
+    }
     if (pending.multiSelect) {
       rows.push([
         { text: "Done", callback_data: callbackData(pending.id, "done") },

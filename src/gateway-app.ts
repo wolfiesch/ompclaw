@@ -23,7 +23,7 @@ import {
   type ScheduledJob,
 } from "./gateway-store";
 import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
-import { RpcGatewayRuntime, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
+import { RpcGatewayRuntime, runtimeCommandMenu, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import type { RpcSessionState } from "./rpc-protocol";
 import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
 import { TelegramTransportAdapter, type TelegramTransportAdapterOptions } from "./transports/telegram/adapter";
@@ -213,6 +213,7 @@ export class GatewayApplication {
         account: telegram.account,
         stateDir: this.#config.stateDir,
         store,
+        commands: runtimeCommandMenu(this.#config.omp.allowRpcBash),
       }));
     }
 
