@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.2 (2026-08-30)
+
+### Fixed
+
+- Bind generated user services to OmpClaw's installed executable instead of relying on the caller's `PATH`.
+
 ## 0.3.1 (2026-08-30)
 
 ### Fixed
