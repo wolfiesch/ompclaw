@@ -105,7 +105,7 @@ mock.module("./rpc-client", () => ({
 const { RpcGatewayRuntime } = await import("./rpc-runtime");
 
 interface DeliveryCall {
-  readonly method: "send" | "update" | "react" | "presentUi";
+  readonly method: "send" | "update" | "finalize" | "react" | "presentUi";
   readonly address: ConversationAddress;
   readonly context: DeliveryContext;
   readonly content?: unknown;
@@ -153,6 +153,10 @@ function delivery(): GatewayDelivery {
     update: async (address, receipt, content, context, signal) => {
       deliveries.push({ method: "update", address, context, content, signal });
       return receipt;
+    },
+    async finalize(address, receipt, content, context, signal) {
+      deliveries.push({ method: "finalize", address, context, content, signal });
+      return [receipt ?? { transport: address.transport, messageId: `receipt-${deliveries.length}` }];
     },
     react: async (address, _receipt, _reaction, context, signal) => {
       deliveries.push({ method: "react", address, context, signal });
@@ -215,7 +219,7 @@ describe("RpcGatewayRuntime", () => {
     rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "final" }] }] });
     await settle();
 
-    const assistantDeliveries = deliveries.filter((call) => call.method === "update" || (call.method === "send" && textFromContent(call.content) !== "OMP is currently serving another authenticated conversation. Try again when that run finishes."));
+    const assistantDeliveries = deliveries.filter((call) => call.method === "update" || call.method === "finalize" || (call.method === "send" && textFromContent(call.content) !== "OMP is currently serving another authenticated conversation. Try again when that run finishes."));
     expect(assistantDeliveries.map((call) => call.address.channel)).toEqual(["first", "first"]);
     expect(assistantDeliveries.every((call) => call.context.principal.id === "principal-first" && call.context.origin.channel === "first")).toBe(true);
     const busy = deliveries.find((call) => textFromContent(call.content) === "OMP is currently serving another authenticated conversation. Try again when that run finishes.");

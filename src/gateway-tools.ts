@@ -33,6 +33,13 @@ export interface GatewayDelivery {
     context: DeliveryContext,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt>;
+  finalize(
+    address: ConversationAddress,
+    receipt: OutboundReceipt | undefined,
+    content: OutboundContent,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<readonly OutboundReceipt[]>;
   react(
     address: ConversationAddress,
     receipt: OutboundReceipt,
