@@ -114,6 +114,42 @@ describe("Telegram outbound delivery", () => {
     expect(receipt.messageId).toBe(String(100 + sends.length));
   });
 
+  test("replaces every chunk of a mutable direct message and removes stale chunks", async () => {
+    const { outbound, calls } = harness();
+    const replyMarkup = { inline_keyboard: [[{ text: "Stop", callback_data: "stop" }]] };
+    const initial = await outbound.sendMessages(
+      address,
+      "x".repeat(TELEGRAM_MAX_CHARS + 200),
+      context,
+      { replyMarkup },
+    );
+    expect(initial).toHaveLength(2);
+    calls.splice(0);
+
+    const compact = await outbound.replaceMessages(address, initial, "updated", context, { replyMarkup });
+    expect(compact).toEqual([{ transport: "telegram", messageId: "101" }]);
+    expect(calls).toEqual([
+      {
+        method: "editMessageText",
+        payload: {
+          chat_id: "42",
+          message_thread_id: 7,
+          message_id: 101,
+          text: "updated",
+          reply_markup: replyMarkup,
+        },
+      },
+      {
+        method: "deleteMessage",
+        payload: {
+          chat_id: "42",
+          message_thread_id: 7,
+          message_id: 102,
+        },
+      },
+    ]);
+  });
+
   test("retries malformed Markdown once as plain text", async () => {
     let send = 0;
     const { outbound, calls } = harness(async (method) => {

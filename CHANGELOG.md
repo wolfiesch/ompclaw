@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.2 (2026-08-31)
+
+### Fixed
+
+- Fail Telegram startup when command registration exposes invalid bot credentials instead of reporting a healthy but unusable poller.
+- Track, update, and remove every part of multipart control cards so status text and controls remain consistent.
+
 ## 0.6.1 (2026-08-31)
 
 ### Fixed

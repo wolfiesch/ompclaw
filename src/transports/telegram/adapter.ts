@@ -28,6 +28,7 @@ import {
   releaseLock,
   startLockHeartbeat,
   tg,
+  TgError,
   type Logger,
   type TgCallbackQuery,
   type TgFileBase,
@@ -121,7 +122,7 @@ interface ControlCard {
   editorText: string;
   readonly statuses: Map<string, string>;
   readonly widgets: Map<string, readonly string[]>;
-  receipt?: OutboundReceipt;
+  receipts: readonly OutboundReceipt[];
   context?: DeliveryContext;
   stopVisible: boolean;
 }
@@ -396,6 +397,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
           await this.#telegram("setMyCommands", { commands: this.#commands }, context.signal);
         } catch (error) {
           if (context.signal?.aborted) throw error;
+          if (error instanceof TgError && (error.code === 401 || error.code === 404)) throw error;
           this.#log?.warn(
             `[telegram] command menu registration failed: ${error instanceof Error ? error.message : String(error)}`,
           );
@@ -627,7 +629,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const address = telegramAddress(query.message, this.#account);
     if (query.data === STOP_CALLBACK) {
       const card = this.#cards.get(cardKey(address));
-      if (!card?.receipt || card.receipt.messageId !== String(query.message.message_id)) {
+      const receipt = card?.receipts.at(-1);
+      if (!card || !receipt || receipt.messageId !== String(query.message.message_id)) {
         await acknowledge("This control has expired.");
         return;
       }
@@ -1006,6 +1009,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       statuses: new Map<string, string>(),
       widgets: new Map<string, readonly string[]>(),
       stopVisible: false,
+      receipts: [],
     };
     if (request.type === "title") card.title = request.title;
     if (request.type === "editor_text") card.editorText = request.text;
@@ -1022,12 +1026,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#cards.set(key, card);
     const body = this.#renderCard(card);
     const markup = card.stopVisible ? { inline_keyboard: [[{ text: "Stop", callback_data: STOP_CALLBACK }]] } : { inline_keyboard: [] };
-    if (!card.receipt) {
-      card.receipt = await this.#outbound.sendMessage(address, body, context, { replyMarkup: markup }, signal);
+    if (card.receipts.length === 0) {
+      card.receipts = await this.#outbound.sendMessages(address, body, context, { replyMarkup: markup }, signal);
       return;
     }
-    await this.#outbound.update(address, card.receipt, { text: body }, context, signal);
-    await this.#outbound.setReplyMarkup(address, card.receipt, markup, context, signal);
+    card.receipts = await this.#outbound.replaceMessages(address, card.receipts, body, context, { replyMarkup: markup }, signal);
   }
 
   #renderCard(card: ControlCard): string {

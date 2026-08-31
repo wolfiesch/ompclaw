@@ -11,9 +11,10 @@ import type {
   Principal,
   TransportStartContext,
 } from "../../gateway-types";
-import type { TgMessage, TgUpdate } from "./bot-api";
+import { TgError, type TgMessage, type TgUpdate } from "./bot-api";
 import { TelegramTransportAdapter, type TelegramPoller } from "./adapter";
 import { telegramDraftId } from "./delivery";
+import { TELEGRAM_MAX_CHARS } from "./formatting";
 
 interface ApiCall {
   readonly method: string;
@@ -207,6 +208,13 @@ describe("Telegram transport lifecycle", () => {
     expect(poller.started).toBe(true);
     expect(warnings).toEqual([expect.stringContaining("command menu registration failed: menu unavailable")]);
     await adapter.stop();
+  });
+
+  test("rejects invalid bot credentials instead of starting an unhealthy poller", async () => {
+    await expect(fixture({
+      commands: [{ command: "home", description: "Open control center" }],
+      setCommandsError: new TgError("Unauthorized", 401),
+    })).rejects.toThrow("Unauthorized");
   });
 
   test("waits for an in-flight polled update before shutdown completes", async () => {
@@ -426,6 +434,35 @@ describe("Telegram interactive UI", () => {
         from: { id: 42 },
         data: callbackData(card, "Stop"),
         message: message({ message_id: 201 }),
+      },
+    });
+    expect(received[0]).toMatchObject({ content: { text: "/stop" }, address: baseAddress });
+  });
+
+  test("moves a multipart control card and its stop button as one mutable unit", async () => {
+    const { adapter, calls, received } = await fixture();
+    await adapter.presentUi(baseAddress, { type: "status", key: "Task", text: "Working" }, delivery);
+    await adapter.presentUi(baseAddress, {
+      type: "widget",
+      key: "Details",
+      lines: ["x".repeat(TELEGRAM_MAX_CHARS)],
+    }, delivery);
+    const sends = calls.filter((entry) => entry.method === "sendMessage");
+    const final = sends.at(-1);
+    if (!final) throw new Error("expected multipart control card");
+    expect(sends.length).toBe(2);
+    expect(calls.find((entry) => entry.method === "editMessageText")?.payload).toMatchObject({
+      message_id: 201,
+      reply_markup: { inline_keyboard: [] },
+    });
+    expect(callbackData(final, "Stop")).toBe("ompctl:stop");
+    await adapter.handleUpdate({
+      update_id: 15,
+      callback_query: {
+        id: "stop-multipart",
+        from: { id: 42 },
+        data: callbackData(final, "Stop"),
+        message: message({ message_id: 202 }),
       },
     });
     expect(received[0]).toMatchObject({ content: { text: "/stop" }, address: baseAddress });
