@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.1 (2026-08-30)
+
+### Fixed
+
+- Generate systemd `WorkingDirectory` values with unit-file escapes instead of quotes, allowing the Linux user service to start.
+
 ## 0.3.0 (2026-08-30)
 
 ### Changed
