@@ -78,7 +78,7 @@ async function fixture(options: {
   readonly transcribe?: boolean;
   readonly uiTimeoutMs?: number;
 } = {}) {
-  const stateDir = await mkdtemp(join(tmpdir(), "omp-gateway-telegram-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-telegram-"));
   temporaryPaths.push(stateDir);
   const calls: TelegramApiCall[] = [];
   const store = new MemoryStore();

@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose a concrete, safe improvement to omp-gateway.
+description: Propose a concrete, safe improvement to ompclaw.
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
@@ -36,7 +36,7 @@ body:
     attributes:
       label: Proposed behavior
       description: Describe the desired behavior as an observable scenario, including the expected result.
-      placeholder: Given X, when Y occurs, omp-gateway should Z.
+      placeholder: Given X, when Y occurs, ompclaw should Z.
     validations:
       required: true
   - type: textarea

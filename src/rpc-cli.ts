@@ -65,17 +65,17 @@ export interface GatewayCliSeams {
   readonly write?: (line: string) => void;
 }
 
-const HELP = `omp-gateway - authenticated multi-transport gateway for one persistent OMP session
+const HELP = `ompclaw - authenticated multi-transport gateway for one persistent OMP session
 
 Usage:
-  omp-gateway run [--config <path>] [--env-file <path>]
-  omp-gateway doctor [--config <path>] [--env-file <path>]
-  omp-gateway principal-add <principal-id> [role ...] [--config <path>]
-  omp-gateway identity-bind <transport> <account> <subject> <principal-id> [--config <path>]
-  omp-gateway telegram-allow <numeric-user-id> [principal-id] [--config <path>]
-  omp-gateway migrate-telegram <legacy-access.json> <legacy-rpc-state.json> [--config <path>]
-  omp-gateway service-install --config <path> --env-file <path>
-  omp-gateway service-uninstall
+  ompclaw run [--config <path>] [--env-file <path>]
+  ompclaw doctor [--config <path>] [--env-file <path>]
+  ompclaw principal-add <principal-id> [role ...] [--config <path>]
+  ompclaw identity-bind <transport> <account> <subject> <principal-id> [--config <path>]
+  ompclaw telegram-allow <numeric-user-id> [principal-id] [--config <path>]
+  ompclaw migrate-telegram <legacy-access.json> <legacy-rpc-state.json> [--config <path>]
+  ompclaw service-install --config <path> --env-file <path>
+  ompclaw service-uninstall
 
 The JSON config carries only paths, OMP options, and credential environment names.
 Transport token values stay in the environment and are removed from the OMP child.`;
@@ -362,7 +362,7 @@ function isGatewayCliCommand(value: string | undefined): value is GatewayCliComm
 }
 
 function openStore(config: GatewayConfig, seams: GatewayCliSeams): GatewayStore {
-  return (seams.createStore ?? ((path: string) => new GatewayStore(path)))(`${config.stateDir}/gateway.sqlite`);
+  return (seams.createStore ?? ((path: string) => new GatewayStore(path)))(`${config.stateDir}/ompclaw.sqlite`);
 }
 
 function requireNoPositionals(args: GatewayCliArgs): void {

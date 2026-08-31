@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.0 (2026-08-30)
+
+### Changed
+
+- Renamed the product, npm package, CLI, repository, service identifiers, default profile, state paths, environment prefix, and OMP host tools from `omp-gateway` to OmpClaw.
+- The new package and command are `ompclaw`; the renamed surfaces intentionally provide no legacy aliases.
+
+### Migration
+
+- Stop and uninstall the old service before installing `com.ompclaw` or `ompclaw.service`.
+- Move the prior state directory to `~/.omp/agent/ompclaw`, rename `gateway.sqlite` and `gateway.lock` to `ompclaw.sqlite` and `ompclaw.lock`, change the old default `gateway` profile to `ompclaw`, and rename `OMP_GATEWAY_*` environment variables to `OMPCLAW_*`. Keep an explicitly configured custom profile unchanged.
+
 ## 0.2.0 (2026-08-30)
 
 ### Added
@@ -13,7 +25,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - Scheduled and interactive work now share one explicitly serialized OMP runtime and delivery context.
-- Gateway configuration and operator documentation now expose automation, learning, isolation, and at-least-once delivery boundaries.
+- Gateway configuration and operator documentation exposed automation, learning, isolation, and at-least-once delivery boundaries.
 
 ## 0.1.0 (2026-08-30)
 

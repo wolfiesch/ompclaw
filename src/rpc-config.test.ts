@@ -41,7 +41,7 @@ afterEach(() => {
 describe("RPC configuration", () => {
   test("builds the exact resumable OMP RPC argv", () => {
     const config = runtimeConfig({
-      cwd: "/workspace/omp-gateway",
+      cwd: "/workspace/ompclaw",
       profile: "production",
       ompCommand: "/opt/omp/bin/omp",
       resume: "/sessions/default.jsonl",
@@ -56,7 +56,7 @@ describe("RPC configuration", () => {
       "--mode",
       "rpc-ui",
       "--cwd",
-      "/workspace/omp-gateway",
+      "/workspace/ompclaw",
       "--profile",
       "production",
       "--no-title",
@@ -81,7 +81,8 @@ describe("RPC configuration", () => {
       buildOmpChildEnv({
         PATH: "/bin",
         TELEGRAM_BOT_TOKEN: "telegram-secret",
-        OMP_GATEWAY_TELEGRAM_TOKEN: "gateway-secret",
+        OMPCLAW_TELEGRAM_TOKEN: "gateway-secret",
+        OMP_GATEWAY_TELEGRAM_TOKEN: "renamed-secret",
         GATEWAY_AUTHORIZATION: "gateway-authorization",
         OMP_TRANSPORT_TOKEN: "transport-secret",
         OMP_WEBSOCKET_TOKEN: "omp-websocket-secret",
@@ -93,7 +94,7 @@ describe("RPC configuration", () => {
   });
 
   test("loads literal environment values without overriding inherited values", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-env-"));
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-env-"));
     directories.push(directory);
     const path = join(directory, ".env");
     writeFileSync(
@@ -109,7 +110,7 @@ describe("RPC configuration", () => {
   });
 
   test("rejects non-private or non-regular environment files", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-env-security-"));
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-env-security-"));
     directories.push(directory);
     const loose = join(directory, "loose.env");
     const link = join(directory, "linked.env");
@@ -126,7 +127,7 @@ describe("RPC configuration", () => {
   });
 
   test("injects a private auth broker token without exposing its source path", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-broker-"));
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-broker-"));
     directories.push(directory);
     const path = join(directory, "auth-broker.token");
     writeFileSync(path, "broker-secret\n", { mode: 0o600 });
@@ -136,7 +137,7 @@ describe("RPC configuration", () => {
         {
           PATH: "/bin",
           TELEGRAM_BOT_TOKEN: "telegram-secret",
-          OMP_GATEWAY_AUTH_BROKER_TOKEN_FILE: path,
+          OMPCLAW_AUTH_BROKER_TOKEN_FILE: path,
         },
         { authBrokerTokenFile: path },
       ),
@@ -145,8 +146,8 @@ describe("RPC configuration", () => {
     expect(childEnv).toEqual({ PATH: "/bin", OMP_AUTH_BROKER_TOKEN: "broker-secret" });
   });
 
-  test("materializes experimental learning in gateway-owned state only when enabled", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-learning-"));
+  test("materializes experimental learning in OmpClaw-owned state only when enabled", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-learning-"));
     directories.push(directory);
     expect(prepareLearningOverlay({
       stateDir: directory,
@@ -173,7 +174,7 @@ describe("RPC configuration", () => {
   });
 
   test("accepts gateway runtime config for inherited harness assets without credentials or runtime state", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-profile-"));
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-profile-"));
     directories.push(directory);
     const source = join(directory, "agent");
     mkdirSync(join(source, "skills"), { recursive: true });

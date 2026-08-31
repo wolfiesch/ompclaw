@@ -8,9 +8,9 @@ import { GatewayStore } from "./gateway-store";
 const directories: string[] = [];
 
 function temporaryDatabase(): string {
-  const directory = mkdtempSync(join(tmpdir(), "omp-gateway-store-"));
+  const directory = mkdtempSync(join(tmpdir(), "ompclaw-store-"));
   directories.push(directory);
-  return join(directory, "gateway.sqlite");
+  return join(directory, "ompclaw.sqlite");
 }
 
 afterEach(() => {

@@ -1,16 +1,16 @@
 {
-  "name": "omp-gateway",
-  "version": "0.2.0",
-  "description": "Authenticated OMP gateway for Telegram and WebSocket clients",
+  "name": "ompclaw",
+  "version": "0.3.0",
+  "description": "OmpClaw: authenticated remote access to one persistent OMP session",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wolfiesch/omp-gateway.git"
+    "url": "git+https://github.com/wolfiesch/ompclaw.git"
   },
-  "homepage": "https://github.com/wolfiesch/omp-gateway#readme",
+  "homepage": "https://github.com/wolfiesch/ompclaw#readme",
   "bugs": {
-    "url": "https://github.com/wolfiesch/omp-gateway/issues"
+    "url": "https://github.com/wolfiesch/ompclaw/issues"
   },
   "exports": {
     ".": {
@@ -20,7 +20,7 @@
   },
   "types": "./src/index.ts",
   "bin": {
-    "omp-gateway": "src/rpc-cli.ts"
+    "ompclaw": "src/rpc-cli.ts"
   },
   "engines": {
     "bun": ">=1.3.0"
@@ -31,6 +31,7 @@
   "keywords": [
     "omp",
     "oh-my-pi",
+    "ompclaw",
     "gateway",
     "telegram",
     "websocket",
@@ -75,7 +76,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "check": "bun run typecheck && bun run test",
-    "gateway": "bun ./src/rpc-cli.ts"
+    "ompclaw": "bun ./src/rpc-cli.ts"
   },
   "devDependencies": {
     "@oh-my-pi/pi-coding-agent": "^17.0.0",

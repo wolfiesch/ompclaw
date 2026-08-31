@@ -11,8 +11,8 @@ permissions:
 
 jobs:
   publish:
-    name: Publish omp-gateway
-    if: github.repository == 'wolfiesch/omp-gateway'
+    name: Publish OmpClaw
+    if: github.repository == 'wolfiesch/ompclaw'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -34,8 +34,8 @@ jobs:
       - name: Publish with provenance
         run: |
           version=$(node -p "require('./package.json').version")
-          if npm view "omp-gateway@$version" version >/dev/null 2>&1; then
-            echo "omp-gateway@$version is already published"
+          if npm view "ompclaw@$version" version >/dev/null 2>&1; then
+            echo "ompclaw@$version is already published"
           else
             npm publish --provenance --access public
           fi

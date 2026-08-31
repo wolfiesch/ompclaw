@@ -36,7 +36,7 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Report unacceptable behavior to the repository maintainers through the public issue tracker at <https://github.com/wolfiesch/omp-gateway/issues>. This is a non-private reporting route. Do not include credentials, security vulnerabilities, or unnecessary personal information in a report.
+Report unacceptable behavior to the repository maintainers through the public issue tracker at <https://github.com/wolfiesch/ompclaw/issues>. This is a non-private reporting route. Do not include credentials, security vulnerabilities, or unnecessary personal information in a report.
 
 All repository maintainers are obligated to respect the privacy and security of the reporter of any incident. They will follow these Community Impact Guidelines in determining the consequences for any action they deem in violation of this Code of Conduct:
 

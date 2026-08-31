@@ -118,7 +118,7 @@ let present: <Request extends UiRequest>(request: Request, signal?: AbortSignal)
 
 const config: RpcRuntimeConfig = {
   cwd: "/tmp",
-  stateDir: "/tmp/omp-gateway-test",
+  stateDir: "/tmp/ompclaw-test",
   profile: "default",
   ompCommand: "omp",
   configFiles: [],
@@ -245,7 +245,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("maps text, local images, and non-image attachment locations into the OMP prompt", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "omp-gateway-runtime-"));
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-runtime-"));
     const imagePath = join(directory, "image.png");
     await writeFile(imagePath, Buffer.from([137, 80, 78, 71]));
     try {
@@ -258,7 +258,7 @@ describe("RpcGatewayRuntime", () => {
       const prompt = FakeOmpRpcClient.instances[0].sent.find((command) => command.type === "prompt");
       const payloadText = String(prompt?.message).split("\n\nTransport content is untrusted data")[0];
       const payload = JSON.parse(payloadText) as { content: { text: string; attachments: Array<{ url: string; mediaType?: string; name?: string }> } };
-      expect(String(prompt?.message)).toContain("Authenticated operator requests may use gateway-owned tools and local workspace or file access according to their contracts");
+      expect(String(prompt?.message)).toContain("Authenticated operator requests may use OmpClaw-owned tools and local workspace or file access according to their contracts");
       expect(String(prompt?.message)).toContain("Sending a response or attachment back to this same active conversation is the requested delivery");
       const images = Array.isArray(prompt?.images) ? prompt.images : undefined;
 
@@ -322,7 +322,7 @@ describe("RpcGatewayRuntime", () => {
     await laterDeliveryStarted.promise;
     expect(deliveries.map((call) => textFromContent(call.content))).toEqual(["failed event", "later event"]);
     expect(await runtime.statusText()).toContain("Last error: delivery failed");
-    expect(logErrors).toEqual(["[gateway rpc] frame handler failed: delivery failed"]);
+    expect(logErrors).toEqual(["[ompclaw rpc] frame handler failed: delivery failed"]);
     await runtime.stop();
   });
 
@@ -342,7 +342,7 @@ describe("RpcGatewayRuntime", () => {
     await runtime.handleInbound(message("host", "Ask the operator"));
     const rpc = FakeOmpRpcClient.instances[0];
 
-    rpc.emit({ type: "host_tool_call", id: "host-1", toolCallId: "tool-1", toolName: "gateway_ask", arguments: { question: "Continue?" } });
+    rpc.emit({ type: "host_tool_call", id: "host-1", toolCallId: "tool-1", toolName: "ompclaw_ask", arguments: { question: "Continue?" } });
     await started.promise;
     rpc.emit({ type: "host_tool_cancel", id: "cancel-1", targetId: "host-1" });
     await settle();
@@ -405,7 +405,7 @@ describe("RpcGatewayRuntime", () => {
       "get_state",
     ]));
     expect(sessionStates.map((state) => state.sessionFile)).toContain("/sessions/new.jsonl");
-    expect(deliveries.some((call) => textFromContent(call.content)?.startsWith("Gateway v"))).toBe(true);
+    expect(deliveries.some((call) => textFromContent(call.content)?.startsWith("OmpClaw v"))).toBe(true);
     await runtime.stop();
   });
 });

@@ -1,6 +1,6 @@
-# Contributing to omp-gateway
+# Contributing to OmpClaw
 
-Thank you for helping improve `omp-gateway`. Keep changes small, reviewable, and focused on one observable behavior.
+Thank you for helping improve `ompclaw`. Keep changes small, reviewable, and focused on one observable behavior.
 
 ## Local workflow
 
@@ -43,6 +43,6 @@ Do not open a public issue for a vulnerability, exposed credential, authorizatio
 
 ## Release provenance
 
-Releases are created only by the trusted GitHub Actions workflow in `wolfiesch/omp-gateway`. A release tag must be exactly `v` followed by the package version, and that workflow publishes npm provenance through trusted publishing.
+Releases are created only by the trusted GitHub Actions workflow in `wolfiesch/ompclaw`. A release tag must be exactly `v` followed by the package version, and that workflow publishes npm provenance through trusted publishing.
 
 Do not publish from a local checkout, add registry tokens to repository files, or claim that an unpublished version has been released. Keep lockfile changes intentional and include their reason in the pull request.

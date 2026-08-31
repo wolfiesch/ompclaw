@@ -20,8 +20,8 @@ describe("gateway config", () => {
   test("uses safe standalone defaults and expands home-relative paths", () => {
     const config = parseGatewayConfig({}, "/workspace/current");
     expect(config.workspace).toBe("/workspace/current");
-    expect(config.profile).toBe("gateway");
-    expect(config.stateDir).toMatch(/\.omp\/agent\/gateway$/);
+    expect(config.profile).toBe("ompclaw");
+    expect(config.stateDir).toMatch(/\.omp\/agent\/ompclaw$/);
     expect(expandGatewayPath("~/state", "/workspace/current")).toMatch(/state$/);
   });
 
@@ -80,13 +80,13 @@ describe("gateway config", () => {
           hostname: "127.0.0.1",
           port: 7788,
           account: "web",
-          credentials: [{ tokenEnv: "OMP_GATEWAY_WEB_TOKEN", subject: "alice", channel: "alice" }],
+          credentials: [{ tokenEnv: "OMPCLAW_WEB_TOKEN", subject: "alice", channel: "alice" }],
         },
       },
     }, "/work");
     const secrets = resolveGatewaySecrets(config, {
       TELEGRAM_BOT_TOKEN: "telegram-secret",
-      OMP_GATEWAY_WEB_TOKEN: "web-secret",
+      OMPCLAW_WEB_TOKEN: "web-secret",
     });
 
     const serialized = JSON.stringify(config);
@@ -104,11 +104,11 @@ describe("gateway config", () => {
         account: "web",
         credentials: [{ tokenEnv: "WEBSOCKET_TOKEN", subject: "alice", channel: "alice" }],
       } },
-    })).toThrow("OMP_GATEWAY_");
+    })).toThrow("OMPCLAW_");
   });
 
   test("loads only bounded regular JSON config documents", () => {
-    const directory = mkdtempSync(join(tmpdir(), "omp-gateway-config-"));
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-config-"));
     directories.push(directory);
     const path = join(directory, "gateway.json");
     writeFileSync(path, JSON.stringify({ profile: "gateway-test" }), { mode: 0o600 });
@@ -120,7 +120,8 @@ describe("gateway config", () => {
     const child = stripGatewaySecretsFromChildEnv({
       PATH: "/bin",
       TELEGRAM_BOT_TOKEN: "telegram-secret",
-      OMP_GATEWAY_WEB_TOKEN: "web-secret",
+      OMPCLAW_WEB_TOKEN: "web-secret",
+      OMP_GATEWAY_WEB_TOKEN: "renamed-secret",
       GATEWAY_LEGACY_TOKEN: "legacy-secret",
       OMP_TRANSPORT_TOKEN: "transport-secret",
     });

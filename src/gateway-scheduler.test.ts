@@ -11,9 +11,9 @@ const address = { transport: "telegram", account: "default", channel: "42" } as 
 const principal = { id: "operator-42", roles: ["operator"] } as const;
 
 function temporaryStore(): { path: string; store: GatewayStore } {
-  const directory = mkdtempSync(join(tmpdir(), "omp-gateway-scheduler-"));
+  const directory = mkdtempSync(join(tmpdir(), "ompclaw-scheduler-"));
   directories.push(directory);
-  const path = join(directory, "gateway.sqlite");
+  const path = join(directory, "ompclaw.sqlite");
   const store = new GatewayStore(path);
   store.upsertPrincipal(principal);
   return { path, store };

@@ -101,8 +101,8 @@ export class GatewayApplication {
     this.#config = options.config;
     this.#providedSecrets = options.secrets;
     this.#seams = options.seams ?? {};
-    this.#lockPath = resolve(options.config.stateDir, "gateway.lock");
-    this.#databasePath = resolve(options.config.stateDir, "gateway.sqlite");
+    this.#lockPath = resolve(options.config.stateDir, "ompclaw.lock");
+    this.#databasePath = resolve(options.config.stateDir, "ompclaw.sqlite");
   }
 
   status(): GatewayApplicationStatus {
@@ -116,13 +116,13 @@ export class GatewayApplication {
 
   async start(signal?: AbortSignal): Promise<void> {
     if (this.#state === "started") return;
-    if (this.#state !== "idle") throw new Error(`Gateway application cannot start while ${this.#state}`);
+    if (this.#state !== "idle") throw new Error(`OmpClaw application cannot start while ${this.#state}`);
     this.#state = "starting";
 
     let lockHeld = false;
     try {
       const lock = (this.#seams.acquireLock ?? acquireLock)(this.#lockPath);
-      if (!lock.ok) throw new Error(`Gateway is already running in process ${lock.holder}`);
+      if (!lock.ok) throw new Error(`OmpClaw is already running in process ${lock.holder}`);
       lockHeld = true;
       this.#releaseHeartbeat = (this.#seams.startLockHeartbeat ?? startLockHeartbeat)(this.#lockPath);
 
@@ -189,7 +189,7 @@ export class GatewayApplication {
   async stop(): Promise<void> {
     if (this.#state === "idle") return;
     if (this.#state === "stopping") return;
-    if (this.#state === "starting") throw new Error("Gateway application cannot stop while starting");
+    if (this.#state === "starting") throw new Error("OmpClaw application cannot stop while starting");
     this.#state = "stopping";
     const error = await this.#stopResources();
     this.#state = "idle";
@@ -363,18 +363,18 @@ export class GatewayApplication {
   }
 
   #requireStore(): GatewayApplicationStore {
-    if (this.#store === undefined) throw new Error("Gateway store is not started");
+    if (this.#store === undefined) throw new Error("OmpClaw store is not started");
     return this.#store;
   }
 
   #requireRuntime(): GatewayRuntime {
-    if (this.#runtime === undefined) throw new Error("Gateway runtime is not started");
+    if (this.#runtime === undefined) throw new Error("OmpClaw runtime is not started");
     return this.#runtime;
   }
 }
 
 export function gatewayDatabasePath(config: Pick<GatewayConfig, "stateDir">): string {
-  return join(config.stateDir, "gateway.sqlite");
+  return join(config.stateDir, "ompclaw.sqlite");
 }
 
 function requireScheduledStore(store: GatewayApplicationStore): GatewayScheduledJobStore {
@@ -387,7 +387,7 @@ function requireScheduledStore(store: GatewayApplicationStore): GatewayScheduled
     "deleteScheduledJob",
   ] as const;
   for (const method of methods) {
-    if (typeof store[method] !== "function") throw new Error(`Gateway store does not support automation method ${method}`);
+    if (typeof store[method] !== "function") throw new Error(`OmpClaw store does not support automation method ${method}`);
   }
   return store as GatewayScheduledJobStore;
 }
