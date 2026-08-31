@@ -919,11 +919,25 @@ export class GatewayStore {
     }
 
     return this.#transaction(() => {
+      const pendingGuard = `
+        NOT EXISTS (
+          SELECT 1 FROM pending_inbound_messages AS pending
+          WHERE pending.transport = inbound.transport
+            AND pending.account = inbound.account
+            AND pending.message_id = inbound.message_id
+        )`;
       const row = this.#database
-        .query("SELECT COUNT(*) AS message_count FROM inbound_messages WHERE received_at < ?")
+        .query(`
+          SELECT COUNT(*) AS message_count
+          FROM inbound_messages AS inbound
+          WHERE inbound.received_at < ? AND ${pendingGuard}
+        `)
         .get(before) as SqlRow;
       const count = storedCount(row, "message_count", "inbound message prune count");
-      this.#database.query("DELETE FROM inbound_messages WHERE received_at < ?").run(before);
+      this.#database.query(`
+        DELETE FROM inbound_messages AS inbound
+        WHERE inbound.received_at < ? AND ${pendingGuard}
+      `).run(before);
       return count;
     });
   }

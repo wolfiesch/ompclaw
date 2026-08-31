@@ -212,16 +212,22 @@ describe("GatewayStore", () => {
     store.close();
   });
 
-  test("prunes only inbound messages received strictly before the cutoff", () => {
+  test("prunes only completed inbound messages strictly before the cutoff", () => {
     const store = new GatewayStore(temporaryDatabase());
+    expect(store.claimInboundMessage(claimedInbound("pending-old"), 98)).toBe(true);
     expect(store.claimInboundMessage(claimedInbound("before"), 99)).toBe(true);
     expect(store.claimInboundMessage(claimedInbound("at-cutoff"), 100)).toBe(true);
     expect(store.claimInboundMessage(claimedInbound("after"), 101)).toBe(true);
+    expect(store.completeInboundMessage("telegram", "default", "before")).toBe(true);
+    expect(store.completeInboundMessage("telegram", "default", "at-cutoff")).toBe(true);
+    expect(store.completeInboundMessage("telegram", "default", "after")).toBe(true);
 
     expect(store.pruneInboundMessages(100)).toBe(1);
     expect(store.claimInboundMessage(claimedInbound("before"), 102)).toBe(true);
+    expect(store.claimInboundMessage(claimedInbound("pending-old"), 102)).toBe(false);
     expect(store.claimInboundMessage(claimedInbound("at-cutoff"), 103)).toBe(false);
     expect(store.claimInboundMessage(claimedInbound("after"), 104)).toBe(false);
+    expect(store.listPendingInboundMessages().map(({ message }) => message.id)).toContain("pending-old");
     expect(store.pruneInboundMessages(101)).toBe(1);
     expect(store.claimInboundMessage(claimedInbound("at-cutoff"), 105)).toBe(true);
     store.close();

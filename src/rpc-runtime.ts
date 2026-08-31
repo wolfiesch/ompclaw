@@ -373,6 +373,11 @@ export class RpcGatewayRuntime {
     return CROSS_DELIVERY_COMMANDS.has(parsed.name);
   }
 
+  isActiveConversation(message: InboundMessage): boolean {
+    const active = this.#activeTurn;
+    return active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message));
+  }
+
   async notifyInboundQueued(message: InboundMessage): Promise<void> {
     await this.#send(this.#deliveryFor(message), "Got it. I’m finishing another conversation, then I’ll handle this next.");
   }

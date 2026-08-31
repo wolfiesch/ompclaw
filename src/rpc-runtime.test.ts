@@ -291,6 +291,10 @@ describe("RpcGatewayRuntime", () => {
     const second = message("second", "Handle this next");
     await runtime.handleInbound(first);
     const rpc = FakeOmpRpcClient.instances[0];
+    expect(runtime.isActiveConversation(first)).toBe(true);
+    expect(runtime.isActiveConversation(second)).toBe(false);
+    expect(runtime.canHandleInboundImmediately(message("second", "/status"))).toBe(true);
+    expect(runtime.canHandleInboundImmediately(second)).toBe(false);
 
     rpc.emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "first streaming" }] } });
     await settle();

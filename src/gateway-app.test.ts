@@ -434,6 +434,69 @@ describe("GatewayApplication", () => {
     await app.stop();
   });
 
+  test("does not rebind another topic when an immediate control bypasses session switching", async () => {
+    const store = new MemoryStore();
+    const core = coreHarness([]);
+    const base = gatewayConfig();
+    const config = parseGatewayConfig({
+      ...base,
+      transports: {
+        telegram: {
+          enabled: true,
+          account: "bot",
+          tokenEnv: "TELEGRAM_BOT_TOKEN",
+          topicSessions: { enabled: true, createFromRoot: true },
+        },
+      },
+    });
+    const handled: string[] = [];
+    const app = new GatewayApplication({
+      config,
+      secrets: { telegramToken: "telegram", webSocketCredentials: [] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "topic-a",
+              sessionFile: "/sessions/topic-a",
+            });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            handled.push(message.id);
+          },
+          canHandleInboundImmediately: () => true,
+          isActiveConversation: () => false,
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+    const topicB: InboundMessage = {
+      ...inbound("topic-b-status"),
+      address: { transport: "telegram", account: "bot", channel: "-1001", thread: "20" },
+      content: { text: "/status" },
+    };
+
+    await app.start();
+    store.bindConversation({
+      address: topicB.address,
+      ompSessionPath: "/sessions/topic-b",
+      workspace: "/workspace/gateway",
+    });
+    await core.options().onInbound(topicB);
+    await waitFor(() => store.pending.size === 0);
+    expect(handled).toEqual(["topic-b-status"]);
+    expect(store.getConversationBinding(topicB.address)?.ompSessionPath).toBe("/sessions/topic-b");
+    await app.stop();
+  });
+
   test("retains a failed inbound claim and retries it without Telegram redelivery", async () => {
     const store = new MemoryStore();
     const core = coreHarness([]);

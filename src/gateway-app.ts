@@ -55,6 +55,7 @@ export interface GatewayRuntime {
   isBusy?(): boolean;
   waitUntilIdle?(): Promise<void>;
   canHandleInboundImmediately?(message: InboundMessage): boolean;
+  isActiveConversation?(message: InboundMessage): boolean;
   notifyInboundQueued?(message: InboundMessage): Promise<void>;
   newSession?(name?: string): Promise<boolean>;
   switchSession?(sessionPath: string): Promise<boolean>;
@@ -346,18 +347,21 @@ export class GatewayApplication {
     if (!immediate) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
 
     const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
-    if (topicSessions) await this.#selectConversationSession(store, runtime, message);
+    const associateSession = !topicSessions || !immediate || runtime.isActiveConversation?.(message) === true;
+    if (topicSessions && !immediate) await this.#selectConversationSession(store, runtime, message);
     if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
     else await runtime.handleInbound(message);
 
     const sessionFile = this.#sessionFile;
     if (sessionFile === undefined) throw new Error("OMP runtime did not report its current session file");
-    store.bindConversation({
-      address: message.address,
-      ompSessionPath: sessionFile,
-      workspace: this.#config.workspace,
-    });
-    if (topicSessions && !this.#isTopicAddress(message.address)) this.#sharedSessionFile = sessionFile;
+    if (associateSession) {
+      store.bindConversation({
+        address: message.address,
+        ompSessionPath: sessionFile,
+        workspace: this.#config.workspace,
+      });
+      if (topicSessions && !this.#isTopicAddress(message.address)) this.#sharedSessionFile = sessionFile;
+    }
     this.#checkpointSession();
     this.#checkpointSharedSession();
     if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
