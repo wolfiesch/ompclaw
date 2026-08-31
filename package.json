@@ -1,6 +1,6 @@
 {
   "name": "ompclaw",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "OmpClaw: authenticated remote access to one persistent OMP session",
   "type": "module",
   "license": "MIT",

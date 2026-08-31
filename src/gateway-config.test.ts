@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   expandGatewayPath,
+  gatewayRpcRuntimeConfig,
   loadGatewayConfig,
   parseGatewayConfig,
   resolveGatewaySecrets,
@@ -23,6 +24,16 @@ describe("gateway config", () => {
     expect(config.profile).toBe("ompclaw");
     expect(config.stateDir).toMatch(/\.omp\/agent\/ompclaw$/);
     expect(expandGatewayPath("~/state", "/workspace/current")).toMatch(/state$/);
+  });
+
+  test("defaults busy input mode to steer and forwards an explicit override to RPC", () => {
+    expect(parseGatewayConfig({}).omp.busyInputMode).toBe("steer");
+
+    const config = parseGatewayConfig({ omp: { busyInputMode: "followup" } });
+    expect(gatewayRpcRuntimeConfig(config).busyInputMode).toBe("followup");
+
+    expect(() => parseGatewayConfig({ omp: { busyInputMode: "queue" } }))
+      .toThrow('omp.busyInputMode must be "steer" or "followup"');
   });
 
   test("keeps unattended automation opt-in and validates bounded runtime controls", () => {

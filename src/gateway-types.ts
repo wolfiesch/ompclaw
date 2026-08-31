@@ -260,6 +260,11 @@ export interface TransportAdapter {
     context: DeliveryContext,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt>;
+  typing?(
+    address: ConversationAddress,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<void>;
   update?(
     address: ConversationAddress,
     receipt: OutboundReceipt,
