@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.7.0 (2026-08-31)
+
 ### Changed
 
 - Present Telegram turns as an ongoing conversation with immediate receipt reactions, source-linked Markdown responses, and task status that clears after successful completion.
