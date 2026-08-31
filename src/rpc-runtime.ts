@@ -286,8 +286,9 @@ const SAME_DELIVERY_IMMEDIATE_COMMANDS = new Set([
 
 const TELEGRAM_PRESENTATION_CONTRACT = [
   "Telegram presentation is part of the trusted gateway contract:",
-  "- Write for a mobile conversation: answer first, use short paragraphs, and keep formatting scannable.",
-  "- Do not narrate internal tool names, raw harness state, or routine progress in the final response.",
+  "- Treat this as an ongoing personal conversation: answer naturally in first person and preserve context without restating the request.",
+  "- Lead with the answer, use short paragraphs, and add Markdown structure only when it helps on a phone.",
+  "- Do not narrate internal tool names, raw harness state, or routine progress in the final response; the gateway already presents live activity.",
   "- Treat a voice transcript as ordinary user speech; ask only when transcription uncertainty changes the action.",
   "- When durable memory was successfully updated, confirm what was remembered in one natural sentence.",
   "- Never claim that something was remembered unless the memory write actually succeeded.",
@@ -1170,6 +1171,7 @@ export class RpcGatewayRuntime {
         ...delivery,
         ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
       };
+      await this.#reactToSource(this.#activeTurn, "👀");
       return;
     }
     const now = this.#now();
@@ -1193,6 +1195,7 @@ export class RpcGatewayRuntime {
       ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
     };
     this.#queueTurnCard(this.#activeTurn);
+    await this.#reactToSource(this.#activeTurn, "👀");
   }
 
   async #setTurnLifecycle(
@@ -1229,12 +1232,14 @@ export class RpcGatewayRuntime {
   }
 
   async #renderTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle): Promise<void> {
-    const text = [
-      lifecycleLabel(lifecycle.state),
-      lifecycle.prompt,
-      lifecycle.currentTool ?? "",
-      lifecycle.error ? `Problem: ${lifecycle.error}` : "",
-    ].filter(Boolean).join("\n");
+    const text = lifecycle.state === "completed"
+      ? undefined
+      : [
+        lifecycleLabel(lifecycle.state),
+        lifecycle.prompt,
+        lifecycle.currentTool ?? "",
+        lifecycle.error ? `Problem: ${lifecycle.error}` : "",
+      ].filter(Boolean).join("\n");
     try {
       await this.#options.delivery.presentUi(
         active.address,
@@ -1265,7 +1270,6 @@ export class RpcGatewayRuntime {
       active.deliveryContext,
     );
     active.previewText = "";
-    await this.#reactToSource(active, "👀");
   }
 
   #terminalState(messages: unknown): "completed" | "stopped" | "failed" {
@@ -1320,7 +1324,7 @@ export class RpcGatewayRuntime {
     const receipts = await this.#options.delivery.finalize(
       active.address,
       active.receipt,
-      { text, format: "text" },
+      { text, format: "markdown", ...(active.sourceReceipt === undefined ? {} : { replyTo: active.sourceReceipt }) },
       active.deliveryContext,
     );
     active.receipt = receipts[0] ?? active.receipt;

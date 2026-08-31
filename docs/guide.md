@@ -172,6 +172,19 @@ A Telegram object is required only when Telegram is configured:
 | `topicSessions.enabled` | isolate each Telegram forum topic in its own persisted OMP session |
 | `topicSessions.createFromRoot` | create a new forum topic for each authorized non-command root message; requires topic sessions |
 
+#### Conversation behavior
+
+OmpClaw presents routine Telegram turns as a conversation rather than a command console:
+
+- A received request gets an immediate `👀` reaction when Telegram provides a source message receipt.
+- Native Telegram drafts stream the assistant response when available. Typing status is the fallback.
+- The completed response is rendered as Telegram Markdown and replies to the message that started the turn.
+- The source reaction changes to `👍` after success, `👌` after a user stop, or `👎` after failure.
+- The task card shows queued and active work, then clears after successful completion. `/tasks` retains the durable history.
+- Voice notes are transcribed as ordinary user speech when `transcribeCommand` is configured. Replies remain text.
+
+These behaviors need no additional configuration. OMP still controls the response content, reasoning mode, tools, approvals, memory, and session history.
+
 Authorizing a user is an explicit local database operation:
 
 ```bash
