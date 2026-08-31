@@ -82,8 +82,11 @@ The JSON document never contains a token value. It names environment variables t
 | `allowRpcBash` | boolean, `false` | enables `/shell` and `/abortbash` in the gateway command surface |
 | `inheritHarness` | boolean, `false` | requests inherited harness preparation in the RPC runtime configuration |
 | `autoRestart` | boolean, `true` | restart an unexpectedly exited OMP child with bounded backoff |
+| `busyInputMode` | `steer` or `followup`, `steer` | map an ordinary message received in the active conversation to an immediate correction or queued follow-up |
 
 `authBrokerTokenFile`, when used, must be private in the same way as the environment file. `allowRpcBash` changes the authority available through the gateway. Leave it disabled unless it is a deliberate operational choice.
+
+`busyInputMode` affects ordinary messages only while OMP is already working in that same conversation. `steer` makes a second message read like a natural correction. `followup` queues it after the current response. Explicit `/steer` and `/followup` commands remain available in either mode. Messages from another authenticated conversation remain serialized behind the active turn.
 
 ### Durable automation
 

@@ -244,6 +244,17 @@ export class GatewayCore {
     return adapter.send(address, content, context, signal);
   }
 
+  async typing(
+    address: ConversationAddress,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    this.#assertDeliveryOrigin(context, address);
+    const adapter = this.#adapterFor(address);
+    this.#assertAddressSupported(adapter, address);
+    await adapter.typing?.(address, context, signal);
+  }
+
   async update(
     address: ConversationAddress,
     receipt: OutboundReceipt,

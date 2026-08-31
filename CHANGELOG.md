@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.8.0 (2026-08-31)
+
+### Changed
+
+- Present active Telegram turns with a renewed typing indicator, one throttled activity card based on OMP intent, persistent commentary segments, and a source-linked final answer.
+- Treat an ordinary message in the active conversation as an immediate correction by default, with configurable follow-up routing through `omp.busyInputMode`.
+
 ## 0.7.0 (2026-08-31)
 
 ### Changed

@@ -258,6 +258,21 @@ describe("Telegram transport lifecycle", () => {
   });
 });
 
+describe("Telegram typing", () => {
+  test("sends a one-shot typing action to the conversation topic", async () => {
+    const { adapter, calls } = await fixture();
+    const address = { ...baseAddress, channel: "-100", thread: "19" };
+    const context = { ...delivery, origin: address };
+
+    await adapter.typing(address, context);
+
+    expect(calls).toEqual([{
+      method: "sendChatAction",
+      payload: { chat_id: "-100", message_thread_id: 19, action: "typing" },
+    }]);
+  });
+});
+
 describe("Telegram inbound conversion", () => {
   test("converts a private message into a principal-free gateway envelope", async () => {
     const { adapter, received, checkpoints } = await fixture();

@@ -15,7 +15,6 @@ import { chunkLabeled, mdToMarkdownV2, TELEGRAM_MAX_CHARS } from "./formatting";
 const DRAFT_MARKER = "draft:";
 const TYPING_MARKER = "typing:";
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-const TYPING_REFRESH_MS = 4_000;
 const TELEGRAM_PHOTO_EXTENSIONS = new Set([".avif", ".jpeg", ".jpg", ".png", ".webp"]);
 
 export interface TelegramRequestOptions {
@@ -180,7 +179,6 @@ export class Outbound {
   readonly #call: TelegramCall;
   readonly #upload: TelegramUpload;
   readonly #draftId: () => number;
-  readonly #typing = new Map<number, NodeJS.Timeout>();
 
   constructor(options: OutboundOptions) {
     if (options.token.length === 0) throw new Error("Telegram bot token is required");
@@ -208,6 +206,16 @@ export class Outbound {
     return delivered[0]!;
   }
 
+  async typing(
+    address: ConversationAddress,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.#assertTarget(address, context);
+    signal?.throwIfAborted();
+    await this.#request("sendChatAction", { ...messageBase(address), action: "typing" }, signal, address);
+  }
+
   async update(
     address: ConversationAddress,
     target: OutboundReceipt,
@@ -230,7 +238,7 @@ export class Outbound {
         return target;
       } catch (error) {
         if (!draftsUnavailable(error)) throw error;
-        await this.#beginTyping(address, draft, signal);
+        await this.typing(address, context, signal);
         return receipt(`${TYPING_MARKER}${draft}`);
       }
     }
@@ -251,7 +259,6 @@ export class Outbound {
     signal?.throwIfAborted();
     const ephemeral = telegramDraftId(target) ?? typingId(target);
     if (ephemeral !== undefined) {
-      this.#endTyping(ephemeral);
       return this.#deliverPersistent(address, { ...content, transient: false }, context, signal);
     }
     if (target === undefined) return this.#deliverPersistent(address, { ...content, transient: false }, context, signal);
@@ -381,7 +388,7 @@ export class Outbound {
   async #startPreview(
     address: ConversationAddress,
     text: string,
-    _context: DeliveryContext,
+    context: DeliveryContext,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt> {
     const draft = this.#draftId();
@@ -395,7 +402,7 @@ export class Outbound {
       return receipt(`${DRAFT_MARKER}${draft}`);
     } catch (error) {
       if (!draftsUnavailable(error)) throw error;
-      await this.#beginTyping(address, draft, signal);
+      await this.typing(address, context, signal);
       return receipt(`${TYPING_MARKER}${draft}`);
     }
   }
@@ -521,22 +528,6 @@ export class Outbound {
     return receipts;
   }
 
-  async #beginTyping(address: ConversationAddress, id: number, signal?: AbortSignal): Promise<void> {
-    await this.#request("sendChatAction", { ...messageBase(address), action: "typing" }, signal, address);
-    this.#endTyping(id);
-    const timer = setInterval(() => {
-      void this.#request("sendChatAction", { ...messageBase(address), action: "typing" }, undefined, address)
-        .catch((error) => this.#log?.warn(`[telegram] typing refresh failed: ${error instanceof Error ? error.message : String(error)}`));
-    }, TYPING_REFRESH_MS);
-    timer.unref?.();
-    this.#typing.set(id, timer);
-  }
-
-  #endTyping(id: number): void {
-    const timer = this.#typing.get(id);
-    if (timer !== undefined) clearInterval(timer);
-    this.#typing.delete(id);
-  }
 
   async #request(
     method: string,
