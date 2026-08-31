@@ -732,6 +732,102 @@ describe("GatewayApplication", () => {
     await app.stop();
   });
 
+  test("re-evaluates immediate controls while replaying durable input", async () => {
+    const store = new MemoryStore();
+    const first = { ...inbound("recovered-prompt"), content: { text: "Build this" } };
+    const stop = { ...inbound("recovered-stop"), content: { text: "/stop" } };
+    expect(store.claimInboundMessage(first, 1)).toBe(true);
+    expect(store.claimInboundMessage(stop, 2)).toBe(true);
+    const core = coreHarness([]);
+    const idle = Promise.withResolvers<void>();
+    const handled: string[] = [];
+    let busy = false;
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            handled.push(message.id);
+            if (message.id === first.id) busy = true;
+            if (message.id === stop.id) {
+              busy = false;
+              idle.resolve();
+            }
+          },
+          isBusy: () => busy,
+          canHandleInboundImmediately: (message) => busy && message.content.text === "/stop",
+          async waitUntilIdle() {
+            await idle.promise;
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await waitFor(() => handled.length === 2 && store.pending.size === 0);
+    expect(handled).toEqual([first.id, stop.id]);
+    await app.stop();
+  });
+
+  test("revalidates authorization after waiting for an active turn", async () => {
+    const store = new MemoryStore();
+    const core = coreHarness([]);
+    const waiting = Promise.withResolvers<void>();
+    const idle = Promise.withResolvers<void>();
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    let dispatches = 0;
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+          },
+          async stop() {},
+          async handleInbound() {
+            dispatches += 1;
+          },
+          isBusy: () => true,
+          async waitUntilIdle() {
+            waiting.resolve();
+            await idle.promise;
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await core.options().onInbound(inbound("revoked-while-waiting"));
+    await waiting.promise;
+    store.resolvedPrincipal = undefined;
+    idle.resolve();
+    await waitFor(() => store.pending.size === 0);
+    expect(dispatches).toBe(0);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("identity authorization changed"));
+    warning.mockRestore();
+    await app.stop();
+  });
+
   test("discards recovered work after its transport identity is revoked", async () => {
     const store = new MemoryStore();
     expect(store.claimInboundMessage(inbound("revoked"), 1)).toBe(true);

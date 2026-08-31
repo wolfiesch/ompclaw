@@ -358,22 +358,20 @@ export class GatewayApplication {
     const key = this.#inboundKey(message);
     let completion = this.#pendingInboundCompletions.get(key);
     if (completion === undefined) {
-      const principal = store.resolvePrincipal(message.identity);
-      if (principal === undefined || principal.id !== message.principal.id) {
-        if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
-          throw new Error(`Unauthorized pending inbound message ${message.id} disappeared before rejection`);
-        }
-        console.warn(
-          `[ompclaw] discarded pending inbound ${message.address.transport}/${message.address.account}/${message.id}; identity authorization changed`,
-        );
-        return;
-      }
-      const authorizedMessage: InboundMessage = { ...message, principal };
-      if (!immediate) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
+      const dispatchImmediately = immediate || (!scheduled && runtime.canHandleInboundImmediately?.(message) === true);
+      if (!dispatchImmediately) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
 
+      let principal = this.#resolvePendingPrincipal(store, message);
+      if (principal === undefined) return;
+      let authorizedMessage: InboundMessage = { ...message, principal };
       const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
-      const associateSession = !topicSessions || !immediate;
-      if (topicSessions && !immediate) await this.#selectConversationSession(store, runtime, authorizedMessage);
+      const associateSession = !topicSessions || !dispatchImmediately;
+      if (topicSessions && !dispatchImmediately) {
+        await this.#selectConversationSession(store, runtime, authorizedMessage);
+        principal = this.#resolvePendingPrincipal(store, message);
+        if (principal === undefined) return;
+        authorizedMessage = { ...message, principal };
+      }
       if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(authorizedMessage);
       else await runtime.handleInbound(authorizedMessage);
 
@@ -405,6 +403,18 @@ export class GatewayApplication {
       throw new Error(`Pending inbound message ${message.id} disappeared before completion`);
     }
     this.#pendingInboundCompletions.delete(key);
+  }
+
+  #resolvePendingPrincipal(store: GatewayApplicationStore, message: InboundMessage): Principal | undefined {
+    const principal = store.resolvePrincipal(message.identity);
+    if (principal !== undefined && principal.id === message.principal.id) return principal;
+    if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+      throw new Error(`Unauthorized pending inbound message ${message.id} disappeared before rejection`);
+    }
+    console.warn(
+      `[ompclaw] discarded pending inbound ${message.address.transport}/${message.address.account}/${message.id}; identity authorization changed`,
+    );
+    return undefined;
   }
 
   #inboundKey(message: InboundMessage): string {
