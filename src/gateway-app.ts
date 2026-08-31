@@ -38,7 +38,8 @@ export interface GatewayApplicationStore extends Partial<GatewayScheduledJobStor
   releaseInboundMessage(transport: string, account: string, messageId: string): boolean;
   bindConversation(binding: ConversationBinding): void;
   getConversationBinding(address: InboundMessage["address"]): ConversationBinding | undefined;
-  hasConversationBindingForSession?(sessionPath: string): boolean;
+  getSharedConversationSessionPath?(): string | undefined;
+  migrateTelegramTopicSessions?(account: string): number;
   putPendingInteraction: GatewayStore["putPendingInteraction"];
   deletePendingInteraction: GatewayStore["deletePendingInteraction"];
 }
@@ -49,6 +50,7 @@ export interface GatewayRuntime {
   handleInbound(message: InboundMessage): Promise<void>;
   handleScheduled?(message: InboundMessage): Promise<void>;
   isBusy?(): boolean;
+  waitUntilIdle?(): Promise<void>;
   newSession?(name?: string): Promise<boolean>;
   switchSession?(sessionPath: string): Promise<boolean>;
 }
@@ -106,6 +108,7 @@ export class GatewayApplication {
   #releaseHeartbeat: (() => void) | undefined;
   #adapters: TransportAdapter[] = [];
   #sessionFile: string | undefined;
+  #sharedSessionFile: string | undefined;
   #inboundTail: Promise<void> = Promise.resolve();
 
   constructor(options: GatewayApplicationOptions) {
@@ -139,12 +142,19 @@ export class GatewayApplication {
 
       const store = (this.#seams.createStore ?? ((path: string) => new GatewayStore(path)))(this.#databasePath);
       this.#store = store;
+      const telegram = this.#config.transports.telegram;
+      const topicSessions = telegram?.enabled === true && telegram.topicSessions.enabled;
+      if (topicSessions) store.migrateTelegramTopicSessions?.(telegram.account);
       const checkpoint = store.getCheckpoint("omp", "session_file");
       if (checkpoint !== undefined && (typeof checkpoint !== "string" || checkpoint.length === 0)) {
         throw new Error("OMP session checkpoint must be a non-empty string");
       }
-      this.#sessionFile = checkpoint;
-
+      const sharedCheckpoint = topicSessions ? store.getCheckpoint("omp", "shared_session_file") : undefined;
+      if (sharedCheckpoint !== undefined && (typeof sharedCheckpoint !== "string" || sharedCheckpoint.length === 0)) {
+        throw new Error("OMP shared session checkpoint must be a non-empty string");
+      }
+      this.#sharedSessionFile = sharedCheckpoint ?? (topicSessions ? store.getSharedConversationSessionPath?.() : undefined);
+      this.#sessionFile = checkpoint ?? this.#sharedSessionFile;
       const core = (this.#seams.createCore ?? ((options: GatewayCoreOptions) => new GatewayCore(options)))({
         identityResolver: (identity) => store.resolvePrincipal(identity),
         onInbound: (message) => this.#handleInbound(message),
@@ -188,7 +198,9 @@ export class GatewayApplication {
 
       // OMP starts before the core makes a transport reachable.
       await runtime.start();
+      if (topicSessions && this.#sharedSessionFile === undefined) this.#sharedSessionFile = this.#sessionFile;
       this.#checkpointSession();
+      this.#checkpointSharedSession();
       await core.start(signal);
       scheduler?.start();
       this.#state = "started";
@@ -264,9 +276,8 @@ export class GatewayApplication {
     if (!store.claimInboundMessage(transport, account, message.id, (this.#seams.now ?? Date.now)())) return;
 
     try {
-      if (this.#config.transports.telegram?.topicSessions.enabled === true) {
-        await this.#selectConversationSession(store, runtime, message);
-      }
+      const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
+      if (topicSessions) await this.#selectConversationSession(store, runtime, message);
       if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
       else await runtime.handleInbound(message);
       const sessionFile = this.#sessionFile;
@@ -276,7 +287,9 @@ export class GatewayApplication {
         ompSessionPath: sessionFile,
         workspace: this.#config.workspace,
       });
+      if (topicSessions && !this.#isTopicAddress(message.address)) this.#sharedSessionFile = sessionFile;
       this.#checkpointSession();
+      this.#checkpointSharedSession();
     } catch (error) {
       store.releaseInboundMessage(transport, account, message.id);
       throw error;
@@ -293,21 +306,40 @@ export class GatewayApplication {
     if (binding !== undefined) {
       if (binding.ompSessionPath === currentSession) return;
       if (runtime.switchSession === undefined) throw new Error("OMP runtime does not support conversation session switching");
-      if (runtime.isBusy?.()) throw new Error("OMP is busy and cannot switch conversation sessions");
+      await this.#waitUntilSessionMutable(runtime, "switch conversation sessions");
       const switched = await runtime.switchSession(binding.ompSessionPath);
       if (!switched) throw new Error(`OMP cancelled the session switch for ${binding.ompSessionPath}`);
       return;
     }
 
-    const isTopic = message.address.transport === "telegram" && message.address.thread !== undefined;
-    const currentOwned = currentSession === undefined
-      ? false
-      : store.hasConversationBindingForSession?.(currentSession) === true;
-    if (!isTopic && !currentOwned) return;
+    if (!this.#isTopicAddress(message.address)) {
+      const sharedSession = this.#sharedSessionFile ?? store.getSharedConversationSessionPath?.();
+      if (sharedSession === undefined || sharedSession === currentSession) return;
+      if (runtime.switchSession === undefined) throw new Error("OMP runtime does not support conversation session switching");
+      await this.#waitUntilSessionMutable(runtime, "switch to the shared session");
+      const switched = await runtime.switchSession(sharedSession);
+      if (!switched) throw new Error(`OMP cancelled the session switch for ${sharedSession}`);
+      return;
+    }
+
+    if (this.#sharedSessionFile === undefined && currentSession !== undefined) {
+      this.#sharedSessionFile = currentSession;
+      this.#checkpointSharedSession();
+    }
     if (runtime.newSession === undefined) throw new Error("OMP runtime does not support per-conversation sessions");
-    if (runtime.isBusy?.()) throw new Error("OMP is busy and cannot create a conversation session");
+    await this.#waitUntilSessionMutable(runtime, "create a conversation session");
     const created = await runtime.newSession(this.#sessionName(message));
     if (!created) throw new Error("OMP cancelled conversation session creation");
+  }
+
+  async #waitUntilSessionMutable(runtime: GatewayRuntime, action: string): Promise<void> {
+    if (!runtime.isBusy?.()) return;
+    if (runtime.waitUntilIdle === undefined) throw new Error(`OMP is busy and cannot ${action}`);
+    await runtime.waitUntilIdle();
+  }
+
+  #isTopicAddress(address: InboundMessage["address"]): boolean {
+    return address.transport === "telegram" && address.thread !== undefined;
   }
 
   #sessionName(message: InboundMessage): string {
@@ -360,6 +392,12 @@ export class GatewayApplication {
 
   #checkpointSession(): void {
     if (this.#sessionFile !== undefined) this.#requireStore().setCheckpoint("omp", "session_file", this.#sessionFile);
+  }
+
+  #checkpointSharedSession(): void {
+    if (this.#sharedSessionFile !== undefined) {
+      this.#requireStore().setCheckpoint("omp", "shared_session_file", this.#sharedSessionFile);
+    }
   }
 
   async #rollbackStart(lockHeld: boolean): Promise<void> {
@@ -427,6 +465,7 @@ export class GatewayApplication {
 
     this.#adapters = [];
     this.#sessionFile = undefined;
+    this.#sharedSessionFile = undefined;
     return firstError;
   }
 

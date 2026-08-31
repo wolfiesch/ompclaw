@@ -82,6 +82,7 @@ export interface LegacyTelegramStateImportResult {
 }
 
 export const LEGACY_TELEGRAM_STATE_MIGRATION = "legacy-telegram-state-v1";
+export const TELEGRAM_TOPIC_SESSION_MIGRATION = "telegram-topic-session-isolation-v1";
 
 type SqlRow = Record<string, unknown>;
 
@@ -713,11 +714,18 @@ export class GatewayStore {
     return row === null ? undefined : decodeConversationBinding(row);
   }
 
-  hasConversationBindingForSession(sessionPath: string): boolean {
-    requiredText(sessionPath, "OMP session path");
-    return this.#database
-      .query("SELECT 1 FROM conversation_bindings WHERE omp_session_path = ? LIMIT 1")
-      .get(sessionPath) !== null;
+
+  getSharedConversationSessionPath(): string | undefined {
+    const row = this.#database
+      .query(
+        `SELECT omp_session_path
+         FROM conversation_bindings
+         WHERE thread = ''
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+      )
+      .get() as SqlRow | null;
+    return row === null ? undefined : storedString(row, "omp_session_path", "conversation binding");
   }
 
   setCheckpoint(adapter: string, key: string, value: JsonValue): void {
@@ -1109,6 +1117,62 @@ export class GatewayStore {
         binding,
         checkpointImported: lastUpdateId !== undefined,
       };
+    });
+  }
+
+  migrateTelegramTopicSessions(account: string): number {
+    requiredText(account, "Telegram account");
+    const marker = `${TELEGRAM_TOPIC_SESSION_MIGRATION}:${account}`;
+    return this.#transaction(() => {
+      if (this.#hasMigration(marker)) return 0;
+
+      const current = this.getCheckpoint("omp", "session_file");
+      const currentWasTopic = typeof current === "string" && this.#database
+        .query(
+          `SELECT 1
+           FROM conversation_bindings
+           WHERE transport = 'telegram' AND account = ? AND thread <> '' AND omp_session_path = ?
+           LIMIT 1`,
+        )
+        .get(account, current) !== null;
+      const currentWasShared = typeof current === "string" && this.#database
+        .query("SELECT 1 FROM conversation_bindings WHERE thread = '' AND omp_session_path = ? LIMIT 1")
+        .get(current) !== null;
+      const sharedRow = this.#database
+        .query(
+          `SELECT omp_session_path
+           FROM conversation_bindings
+           WHERE thread = ''
+           ORDER BY updated_at ASC, rowid ASC
+           LIMIT 1`,
+        )
+        .get() as SqlRow | null;
+      const shared = sharedRow === null ? undefined : storedString(sharedRow, "omp_session_path", "conversation binding");
+      const removed = this.#database
+        .query("DELETE FROM conversation_bindings WHERE transport = 'telegram' AND account = ? AND thread <> ''")
+        .run(account).changes;
+
+      if (shared !== undefined) {
+        this.#database
+          .query("UPDATE conversation_bindings SET omp_session_path = ? WHERE thread = ''")
+          .run(shared);
+        this.setCheckpoint("omp", "shared_session_file", shared);
+        if (currentWasTopic || currentWasShared) this.setCheckpoint("omp", "session_file", shared);
+      } else if (currentWasTopic && this.#database
+        .query("SELECT 1 FROM conversation_bindings WHERE omp_session_path = ? LIMIT 1")
+        .get(current) === null) {
+        for (const key of ["session_file", "shared_session_file"]) {
+          if (this.getCheckpoint("omp", key) !== current) continue;
+          this.#database
+            .query("DELETE FROM adapter_checkpoints WHERE adapter = 'omp' AND checkpoint_key = ?")
+            .run(key);
+        }
+      }
+
+      this.#database
+        .query("INSERT INTO migration_markers (marker, completed_at) VALUES (?, ?)")
+        .run(marker, Date.now());
+      return removed;
     });
   }
 

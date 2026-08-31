@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Deliver complete Telegram responses when a streamed final answer exceeds one message.
+- Wait for active turns before switching forum-topic sessions, preserve one shared session for non-topic conversations, and reset ambiguous pre-release topic bindings once on upgrade.
 
 ## 0.3.2 (2026-08-30)
 

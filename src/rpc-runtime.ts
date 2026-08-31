@@ -220,6 +220,7 @@ export class RpcGatewayRuntime {
   #promptQueue: Promise<void> = Promise.resolve();
   #frameQueue: Promise<void> = Promise.resolve();
   #turnCardQueue: Promise<void> = Promise.resolve();
+  readonly #idleWaiters = new Set<PromiseWithResolvers<void>>();
 
   constructor(options: RpcGatewayRuntimeOptions, logger: RpcRuntimeLogger = console) {
     this.#options = options;
@@ -247,11 +248,13 @@ export class RpcGatewayRuntime {
     this.#ui?.shutdown();
     this.#ui = undefined;
     for (const execution of this.#hostTools.values()) execution.controller.abort();
-    await this.#setTurnLifecycle("interrupted", { error: "OMP runtime stopped" });
+    const stopped = new Error("OMP runtime stopped");
+    await this.#setTurnLifecycle("interrupted", { error: stopped.message });
     this.#hostTools.clear();
     const active = this.#activeTurn;
     this.#activeTurn = undefined;
-    active?.scheduledCompletion?.reject(new Error("OMP runtime stopped"));
+    active?.scheduledCompletion?.reject(stopped);
+    this.#failIdleWaiters(stopped);
     const rpc = this.#rpc;
     this.#rpc = undefined;
     await rpc?.stop();
@@ -276,6 +279,22 @@ export class RpcGatewayRuntime {
 
   isBusy(): boolean {
     return this.#activeTurn !== undefined || this.#status.state?.isStreaming === true;
+  }
+
+  async waitUntilIdle(): Promise<void> {
+    if (!this.#rpc?.running) throw new Error("OMP RPC is not running");
+    if (!this.isBusy()) return;
+    const waiter = Promise.withResolvers<void>();
+    this.#idleWaiters.add(waiter);
+    if (!this.isBusy()) {
+      this.#idleWaiters.delete(waiter);
+      return;
+    }
+    try {
+      await waiter.promise;
+    } finally {
+      this.#idleWaiters.delete(waiter);
+    }
   }
   async newSession(name?: string): Promise<boolean> {
     const data = await this.#requestData<{ cancelled: boolean }>({ type: "new_session" });
@@ -381,6 +400,7 @@ export class RpcGatewayRuntime {
     await this.#setTurnLifecycle("interrupted", { error: error.message });
     const active = this.#activeTurn;
     this.#activeTurn = undefined;
+    this.#failIdleWaiters(error);
     if (active) {
       active.scheduledCompletion?.reject(error);
       await this.#send(active, `OMP stopped unexpectedly: ${error.message}\n\nThe gateway will ${this.#options.config.autoRestart ? "restart it" : "remain offline"}.`).catch(() => {});
@@ -907,6 +927,7 @@ export class RpcGatewayRuntime {
     const state = await this.#requestData<RpcSessionState>({ type: "get_state" });
     this.#status.state = state;
     this.#persistSession(state);
+    this.#wakeIdleWaiters();
     return state;
   }
 
@@ -953,7 +974,20 @@ export class RpcGatewayRuntime {
   }
 
   #clearActiveDelivery(delivery: RpcGatewayUiTarget): void {
-    if (this.#activeTurn && this.#sameDelivery(this.#activeTurn, delivery)) this.#activeTurn = undefined;
+    if (!this.#activeTurn || !this.#sameDelivery(this.#activeTurn, delivery)) return;
+    this.#activeTurn = undefined;
+    this.#wakeIdleWaiters();
+  }
+
+  #wakeIdleWaiters(): void {
+    if (this.isBusy()) return;
+    for (const waiter of this.#idleWaiters) waiter.resolve();
+    this.#idleWaiters.clear();
+  }
+
+  #failIdleWaiters(error: Error): void {
+    for (const waiter of this.#idleWaiters) waiter.reject(error);
+    this.#idleWaiters.clear();
   }
 
   #sameDelivery(left: RpcGatewayUiTarget, right: RpcGatewayUiTarget): boolean {

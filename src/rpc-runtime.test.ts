@@ -293,6 +293,25 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("waits for an active turn to reach its terminal RPC event", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    await runtime.handleInbound(message("first", "Build this"));
+    const rpc = FakeOmpRpcClient.instances[0];
+    let idle = false;
+    const waiting = runtime.waitUntilIdle().then(() => {
+      idle = true;
+    });
+
+    await settle();
+    expect(idle).toBe(false);
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+    await waiting;
+
+    expect(idle).toBe(true);
+    await runtime.stop();
+  });
+
   test("waits for scheduled turns to finish before acknowledging dispatch", async () => {
     const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
     await runtime.start();
