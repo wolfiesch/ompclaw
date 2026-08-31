@@ -17,7 +17,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- Keep queued inbound messages pending until OMP dispatch so transport checkpoints cannot acknowledge in-memory-only work.
+- Persist full queued inbound requests before transport acknowledgement, retry dispatch failures without releasing deduplication claims, and replay pending work after restart.
 
 ## 0.4.0 (2026-08-30)
 

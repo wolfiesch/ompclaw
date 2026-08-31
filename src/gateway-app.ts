@@ -1,4 +1,5 @@
 import { join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { acquireLock, releaseLock, startLockHeartbeat } from "./api";
 import {
   gatewayRpcRuntimeConfig,
@@ -34,8 +35,10 @@ export interface GatewayApplicationStore extends Partial<GatewayScheduledJobStor
   resolvePrincipal(identity: TransportIdentity): Principal | undefined;
   getCheckpoint(adapter: string, key: string): JsonValue | undefined;
   setCheckpoint(adapter: string, key: string, value: JsonValue): void;
-  claimInboundMessage(transport: string, account: string, messageId: string, receivedAt: number): boolean;
-  releaseInboundMessage(transport: string, account: string, messageId: string): boolean;
+  claimInboundMessage: GatewayStore["claimInboundMessage"];
+  completeInboundMessage: GatewayStore["completeInboundMessage"];
+  listPendingInboundMessages: GatewayStore["listPendingInboundMessages"];
+  releaseInboundMessage: GatewayStore["releaseInboundMessage"];
   bindConversation(binding: ConversationBinding): void;
   getConversationBinding(address: InboundMessage["address"]): ConversationBinding | undefined;
   getSharedConversationSessionPath?(): string | undefined;
@@ -51,6 +54,8 @@ export interface GatewayRuntime {
   handleScheduled?(message: InboundMessage): Promise<void>;
   isBusy?(): boolean;
   waitUntilIdle?(): Promise<void>;
+  canHandleInboundImmediately?(message: InboundMessage): boolean;
+  notifyInboundQueued?(message: InboundMessage): Promise<void>;
   newSession?(name?: string): Promise<boolean>;
   switchSession?(sessionPath: string): Promise<boolean>;
 }
@@ -72,6 +77,8 @@ export interface GatewayApplicationSeams {
   readonly releaseLock?: (path: string) => void;
   readonly startLockHeartbeat?: (path: string) => () => void;
   readonly now?: () => number;
+  readonly inboundRetryDelayMs?: number;
+  readonly onInboundDispatchError?: (message: InboundMessage, error: unknown) => void;
 }
 
 export interface GatewayApplicationOptions {
@@ -109,7 +116,12 @@ export class GatewayApplication {
   #adapters: TransportAdapter[] = [];
   #sessionFile: string | undefined;
   #sharedSessionFile: string | undefined;
-  #inboundTail: Promise<void> = Promise.resolve();
+  #dispatchTail: Promise<void> = Promise.resolve();
+  #dispatchReady: Promise<void> = Promise.resolve();
+  #releaseDispatchReady: (() => void) | undefined;
+  #dispatchAbort: AbortController | undefined;
+  #pendingDispatches = new Map<string, Promise<void>>();
+  #queuedInboundCount = 0;
 
   constructor(options: GatewayApplicationOptions) {
     this.#config = options.config;
@@ -132,6 +144,13 @@ export class GatewayApplication {
     if (this.#state === "started") return;
     if (this.#state !== "idle") throw new Error(`OmpClaw application cannot start while ${this.#state}`);
     this.#state = "starting";
+    this.#dispatchTail = Promise.resolve();
+    this.#pendingDispatches.clear();
+    this.#queuedInboundCount = 0;
+    this.#dispatchAbort = new AbortController();
+    this.#dispatchReady = new Promise<void>((resolve) => {
+      this.#releaseDispatchReady = resolve;
+    });
 
     let lockHeld = false;
     try {
@@ -201,9 +220,14 @@ export class GatewayApplication {
       if (topicSessions && this.#sharedSessionFile === undefined) this.#sharedSessionFile = this.#sessionFile;
       this.#checkpointSession();
       this.#checkpointSharedSession();
+      for (const pending of store.listPendingInboundMessages()) {
+        this.#schedulePendingInbound(pending.message, false);
+      }
       await core.start(signal);
-      scheduler?.start();
       this.#state = "started";
+      this.#releaseDispatchReady?.();
+      this.#releaseDispatchReady = undefined;
+      scheduler?.start();
     } catch (error) {
       await this.#rollbackStart(lockHeld);
       throw error;
@@ -252,49 +276,108 @@ export class GatewayApplication {
   }
 
   async #handleInbound(message: InboundMessage): Promise<void> {
-    await this.#serializeInbound(() => this.#processInbound(message, false));
-  }
-
-  async #serializeInbound(operation: () => Promise<void>): Promise<void> {
-    const previous = this.#inboundTail;
-    let release: (() => void) | undefined;
-    this.#inboundTail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      await operation();
-    } finally {
-      release?.();
-    }
-  }
-
-  async #processInbound(message: InboundMessage, scheduled: boolean): Promise<void> {
     const store = this.#requireStore();
     const runtime = this.#requireRuntime();
-    const { transport, account } = message.address;
-    if (scheduled) store.releaseInboundMessage(transport, account, message.id);
-    if (!store.claimInboundMessage(transport, account, message.id, (this.#seams.now ?? Date.now)())) return;
+    if (!store.claimInboundMessage(message, (this.#seams.now ?? Date.now)())) return;
 
-    try {
-      const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
-      if (topicSessions) await this.#selectConversationSession(store, runtime, message);
-      if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
-      else await runtime.handleInbound(message);
-      const sessionFile = this.#sessionFile;
-      if (sessionFile === undefined) throw new Error("OMP runtime did not report its current session file");
-      store.bindConversation({
-        address: message.address,
-        ompSessionPath: sessionFile,
-        workspace: this.#config.workspace,
-      });
-      if (topicSessions && !this.#isTopicAddress(message.address)) this.#sharedSessionFile = sessionFile;
-      this.#checkpointSession();
-      this.#checkpointSharedSession();
-    } catch (error) {
-      store.releaseInboundMessage(transport, account, message.id);
-      throw error;
+    const immediate = runtime.canHandleInboundImmediately?.(message) === true;
+    const delayed = !immediate && (this.#queuedInboundCount > 0 || runtime.isBusy?.() === true);
+    const ready = delayed && runtime.notifyInboundQueued !== undefined
+      ? runtime.notifyInboundQueued(message).catch((error) => {
+          this.#reportInboundDispatchError(message, error);
+        })
+      : Promise.resolve();
+    this.#schedulePendingInbound(message, immediate, ready);
+    await ready;
+  }
+
+  #schedulePendingInbound(
+    message: InboundMessage,
+    immediate: boolean,
+    ready: Promise<void> = Promise.resolve(),
+  ): void {
+    const key = this.#inboundKey(message);
+    if (this.#pendingDispatches.has(key)) return;
+
+    let work: Promise<void>;
+    if (immediate) {
+      work = ready.then(() => this.#retryPendingInbound(message, true));
+    } else {
+      this.#queuedInboundCount += 1;
+      work = this.#dispatchTail
+        .then(() => ready)
+        .then(() => this.#retryPendingInbound(message, false))
+        .finally(() => {
+          this.#queuedInboundCount -= 1;
+        });
+      this.#dispatchTail = work.catch(() => undefined);
     }
+    this.#pendingDispatches.set(key, work);
+    void work
+      .finally(() => {
+        if (this.#pendingDispatches.get(key) === work) this.#pendingDispatches.delete(key);
+      })
+      .catch(() => undefined);
+  }
+
+  async #retryPendingInbound(message: InboundMessage, immediate: boolean): Promise<void> {
+    await this.#dispatchReady;
+    let retryDelay = this.#seams.inboundRetryDelayMs ?? 1_000;
+    while (this.#state === "starting" || this.#state === "started") {
+      try {
+        await this.#dispatchPendingInbound(message, immediate, false);
+        return;
+      } catch (error) {
+        this.#reportInboundDispatchError(message, error);
+        if (this.#state !== "starting" && this.#state !== "started") return;
+        try {
+          await delay(retryDelay, undefined, { signal: this.#dispatchAbort?.signal });
+        } catch {
+          return;
+        }
+        retryDelay = Math.min(retryDelay * 2, 15_000);
+      }
+    }
+  }
+
+  async #dispatchPendingInbound(message: InboundMessage, immediate: boolean, scheduled: boolean): Promise<void> {
+    const store = this.#requireStore();
+    const runtime = this.#requireRuntime();
+    if (!immediate) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
+
+    const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
+    if (topicSessions) await this.#selectConversationSession(store, runtime, message);
+    if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
+    else await runtime.handleInbound(message);
+
+    const sessionFile = this.#sessionFile;
+    if (sessionFile === undefined) throw new Error("OMP runtime did not report its current session file");
+    store.bindConversation({
+      address: message.address,
+      ompSessionPath: sessionFile,
+      workspace: this.#config.workspace,
+    });
+    if (topicSessions && !this.#isTopicAddress(message.address)) this.#sharedSessionFile = sessionFile;
+    this.#checkpointSession();
+    this.#checkpointSharedSession();
+    if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+      throw new Error(`Pending inbound message ${message.id} disappeared before completion`);
+    }
+  }
+
+  #inboundKey(message: InboundMessage): string {
+    return `${message.address.transport}\u0000${message.address.account}\u0000${message.id}`;
+  }
+
+  #reportInboundDispatchError(message: InboundMessage, error: unknown): void {
+    if (this.#seams.onInboundDispatchError !== undefined) {
+      this.#seams.onInboundDispatchError(message, error);
+      return;
+    }
+    console.warn(
+      `[ompclaw] inbound ${message.address.transport}/${message.address.account}/${message.id} dispatch failed; retrying:`,
+      error,
+    );
   }
 
   async #selectConversationSession(
@@ -355,12 +438,15 @@ export class GatewayApplication {
 
   async #dispatchScheduledJob(job: ScheduledJob, scheduledFor: number): Promise<void> {
     const runtime = this.#requireRuntime();
-    if (runtime.isBusy?.()) throw new ScheduledDispatchBusyError("OMP is serving another turn");
-    const principal = this.#requireStore().resolvePrincipal(job.identity);
+    if (runtime.isBusy?.() || this.#queuedInboundCount > 0) {
+      throw new ScheduledDispatchBusyError("OMP is serving another turn");
+    }
+    const store = this.#requireStore();
+    const principal = store.resolvePrincipal(job.identity);
     if (principal === undefined || principal.id !== job.principalId) {
       throw new Error(`Scheduled job ${job.id} no longer has an authorized principal`);
     }
-    await this.#serializeInbound(() => this.#processInbound({
+    const message: InboundMessage = {
       id: `scheduled:${job.id}:${scheduledFor}`,
       sentAt: scheduledFor,
       identity: job.identity,
@@ -373,7 +459,15 @@ export class GatewayApplication {
           job.prompt,
         ].join("\n\n"),
       },
-    }, true));
+    };
+    store.releaseInboundMessage(message.address.transport, message.address.account, message.id);
+    if (!store.claimInboundMessage(message, (this.#seams.now ?? Date.now)())) return;
+    try {
+      await this.#dispatchPendingInbound(message, false, true);
+    } catch (error) {
+      store.releaseInboundMessage(message.address.transport, message.address.account, message.id);
+      throw error;
+    }
   }
 
   async #notifyScheduledFailure(job: ScheduledJob, error: Error): Promise<void> {
@@ -400,8 +494,8 @@ export class GatewayApplication {
       this.#requireStore().setCheckpoint("omp", "shared_session_file", this.#sharedSessionFile);
     }
   }
-
   async #rollbackStart(lockHeld: boolean): Promise<void> {
+    this.#state = "stopping";
     await this.#stopResources(lockHeld);
     this.#state = "idle";
   }
@@ -409,6 +503,10 @@ export class GatewayApplication {
   async #stopResources(lockHeld = true): Promise<unknown> {
     let firstError: unknown;
     const remember = (error: unknown): void => { firstError ??= error; };
+    this.#dispatchAbort?.abort();
+    this.#dispatchAbort = undefined;
+    this.#releaseDispatchReady?.();
+    this.#releaseDispatchReady = undefined;
 
     const scheduler = this.#scheduler;
     this.#scheduler = undefined;
@@ -439,6 +537,12 @@ export class GatewayApplication {
         remember(error);
       }
     }
+
+    const pendingDispatches = [...this.#pendingDispatches.values()];
+    if (pendingDispatches.length > 0) await Promise.allSettled(pendingDispatches);
+    this.#pendingDispatches.clear();
+    this.#dispatchTail = Promise.resolve();
+    this.#queuedInboundCount = 0;
 
     const store = this.#store;
     this.#store = undefined;

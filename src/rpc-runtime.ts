@@ -365,6 +365,18 @@ export class RpcGatewayRuntime {
     return this.#currentTurnBusy() || this.#queuedConversationCount > 0;
   }
 
+  canHandleInboundImmediately(message: InboundMessage): boolean {
+    const parsed = parseSlashCommand(message.content.text);
+    if (parsed === undefined) return false;
+    const active = this.#activeTurn;
+    if (active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message))) return true;
+    return CROSS_DELIVERY_COMMANDS.has(parsed.name);
+  }
+
+  async notifyInboundQueued(message: InboundMessage): Promise<void> {
+    await this.#send(this.#deliveryFor(message), "Got it. I’m finishing another conversation, then I’ll handle this next.");
+  }
+
   async waitUntilIdle(): Promise<void> {
     if (!this.#rpc?.running) throw new Error("OMP RPC is not running");
     do {
