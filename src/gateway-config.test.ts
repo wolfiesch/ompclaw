@@ -87,6 +87,28 @@ describe("gateway config", () => {
     expect(() => telegram({ enabled: true, unknown: true })).toThrow("unknown key unknown");
   });
 
+  test("accepts stdout and Whisper-style Telegram transcription commands", () => {
+    const telegram = (transcribeCommand: unknown) => parseGatewayConfig({
+      transports: {
+        telegram: {
+          enabled: true,
+          account: "default",
+          tokenEnv: "TELEGRAM_BOT_TOKEN",
+          transcribeCommand,
+        },
+      },
+    }).transports.telegram;
+
+    expect(telegram(["transcribe", "{file}"])?.transcribeCommand).toEqual(["transcribe", "{file}"]);
+    expect(telegram(["whisper", "{file}", "--output_dir", "{outputDir}"])?.transcribeCommand).toEqual([
+      "whisper",
+      "{file}",
+      "--output_dir",
+      "{outputDir}",
+    ]);
+    expect(() => telegram(["transcribe"])).toThrow("{file}");
+  });
+
   test("accepts only credential environment names and never serializes their values", () => {
     const config = parseGatewayConfig({
       workspace: "~/workspace",
