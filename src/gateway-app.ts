@@ -222,7 +222,7 @@ export class GatewayApplication {
       this.#checkpointSession();
       this.#checkpointSharedSession();
       for (const pending of store.listPendingInboundMessages()) {
-        this.#schedulePendingInbound(pending.message, false);
+        if (!pending.scheduled) this.#schedulePendingInbound(pending.message, false);
       }
       await core.start(signal);
       this.#state = "started";
@@ -465,7 +465,7 @@ export class GatewayApplication {
       },
     };
     store.releaseInboundMessage(message.address.transport, message.address.account, message.id);
-    if (!store.claimInboundMessage(message, (this.#seams.now ?? Date.now)())) return;
+    if (!store.claimInboundMessage(message, (this.#seams.now ?? Date.now)(), true)) return;
     try {
       await this.#dispatchPendingInbound(message, false, true);
     } catch (error) {

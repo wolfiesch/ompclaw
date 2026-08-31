@@ -18,6 +18,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Persist full queued inbound requests before transport acknowledgement, retry dispatch failures without releasing deduplication claims, and replay pending work after restart.
+- Resume scheduler-owned pending attempts through scheduler accounting, preserve queued attachment files during inbox cleanup, and serialize session-mutating controls behind active work.
 
 ## 0.4.0 (2026-08-30)
 

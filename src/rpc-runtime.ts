@@ -271,6 +271,18 @@ function lifecycleLabel(state: TurnLifecycleState): string {
 }
 
 const CROSS_DELIVERY_COMMANDS = new Set(["start", "help", "status", "stop", "tasks", "todos", "jobs"]);
+const SAME_DELIVERY_IMMEDIATE_COMMANDS = new Set([
+  "start",
+  "help",
+  "status",
+  "stop",
+  "tasks",
+  "todos",
+  "jobs",
+  "steer",
+  "followup",
+  "abortbash",
+]);
 
 const TELEGRAM_PRESENTATION_CONTRACT = [
   "Telegram presentation is part of the trusted gateway contract:",
@@ -369,7 +381,9 @@ export class RpcGatewayRuntime {
     const parsed = parseSlashCommand(message.content.text);
     if (parsed === undefined) return false;
     const active = this.#activeTurn;
-    if (active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message))) return true;
+    if (active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message))) {
+      return SAME_DELIVERY_IMMEDIATE_COMMANDS.has(parsed.name);
+    }
     return CROSS_DELIVERY_COMMANDS.has(parsed.name);
   }
 

@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { TgMessage, TgUpdate } from "../../api";
-import type { JsonValue, PendingInteraction } from "../../gateway-store";
+import type { JsonValue, PendingInboundMessage, PendingInteraction } from "../../gateway-store";
 import type { ConversationAddress, DeliveryContext, InboundEnvelope, Principal, TransportStartContext } from "../../gateway-types";
 import { TelegramTransportAdapter, type TelegramPoller } from "./adapter";
 
@@ -29,6 +30,7 @@ class MemoryStore {
   readonly checkpoints = new Map<string, JsonValue>();
   readonly pending = new Map<string, PendingInteraction>();
   readonly writes: Array<{ adapter: string; key: string; value: JsonValue }> = [];
+  readonly pendingInbound: PendingInboundMessage[] = [];
   readonly #pendingWaiters = new Set<(interaction: PendingInteraction) => void>();
 
   getCheckpoint(adapter: string, key: string): JsonValue | undefined {
@@ -48,6 +50,10 @@ class MemoryStore {
 
   deletePendingInteraction(id: string): boolean {
     return this.pending.delete(id);
+  }
+
+  listPendingInboundMessages(): PendingInboundMessage[] {
+    return this.pendingInbound;
   }
 
   waitForPending(): Promise<PendingInteraction> {
@@ -419,6 +425,41 @@ describe("TelegramTransportAdapter inbound conversion", () => {
       expect.objectContaining({ name: "voice-voice-unique.ogg", mediaType: "audio/ogg", url: expect.stringMatching(/^file:\/\//) }),
     ]);
     expect(envelope.content.attachments?.[0].url).toContain(`${stateDir}/inbox/`);
+    await adapter.stop();
+  });
+
+
+  test("preserves inbox files referenced by pending durable messages during media pruning", async () => {
+    const { adapter, stateDir, store } = await fixture();
+    const inboxDir = join(stateDir, "inbox");
+    const protectedPath = join(inboxDir, "pending-photo.jpg");
+    await mkdir(inboxDir, { recursive: true });
+    await writeFile(protectedPath, new Uint8Array([9, 8, 7]));
+    await utimes(protectedPath, 0, 0);
+    store.pendingInbound.push({
+      message: {
+        id: "pending-photo",
+        sentAt: 1,
+        identity: { transport: "telegram", account: "default", subject: "42" },
+        address: privateAddress,
+        principal: owner,
+        content: {
+          attachments: [{ url: pathToFileURL(protectedPath).href, name: "pending-photo.jpg", mediaType: "image/jpeg" }],
+        },
+      },
+      receivedAt: 1,
+      scheduled: false,
+    });
+
+    await adapter.handleUpdate({
+      update_id: 2,
+      message: message({
+        message_id: 8,
+        photo: [{ file_id: "new-photo", file_unique_id: "new-photo", width: 100, height: 100, file_size: 3 }],
+      }),
+    });
+
+    expect(await Bun.file(protectedPath).exists()).toBe(true);
     await adapter.stop();
   });
 

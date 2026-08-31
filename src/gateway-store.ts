@@ -25,6 +25,7 @@ export interface PendingInteraction {
 export interface PendingInboundMessage {
   readonly message: InboundMessage;
   readonly receivedAt: number;
+  readonly scheduled: boolean;
 }
 
 export type TurnLifecycleState = "queued" | "running" | "completed" | "stopped" | "failed" | "interrupted";
@@ -617,6 +618,7 @@ export class GatewayStore {
         message_id TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         received_at INTEGER NOT NULL,
+        scheduled INTEGER NOT NULL DEFAULT 0 CHECK (scheduled IN (0, 1)),
         UNIQUE (transport, account, message_id),
         FOREIGN KEY (transport, account, message_id)
           REFERENCES inbound_messages (transport, account, message_id)
@@ -674,6 +676,14 @@ export class GatewayStore {
         completed_at INTEGER NOT NULL
       );
     `);
+    const pendingInboundColumns = this.#database
+      .query("PRAGMA table_info(pending_inbound_messages)")
+      .all() as SqlRow[];
+    if (!pendingInboundColumns.some((row) => row.name === "scheduled")) {
+      this.#database.exec(
+        "ALTER TABLE pending_inbound_messages ADD COLUMN scheduled INTEGER NOT NULL DEFAULT 0 CHECK (scheduled IN (0, 1))",
+      );
+    }
   }
 
   close(): void {
@@ -836,7 +846,7 @@ export class GatewayStore {
     return row === null ? undefined : decodeJson(row.value_json, "adapter checkpoint");
   }
 
-  claimInboundMessage(message: InboundMessage, receivedAt: number): boolean {
+  claimInboundMessage(message: InboundMessage, receivedAt: number, scheduled = false): boolean {
     validateInboundMessage(message);
     if (!Number.isSafeInteger(receivedAt)) {
       throw new Error("inbound message receivedAt must be an integer timestamp");
@@ -856,8 +866,8 @@ export class GatewayStore {
       this.#database
         .query(
           `INSERT INTO pending_inbound_messages
-             (transport, account, message_id, payload_json, received_at)
-           VALUES (?, ?, ?, ?, ?)`,
+             (transport, account, message_id, payload_json, received_at, scheduled)
+           VALUES (?, ?, ?, ?, ?, ?)`,
         )
         .run(
           transport,
@@ -865,6 +875,7 @@ export class GatewayStore {
           message.id,
           encodeJson(message as unknown as JsonValue, "inbound message"),
           receivedAt,
+          scheduled ? 1 : 0,
         );
       return true;
     });
@@ -885,7 +896,7 @@ export class GatewayStore {
   listPendingInboundMessages(): PendingInboundMessage[] {
     const rows = this.#database
       .query(
-        `SELECT payload_json, received_at
+        `SELECT payload_json, received_at, scheduled
          FROM pending_inbound_messages
          ORDER BY sequence ASC`,
       )
@@ -893,9 +904,13 @@ export class GatewayStore {
     return rows.map((row) => {
       const message = decodeJson(row.payload_json, "pending inbound message");
       validateInboundMessage(message);
+      if (row.scheduled !== 0 && row.scheduled !== 1) {
+        throw new Error("corrupt stored pending inbound message: scheduled is not boolean");
+      }
       return {
         message,
         receivedAt: storedTimestamp(row, "received_at", "pending inbound message"),
+        scheduled: row.scheduled === 1,
       };
     });
   }

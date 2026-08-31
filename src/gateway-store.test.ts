@@ -163,7 +163,7 @@ describe("GatewayStore", () => {
     const first = new GatewayStore(path);
     const contender = new GatewayStore(path);
 
-    expect(first.claimInboundMessage(claimedInbound("update-1"), 100)).toBe(true);
+    expect(first.claimInboundMessage(claimedInbound("update-1"), 100, true)).toBe(true);
     expect(contender.claimInboundMessage(claimedInbound("update-1"), 101)).toBe(false);
     const repeatedClaims = Array.from({ length: 16 }, (_, index) =>
       (index % 2 === 0 ? first : contender).claimInboundMessage(claimedInbound("update-2"), 102),
@@ -177,6 +177,7 @@ describe("GatewayStore", () => {
       "update-1",
       "update-1",
     ]);
+    expect(first.listPendingInboundMessages().map(({ scheduled }) => scheduled)).toEqual([true, false, false, false]);
     contender.close();
     first.close();
 
@@ -186,6 +187,7 @@ describe("GatewayStore", () => {
     expect(restarted.claimInboundMessage(claimedInbound("update-1", "websocket"), 107)).toBe(false);
     expect(restarted.claimInboundMessage(claimedInbound("update-3"), 108)).toBe(true);
     expect(restarted.listPendingInboundMessages()).toHaveLength(5);
+    expect(restarted.listPendingInboundMessages()[0]?.scheduled).toBe(true);
     expect(restarted.completeInboundMessage("telegram", "default", "update-1")).toBe(true);
     expect(restarted.completeInboundMessage("telegram", "default", "update-1")).toBe(false);
     expect(restarted.listPendingInboundMessages().map(({ message }) => message.id)).toEqual([

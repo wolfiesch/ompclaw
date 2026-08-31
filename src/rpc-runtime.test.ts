@@ -293,6 +293,9 @@ describe("RpcGatewayRuntime", () => {
     const rpc = FakeOmpRpcClient.instances[0];
     expect(runtime.isActiveConversation(first)).toBe(true);
     expect(runtime.isActiveConversation(second)).toBe(false);
+    expect(runtime.canHandleInboundImmediately(message("first", "/steer correct this"))).toBe(true);
+    expect(runtime.canHandleInboundImmediately(message("first", "/new"))).toBe(false);
+    expect(runtime.canHandleInboundImmediately(message("first", "/switch /sessions/other"))).toBe(false);
     expect(runtime.canHandleInboundImmediately(message("second", "/status"))).toBe(true);
     expect(runtime.canHandleInboundImmediately(second)).toBe(false);
 

@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
   Poller,
@@ -73,7 +73,10 @@ export interface TelegramTransportAdapterOptions {
   readonly token: string;
   readonly account?: string;
   readonly stateDir: string;
-  readonly store: Pick<GatewayStore, "getCheckpoint" | "setCheckpoint" | "putPendingInteraction" | "deletePendingInteraction">;
+  readonly store: Pick<
+    GatewayStore,
+    "getCheckpoint" | "setCheckpoint" | "putPendingInteraction" | "deletePendingInteraction" | "listPendingInboundMessages"
+  >;
   readonly transcribeCommand?: readonly string[];
   readonly logger?: Logger;
   readonly api?: TelegramApiSeams;
@@ -984,7 +987,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       const bytes = await this.#download(this.#token, rawFile.file_path);
       const extension = extname(media.name) || extname(rawFile.file_path) || ".bin";
       const name = `${this.#now()}-${safeFilename(media.uniqueId)}${extension}`;
-      const path = await storeInboxFile(this.#inboxDir, name, bytes);
+      const path = await storeInboxFile(this.#inboxDir, name, bytes, this.#pendingInboxPaths());
       return {
         path,
         voice: media.voice,
@@ -994,6 +997,21 @@ export class TelegramTransportAdapter implements TransportAdapter {
       this.#logger?.warn(`[telegram] media download failed: ${error instanceof Error ? error.message : String(error)}`);
       return undefined;
     }
+  }
+
+  #pendingInboxPaths(): ReadonlySet<string> {
+    const paths = new Set<string>();
+    for (const { message } of this.#store.listPendingInboundMessages()) {
+      for (const attachment of message.content.attachments ?? []) {
+        try {
+          const url = new URL(attachment.url);
+          if (url.protocol === "file:") paths.add(fileURLToPath(url));
+        } catch {
+          // Malformed URLs cannot name inbox files.
+        }
+      }
+    }
+    return paths;
   }
 
   async #transcript(path: string, signal?: AbortSignal): Promise<string | undefined> {

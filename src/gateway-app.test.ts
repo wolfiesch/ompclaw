@@ -11,7 +11,7 @@ import {
 } from "./gateway-app";
 import { parseGatewayConfig, type GatewayConfig } from "./gateway-config";
 import type { GatewayCoreOptions } from "./gateway-core";
-import { GatewayStore, type ConversationBinding, type JsonValue } from "./gateway-store";
+import { GatewayStore, type ConversationBinding, type JsonValue, type ScheduledJob } from "./gateway-store";
 import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
 import type { RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import { identityBind, migrateTelegram, principalAdd, telegramAllow } from "./rpc-cli";
@@ -83,7 +83,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 
 class MemoryStore implements GatewayApplicationStore {
   readonly claims = new Set<string>();
-  readonly pending = new Map<string, { readonly message: InboundMessage; readonly receivedAt: number }>();
+  readonly pending = new Map<string, { readonly message: InboundMessage; readonly receivedAt: number; readonly scheduled: boolean }>();
   readonly checkpoint = new Map<string, JsonValue>();
   readonly bindings: ConversationBinding[] = [];
   readonly releases: string[] = [];
@@ -106,11 +106,11 @@ class MemoryStore implements GatewayApplicationStore {
     this.checkpoint.set(`${adapterName}/${key}`, value);
   }
 
-  claimInboundMessage(message: InboundMessage, receivedAt: number) {
+  claimInboundMessage(message: InboundMessage, receivedAt: number, scheduled = false) {
     const key = `${message.address.transport}/${message.address.account}/${message.id}`;
     if (this.claims.has(key)) return false;
     this.claims.add(key);
-    this.pending.set(key, { message, receivedAt });
+    this.pending.set(key, { message, receivedAt, scheduled });
     return true;
   }
 
@@ -634,6 +634,81 @@ describe("GatewayApplication", () => {
     expect(handled).toEqual(["recovered"]);
     expect(store.pending.size).toBe(0);
     expect(store.claims).toContain("telegram/bot/recovered");
+    await app.stop();
+  });
+
+  test("reconciles recovered scheduled work through the scheduler attempt lifecycle", async () => {
+    const base = gatewayConfig();
+    const config: GatewayConfig = {
+      ...base,
+      automation: { enabled: true, pollIntervalMs: 1_000, retryDelayMs: 15_000, maxAttempts: 3 },
+    };
+    const store = new GatewayStore(join(config.stateDir, "ompclaw.sqlite"));
+    store.upsertPrincipal({ id: "operator", roles: ["operator"] });
+    store.bindIdentity({ transport: "telegram", account: "bot", subject: "42" }, "operator");
+    const scheduledFor = 1_000;
+    const job: ScheduledJob = {
+      id: "scheduled-job",
+      principalId: "operator",
+      identity: { transport: "telegram", account: "bot", subject: "42" },
+      address: { transport: "telegram", account: "bot", channel: "42" },
+      name: "Recovered job",
+      prompt: "Finish the recovered work",
+      schedule: { kind: "at", at: scheduledFor },
+      enabled: true,
+      nextRunAt: scheduledFor,
+      attemptCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    store.createScheduledJob(job);
+    expect(store.claimInboundMessage({
+      ...inbound(`scheduled:${job.id}:${scheduledFor}`),
+      sentAt: scheduledFor,
+    }, 1, true)).toBe(true);
+    const core = coreHarness([]);
+    const scheduled: string[] = [];
+    const interactive: string[] = [];
+    const app = new GatewayApplication({
+      config,
+      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      seams: {
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "scheduled",
+              sessionFile: "/sessions/scheduled",
+            });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            interactive.push(message.id);
+          },
+          async handleScheduled(message) {
+            scheduled.push(message.id);
+          },
+          isBusy: () => false,
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+        now: () => 2_000,
+      },
+    });
+
+    await app.start();
+    await waitFor(() => store.getScheduledJob(job.id)?.successCount === 1);
+    expect(scheduled).toEqual([`scheduled:${job.id}:${scheduledFor}`]);
+    expect(interactive).toEqual([]);
+    expect(store.listPendingInboundMessages()).toEqual([]);
     await app.stop();
   });
 
