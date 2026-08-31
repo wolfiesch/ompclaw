@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { TgError } from "./bot-api";
 import { Outbound, telegramDraftId } from "./delivery";
+import { TELEGRAM_MAX_CHARS } from "./formatting";
 import type { ConversationAddress, DeliveryContext } from "../../gateway-types";
 
 interface TelegramInvocation {
@@ -89,6 +90,28 @@ describe("Telegram outbound delivery", () => {
     expect(sends[0]?.payload.reply_to_message_id).toBe(12);
     expect(sends.slice(1).every((entry) => entry.payload.reply_to_message_id === undefined)).toBe(true);
     expect(receipt).toEqual({ transport: "telegram", messageId: "101" });
+  });
+
+  test("chunks direct UI text and keeps controls on the final message", async () => {
+    const { outbound, calls } = harness();
+    const replyMarkup = { inline_keyboard: [[{ text: "Approve", callback_data: "approve" }]] };
+    const receipt = await outbound.sendMessage(
+      address,
+      "x".repeat(TELEGRAM_MAX_CHARS + 200),
+      context,
+      {
+        replyTo: { transport: "telegram", messageId: "12" },
+        replyMarkup,
+      },
+    );
+    const sends = calls.filter((entry) => entry.method === "sendMessage");
+    expect(sends.length).toBeGreaterThan(1);
+    expect(sends.every((entry) => String(entry.payload.text).length <= TELEGRAM_MAX_CHARS)).toBe(true);
+    expect(sends[0]?.payload.reply_to_message_id).toBe(12);
+    expect(sends.slice(1).every((entry) => entry.payload.reply_to_message_id === undefined)).toBe(true);
+    expect(sends.slice(0, -1).every((entry) => entry.payload.reply_markup === undefined)).toBe(true);
+    expect(sends.at(-1)?.payload.reply_markup).toEqual(replyMarkup);
+    expect(receipt.messageId).toBe(String(100 + sends.length));
   });
 
   test("retries malformed Markdown once as plain text", async () => {

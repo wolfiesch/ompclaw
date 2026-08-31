@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.1 (2026-08-31)
+
+### Fixed
+
+- Continue Telegram polling when optional command-menu registration fails.
+- Decode queued attachment file URLs before inbox retention checks so encoded local paths remain protected.
+- Split oversized interactive UI messages within Telegram's text limit and keep controls on the final part.
+
 ## 0.6.0 (2026-08-31)
 
 ### Changed

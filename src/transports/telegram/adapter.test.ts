@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { PendingInteraction } from "../../gateway-store";
+import { pathToFileURL } from "node:url";
+import type { PendingInboundMessage, PendingInteraction } from "../../gateway-store";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -50,17 +51,36 @@ class TestPoller implements TelegramPoller {
 async function fixture(options: {
   readonly resolve?: (subject: string) => Principal | undefined;
   readonly commands?: readonly { readonly command: string; readonly description: string }[];
+  readonly setCommandsError?: Error;
   readonly transcribe?: boolean;
   readonly createTopicsFromRoot?: boolean;
   readonly failFirstReceive?: boolean;
+  readonly pendingAttachmentName?: string;
   readonly receive?: (message: InboundEnvelope) => Promise<void>;
 } = {}) {
-  const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-adapter-"));
+  const stateDir = await mkdtemp(join(tmpdir(), options.pendingAttachmentName ? "ompclaw adapter " : "ompclaw-adapter-"));
   scratch.push(stateDir);
   const calls: ApiCall[] = [];
   const received: InboundEnvelope[] = [];
   const checkpoints = new Map<string, unknown>();
   const pending = new Map<string, PendingInteraction>();
+  const pendingInbound: PendingInboundMessage[] = options.pendingAttachmentName === undefined ? [] : [{
+    message: {
+      id: "pending-message",
+      sentAt: 1_800_000_000_000,
+      identity: { transport: "telegram", account: "primary", subject: "42" },
+      address: baseAddress,
+      content: {
+        attachments: [{
+          url: pathToFileURL(join(stateDir, "inbox", options.pendingAttachmentName)).href,
+        }],
+      },
+      principal: owner,
+    },
+    receivedAt: 1_800_000_000_000,
+    scheduled: false,
+  }];
+  const warnings: string[] = [];
   const poller = new TestPoller();
   let messageId = 200;
   const key = (adapter: string, checkpoint: string): string => `${adapter}\0${checkpoint}`;
@@ -75,7 +95,13 @@ async function fixture(options: {
       setCheckpoint: (adapterId, checkpoint, value) => { checkpoints.set(key(adapterId, checkpoint), value); },
       putPendingInteraction: (interaction) => { pending.set(interaction.id, interaction); },
       deletePendingInteraction: (id) => { pending.delete(id); },
-      listPendingInboundMessages: () => [],
+      listPendingInboundMessages: () => pendingInbound,
+    },
+    logger: {
+      debug: () => {},
+      info: () => {},
+      warn: (message) => { warnings.push(message); },
+      error: () => {},
     },
     api: {
       poller,
@@ -86,6 +112,7 @@ async function fixture(options: {
       randomId: () => "interaction-id",
       callTelegram: async (method, payload = {}) => {
         calls.push({ method, payload });
+        if (method === "setMyCommands" && options.setCommandsError) throw options.setCommandsError;
         if (method === "sendMessageDraft") return true;
         if (method === "getFile") return { file_path: "uploads/file.bin" };
         if (method === "createForumTopic") return { message_thread_id: 77 };
@@ -109,7 +136,7 @@ async function fixture(options: {
     resolveIdentity: (identity) => options.resolve?.(identity.subject) ?? (identity.subject === "42" ? owner : undefined),
   };
   await adapter.start(context);
-  return { adapter, calls, checkpoints, pending, poller, received, stateDir };
+  return { adapter, calls, checkpoints, pending, poller, received, stateDir, warnings };
 }
 
 function message(overrides: Partial<TgMessage> = {}): TgMessage {
@@ -170,6 +197,16 @@ describe("Telegram transport lifecycle", () => {
     expect(poller.started).toBe(true);
     await adapter.stop();
     expect(poller.stopped).toBe(true);
+  });
+
+  test("continues polling when command-menu registration fails", async () => {
+    const { adapter, poller, warnings } = await fixture({
+      commands: [{ command: "home", description: "Open control center" }],
+      setCommandsError: new Error("menu unavailable"),
+    });
+    expect(poller.started).toBe(true);
+    expect(warnings).toEqual([expect.stringContaining("command menu registration failed: menu unavailable")]);
+    await adapter.stop();
   });
 
   test("waits for an in-flight polled update before shutdown completes", async () => {
@@ -283,6 +320,22 @@ describe("Telegram inbound conversion", () => {
     expect(attachment?.url.startsWith("file://")).toBe(true);
     if (!attachment) throw new Error("expected attachment");
     expect(await readFile(new URL(attachment.url))).toEqual(Buffer.from([4, 5, 6]));
+  });
+
+  test("retains queued attachments when file URLs contain encoded paths", async () => {
+    const queuedName = "queued file.bin";
+    const { adapter, stateDir } = await fixture({ pendingAttachmentName: queuedName });
+    const queuedPath = join(stateDir, "inbox", queuedName);
+    await writeFile(queuedPath, "queued");
+    await utimes(queuedPath, 0, 0);
+    await adapter.handleUpdate({
+      update_id: 9,
+      message: message({
+        text: undefined,
+        document: { file_id: "remote", file_unique_id: "new", file_name: "new.bin", file_size: 3 },
+      }),
+    });
+    expect(await readFile(queuedPath, "utf8")).toBe("queued");
   });
 
   test("adds voice transcription beside the saved attachment", async () => {

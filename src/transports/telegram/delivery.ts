@@ -135,6 +135,16 @@ function renderText(text: string, format: OutboundContent["format"]): readonly R
   }));
 }
 
+function renderDirectText(text: string, options: TelegramMessageOptions): readonly RenderedText[] {
+  const wireParts = chunkLabeled(text, TELEGRAM_MAX_CHARS, "newline");
+  const plainParts = chunkLabeled(options.plainFallbackText ?? text, TELEGRAM_MAX_CHARS, "newline");
+  return wireParts.map((wireText, index) => ({
+    wireText,
+    plainText: plainParts[index] ?? wireText,
+    parseMode: options.parseMode,
+  }));
+}
+
 function attachmentPath(url: string): string {
   let parsed: URL;
   try {
@@ -256,14 +266,15 @@ export class Outbound {
     signal?: AbortSignal,
   ): Promise<OutboundReceipt> {
     await this.#assertTarget(address, context);
-    const result = await this.#sendOneText(address, {
-      wireText: text,
-      plainText: options.plainFallbackText ?? text,
-      parseMode: options.parseMode,
-    }, {
-      replyTo: options.replyTo,
-      replyMarkup: options.replyMarkup,
-    }, signal);
+    const pieces = renderDirectText(text, options);
+    let result: OutboundReceipt | undefined;
+    for (let index = 0; index < pieces.length; index += 1) {
+      result = await this.#sendOneText(address, pieces[index]!, {
+        replyTo: index === 0 ? options.replyTo : undefined,
+        replyMarkup: index === pieces.length - 1 ? options.replyMarkup : undefined,
+      }, signal);
+    }
+    if (result === undefined) throw new Error("Telegram message text must not be empty");
     return result;
   }
 
