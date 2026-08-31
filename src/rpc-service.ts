@@ -1,4 +1,4 @@
-import { accessSync, constants, lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -16,7 +16,7 @@ export interface GatewayServicePaths {
 
 const SERVICE_NAME = "com.ompclaw";
 const SYSTEMD_UNIT = "ompclaw.service";
-const GATEWAY_COMMAND = "ompclaw";
+const GATEWAY_COMMAND = resolve(import.meta.dir, "rpc-cli.ts");
 
 function xml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
@@ -43,20 +43,6 @@ function systemdPath(value: string): string {
   return escaped;
 }
 
-function resolveCommand(command: string): string {
-  if (command.includes("/")) return command;
-  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
-    if (!directory) continue;
-    const candidate = join(directory, command);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      // Keep searching.
-    }
-  }
-  return command;
-}
 
 export function resolveGatewayServicePaths(
   configPath: string | undefined,
@@ -89,8 +75,8 @@ function servicePath(program: string): string {
   ])].join(delimiter);
 }
 
-function serviceArguments(paths: GatewayServicePaths): string[] {
-  return [resolveCommand(GATEWAY_COMMAND), "run", "--config", paths.configPath, "--env-file", paths.envFile];
+export function buildServiceArguments(paths: GatewayServicePaths): string[] {
+  return [GATEWAY_COMMAND, "run", "--config", paths.configPath, "--env-file", paths.envFile];
 }
 
 export function renderSystemdUnit(
@@ -139,7 +125,7 @@ export function installRpcService(
   envFile: string,
 ): ServiceInstallResult {
   const paths = resolveGatewayServicePaths(configPath, envFile);
-  const args = serviceArguments(paths);
+  const args = buildServiceArguments(paths);
   const logs = join(config.stateDir, "logs");
   mkdirSync(logs, { recursive: true, mode: 0o700 });
 
