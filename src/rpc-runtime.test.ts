@@ -367,15 +367,61 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
-  test("finishes the source reaction when the prompt response skips the agent", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+  test("dispatches a prompt without waiting for the receipt acknowledgement", async () => {
+    const acknowledgement = Promise.withResolvers<void>();
+    let acknowledgementStarted = false;
+    const runtime = new RpcGatewayRuntime({
+      config,
+      delivery: delivery(async (reaction) => {
+        if (reaction.emoji !== "👀") return;
+        acknowledgementStarted = true;
+        await acknowledgement.promise;
+      }),
+    });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0];
+    const sourceReceipt = { transport: "test", messageId: "source-acknowledgement" };
+
+    const inbound = runtime.handleInbound({ ...message("companion", "Start now"), sourceReceipt });
+    await waitFor(() => acknowledgementStarted);
+    const dispatchedWhileReactionPending = await waitFor(
+      () => rpc.sent.some((command) => command.type === "prompt"),
+    ).then(() => true, () => false);
+    acknowledgement.resolve();
+    await inbound;
+
+    expect(acknowledgementStarted).toBe(true);
+    expect(dispatchedWhileReactionPending).toBe(true);
+    await runtime.stop();
+  });
+
+  test("finishes a non-agent prompt without waiting for its terminal reaction", async () => {
+    const terminalReaction = Promise.withResolvers<void>();
+    let terminalReactionStarted = false;
+    const runtime = new RpcGatewayRuntime({
+      config,
+      delivery: delivery(async (reaction) => {
+        if (reaction.emoji !== "👍") return;
+        terminalReactionStarted = true;
+        await terminalReaction.promise;
+      }),
+    });
     await runtime.start();
     const rpc = FakeOmpRpcClient.instances[0];
     rpc.promptAgentInvoked = false;
     const sourceReceipt = { transport: "test", messageId: "source-no-agent" };
+    let inboundCompleted = false;
 
-    await runtime.handleInbound({ ...message("companion", "Handle without an agent"), sourceReceipt });
+    const inbound = runtime.handleInbound({ ...message("companion", "Handle without an agent"), sourceReceipt }).then(() => {
+      inboundCompleted = true;
+    });
+    await waitFor(() => terminalReactionStarted);
+    const completedWhileReactionPending = await waitFor(() => inboundCompleted).then(() => true, () => false);
+    terminalReaction.resolve();
+    await inbound;
 
+    expect(terminalReactionStarted).toBe(true);
+    expect(completedWhileReactionPending).toBe(true);
     expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
     expect(runtime.isBusy()).toBe(false);
     await runtime.stop();
@@ -426,9 +472,10 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
-  test("finishes the source reaction when a terminal prompt event skips the agent", async () => {
+  test("processes later frames while a terminal prompt reaction is pending", async () => {
     const terminalReaction = Promise.withResolvers<void>();
     let terminalReactionStarted = false;
+    const sessionStates: RpcSessionState[] = [];
     const runtime = new RpcGatewayRuntime({
       config,
       delivery: delivery(async (reaction) => {
@@ -436,6 +483,7 @@ describe("RpcGatewayRuntime", () => {
         terminalReactionStarted = true;
         await terminalReaction.promise;
       }),
+      onSessionState: (state) => sessionStates.push(state),
     });
     await runtime.start();
     const sourceReceipt = { transport: "test", messageId: "source-prompt-result" };
@@ -449,11 +497,17 @@ describe("RpcGatewayRuntime", () => {
     rpc.emit({ type: "prompt_result", agentInvoked: false });
     await waiting;
     expect(runtime.isBusy()).toBe(false);
-    await settle();
-    expect(terminalReactionStarted).toBe(true);
+    await waitFor(() => terminalReactionStarted);
+
+    rpc.state = { ...rpc.state, model: { provider: "provider", id: "after-reaction" } };
+    rpc.emit({ type: "model_changed" });
+    const processedWhileReactionPending = await waitFor(
+      () => sessionStates.some((state) => state.model?.id === "after-reaction"),
+    ).then(() => true, () => false);
     terminalReaction.resolve();
     await settle();
 
+    expect(processedWhileReactionPending).toBe(true);
     expect(rpc.state.isStreaming).toBe(false);
     expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
     await runtime.stop();
