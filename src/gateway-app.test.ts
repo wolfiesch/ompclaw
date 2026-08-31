@@ -434,7 +434,7 @@ describe("GatewayApplication", () => {
     await app.stop();
   });
 
-  test("does not rebind another topic when an immediate control bypasses session switching", async () => {
+  test("does not rebind an active topic when an immediate control overlaps a session switch", async () => {
     const store = new MemoryStore();
     const core = coreHarness([]);
     const base = gatewayConfig();
@@ -468,9 +468,15 @@ describe("GatewayApplication", () => {
           async stop() {},
           async handleInbound(message) {
             handled.push(message.id);
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "topic-c",
+              sessionFile: "/sessions/topic-c",
+            });
           },
           canHandleInboundImmediately: () => true,
-          isActiveConversation: () => false,
+          isActiveConversation: () => true,
         }),
         createTelegramAdapter: () => adapter("telegram"),
         acquireLock: () => ({ ok: true }),
@@ -487,13 +493,13 @@ describe("GatewayApplication", () => {
     await app.start();
     store.bindConversation({
       address: topicB.address,
-      ompSessionPath: "/sessions/topic-b",
+      ompSessionPath: "/sessions/topic-a",
       workspace: "/workspace/gateway",
     });
     await core.options().onInbound(topicB);
     await waitFor(() => store.pending.size === 0);
     expect(handled).toEqual(["topic-b-status"]);
-    expect(store.getConversationBinding(topicB.address)?.ompSessionPath).toBe("/sessions/topic-b");
+    expect(store.getConversationBinding(topicB.address)?.ompSessionPath).toBe("/sessions/topic-a");
     await app.stop();
   });
 

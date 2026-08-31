@@ -347,7 +347,7 @@ export class GatewayApplication {
     if (!immediate) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
 
     const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
-    const associateSession = !topicSessions || !immediate || runtime.isActiveConversation?.(message) === true;
+    const associateSession = !topicSessions || !immediate;
     if (topicSessions && !immediate) await this.#selectConversationSession(store, runtime, message);
     if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(message);
     else await runtime.handleInbound(message);
