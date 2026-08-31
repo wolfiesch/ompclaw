@@ -15,6 +15,10 @@ All notable changes to this project will be documented in this file.
 - Give Telegram turns a concise mobile response contract and require successful durable writes before acknowledging memory.
 - Queue authenticated conversations behind the active OMP turn instead of requiring users to resend after a busy response.
 
+### Fixed
+
+- Keep queued inbound messages pending until OMP dispatch so transport checkpoints cannot acknowledge in-memory-only work.
+
 ## 0.4.0 (2026-08-30)
 
 ### Added

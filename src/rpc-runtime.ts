@@ -350,8 +350,7 @@ export class RpcGatewayRuntime {
     }
     if (differentConversation || (active === undefined && this.#queuedConversationCount > 0)) {
       await this.#send(delivery, "Got it. I’m finishing another conversation, then I’ll handle this next.");
-      this.#enqueueConversation(message, delivery, parsed);
-      return;
+      return this.#enqueueConversation(message, delivery, parsed);
     }
 
     if (parsed && (await this.#handleCommand(delivery, parsed.name, parsed.args))) return;
@@ -397,23 +396,22 @@ export class RpcGatewayRuntime {
     message: InboundMessage,
     delivery: GatewayTurnTarget,
     parsed: ParsedCommand | undefined,
-  ): void {
+  ): Promise<void> {
     this.#queuedConversationCount += 1;
     const queued = this.#conversationQueue.then(async () => {
       await this.#waitUntilCurrentTurnIdle();
       if (parsed && (await this.#handleCommand(delivery, parsed.name, parsed.args))) return;
       await this.#startTurn(delivery, message);
       await this.#deliverPrompt(message, delivery);
-      await this.#waitUntilCurrentTurnIdle();
     });
-    this.#conversationQueue = queued
-      .catch(async (error: unknown) => {
-        const detail = error instanceof Error ? error.message : String(error);
-        await this.#send(delivery, `I couldn’t start that queued request: ${detail}`).catch(() => undefined);
-      })
-      .finally(() => {
-        this.#queuedConversationCount -= 1;
-      });
+    const settled = queued.finally(() => {
+      this.#queuedConversationCount -= 1;
+    });
+    this.#conversationQueue = settled.catch(async (error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      await this.#send(delivery, `I couldn’t start that queued request: ${detail}`).catch(() => undefined);
+    });
+    return settled;
   }
 
   async newSession(name?: string): Promise<boolean> {
