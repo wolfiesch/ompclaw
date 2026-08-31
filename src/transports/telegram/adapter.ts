@@ -14,6 +14,7 @@ import {
   type Logger,
   type TgCallbackQuery,
   type TgMessage,
+  type TgMessageGenerationStopped,
   type TgUpdate,
   withRateLimit,
 } from "../../api";
@@ -34,11 +35,12 @@ import type {
   UiResponseFor,
 } from "../../gateway-types";
 import { INBOX_MAX_FILE_BYTES, storeInboxFile } from "../../inbox";
-import { Outbound, type TelegramCall, type TelegramUpload } from "../../outbound";
+import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } from "../../outbound";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_UI_TIMEOUT_MS = 5 * 60 * 1000;
 const CALLBACK_PREFIX = "ompui";
+const TASK_STOP_CALLBACK = "ompctl:stop";
 
 export interface TelegramPoller {
   start(
@@ -91,12 +93,19 @@ interface PendingUi {
   removeAbortListener?: () => void;
 }
 
+interface PendingDraft {
+  readonly address: ConversationAddress;
+  readonly delivery: DeliveryContext;
+}
+
 interface Surface {
   title: string;
   editorText: string;
   readonly statuses: Map<string, string>;
   readonly widgets: Map<string, readonly string[]>;
   message?: OutboundReceipt;
+  delivery?: DeliveryContext;
+  stopControlVisible?: boolean;
 }
 
 interface MediaSpec {
@@ -261,6 +270,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #outbound: Outbound;
   readonly #pending = new Map<string, PendingUi>();
   readonly #surfaces = new Map<string, Surface>();
+  readonly #drafts = new Map<number, PendingDraft>();
   readonly #inflight = new Map<number, Promise<void>>();
   readonly #receivedUpdateIds: number[] = [];
   readonly #completedUpdateIds = new Set<number>();
@@ -331,6 +341,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     await Promise.allSettled([...this.#inflight.values()]);
     await Promise.allSettled([...this.#pending.values()].map((pending) => this.#finish(pending, undefined, true)));
     this.#pending.clear();
+    this.#drafts.clear();
     this.#releaseHeartbeat?.();
     this.#releaseHeartbeat = undefined;
     if (this.#lockPath) this.#releaseLock(this.#lockPath);
@@ -345,7 +356,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
     context: DeliveryContext,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt> {
-    return this.#outbound.send(address, content, context, signal);
+    const sent = await this.#outbound.send(address, content, context, signal);
+    const draftId = telegramDraftId(sent);
+    if (draftId !== undefined) this.#drafts.set(draftId, { address, delivery: context });
+    return sent;
   }
 
   async update(
@@ -355,7 +369,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
     context: DeliveryContext,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt> {
-    return this.#outbound.update(address, receipt, content, context, signal);
+    const updated = await this.#outbound.update(address, receipt, content, context, signal);
+    const priorDraftId = telegramDraftId(receipt);
+    const nextDraftId = telegramDraftId(updated);
+    if (priorDraftId !== undefined && nextDraftId === undefined) this.#drafts.delete(priorDraftId);
+    if (nextDraftId !== undefined) this.#drafts.set(nextDraftId, { address, delivery: context });
+    return updated;
   }
   async finalize(
     address: ConversationAddress,
@@ -364,7 +383,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
     context: DeliveryContext,
     signal?: AbortSignal,
   ): Promise<readonly OutboundReceipt[]> {
-    return this.#outbound.finalize(address, receipt, content, context, signal);
+    try {
+      return await this.#outbound.finalize(address, receipt, content, context, signal);
+    } finally {
+      const draftId = telegramDraftId(receipt);
+      if (draftId !== undefined) this.#drafts.delete(draftId);
+    }
   }
 
   async react(
@@ -437,6 +461,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
   }
 
   async #handleUpdate(update: TgUpdate): Promise<void> {
+    if (update.stopped_message_generation) {
+      await this.#handleGenerationStopped(update.stopped_message_generation, update.update_id);
+      return;
+    }
     if (update.callback_query) {
       if (await this.#handleCallback(update.callback_query)) return;
       return;
@@ -468,13 +496,45 @@ export class TelegramTransportAdapter implements TransportAdapter {
         ...(attachment === undefined ? {} : { attachments: [attachment.attachment] }),
       },
       ...(message.reply_to_message === undefined ? {} : { replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) } }),
+      sourceReceipt: { transport: "telegram", messageId: String(message.message_id) },
       edited: message.edited_flag === true,
     };
     await context.receive(envelope, context.signal);
   }
 
+  async #handleGenerationStopped(stopped: TgMessageGenerationStopped, updateId: number): Promise<void> {
+    if (stopped.chat.type !== "private") return;
+    const pending = this.#drafts.get(stopped.draft_id);
+    if (!pending) return;
+    const address: ConversationAddress = {
+      transport: "telegram",
+      account: this.#account,
+      channel: String(stopped.chat.id),
+      ...(stopped.message_thread_id === undefined ? {} : { thread: String(stopped.message_thread_id) }),
+    };
+    if (!sameAddress(address, pending.address)) return;
+
+    const context = this.#assertStarted();
+    const identity = identityFor(stopped.chat.id, this.#account);
+    const principal = await context.resolveIdentity(identity, context.signal);
+    if (principal?.id !== pending.delivery.principal.id) return;
+
+    this.#drafts.delete(stopped.draft_id);
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:draft-stop:${stopped.draft_id}:${updateId}`,
+        sentAt: this.#now(),
+        identity,
+        address,
+        content: { text: "/stop" },
+      },
+      context.signal,
+    );
+  }
+
   async #handleCallback(query: TgCallbackQuery): Promise<boolean> {
     const data = query.data;
+    if (data === TASK_STOP_CALLBACK) return this.#handleTaskStop(query);
     if (!data?.startsWith(`${CALLBACK_PREFIX}:`)) return false;
     const [, id, action] = data.split(":", 3);
     const pending = id === undefined ? undefined : this.#pending.get(id);
@@ -535,6 +595,41 @@ export class TelegramTransportAdapter implements TransportAdapter {
     else pending.selected.add(index);
     await this.#answerCallback(query.id, pending.selected.has(index) ? "Selected" : "Removed");
     await this.#outbound.setReplyMarkup(pending.address, pending.message, this.#keyboard(pending), pending.delivery, context.signal);
+    return true;
+  }
+
+  async #handleTaskStop(query: TgCallbackQuery): Promise<boolean> {
+    if (!query.message) {
+      await this.#answerCallback(query.id, "This control has expired.", true);
+      return true;
+    }
+    const address = addressFor(query.message, this.#account);
+    const surface = this.#surfaces.get(`${address.channel}:${address.thread ?? ""}`);
+    const task = surface?.statuses.get("Task");
+    if (
+      !surface?.message ||
+      query.message.message_id !== Number(surface.message.messageId) ||
+      !task ||
+      !/^(Queued|Running)(?:\n|$)/.test(task)
+    ) {
+      await this.#answerCallback(query.id, "This task is no longer running.", true);
+      return true;
+    }
+    const context = this.#assertStarted();
+    const identity = identityFor(query.from.id, this.#account);
+    const principal = await context.resolveIdentity(identity, context.signal);
+    if (!principal || principal.id !== surface.delivery?.principal.id) {
+      await this.#answerCallback(query.id, "This control belongs to another user.", true);
+      return true;
+    }
+    await context.receive({
+      id: `telegram:${this.#account}:task-stop:${query.id}`,
+      sentAt: this.#now(),
+      identity,
+      address,
+      content: { text: "/stop" },
+    }, context.signal);
+    await this.#answerCallback(query.id, "Stop requested");
     return true;
   }
 
@@ -619,6 +714,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       surface = { title: "OMP", editorText: "", statuses: new Map(), widgets: new Map() };
       this.#surfaces.set(key, surface);
     }
+    surface.delivery = delivery;
     if (request.type === "status") {
       if (request.text === undefined) surface.statuses.delete(request.key);
       else surface.statuses.set(request.key, request.text);
@@ -629,16 +725,33 @@ export class TelegramTransportAdapter implements TransportAdapter {
     else surface.editorText = request.text;
 
     const text = this.#surfaceText(surface);
+    const stopControlVisible = /^(Queued|Running)(?:\n|$)/.test(surface.statuses.get("Task") ?? "");
+    const replyMarkup = stopControlVisible
+      ? { inline_keyboard: [[{ text: "Stop", callback_data: TASK_STOP_CALLBACK }]] }
+      : { inline_keyboard: [] };
     if (surface.message) {
       try {
         surface.message = await this.#outbound.update(address, surface.message, { text, format: "text" }, delivery, signal);
-        return;
       } catch (error) {
         this.#logger?.warn(`[telegram] could not edit UI surface: ${error instanceof Error ? error.message : String(error)}`);
+        surface.message = undefined;
+      }
+      if (surface.message) {
+        if (surface.stopControlVisible !== stopControlVisible) {
+          try {
+            await this.#outbound.setReplyMarkup(address, surface.message, replyMarkup, delivery, signal);
+          } catch (error) {
+            this.#logger?.warn(`[telegram] could not edit UI controls: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        surface.stopControlVisible = stopControlVisible;
+        return;
       }
     }
-    surface.message = await this.#outbound.sendMessage(address, text, delivery, {}, signal);
+    surface.message = await this.#outbound.sendMessage(address, text, delivery, { replyMarkup }, signal);
+    surface.stopControlVisible = stopControlVisible;
   }
+
 
   #surfaceText(surface: Surface): string {
     const lines = [`Surface: ${surface.title}`];

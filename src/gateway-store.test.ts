@@ -334,6 +334,52 @@ describe("GatewayStore", () => {
     restarted.close();
   });
 
+  test("persists task lifecycle transitions and interrupts unfinished turns after restart", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    first.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    first.putTurnLifecycle({
+      id: "turn-running",
+      principalId: "operator-42",
+      address: ownerAddress,
+      prompt: "Inspect the deployment",
+      state: "running",
+      currentTool: "bash",
+      createdAt: 100,
+      updatedAt: 200,
+    });
+    first.putTurnLifecycle({
+      id: "turn-complete",
+      principalId: "operator-42",
+      address: { ...ownerAddress, thread: "topic-1" },
+      prompt: "Summarize the release",
+      state: "completed",
+      createdAt: 300,
+      updatedAt: 400,
+      finishedAt: 400,
+    });
+    first.close();
+
+    const restarted = new GatewayStore(path);
+    expect(restarted.interruptActiveTurns(500)).toBe(1);
+    expect(restarted.listTurnLifecycles(ownerAddress)).toEqual([
+      {
+        id: "turn-running",
+        principalId: "operator-42",
+        address: ownerAddress,
+        prompt: "Inspect the deployment",
+        state: "interrupted",
+        createdAt: 100,
+        updatedAt: 500,
+        finishedAt: 500,
+      },
+    ]);
+    expect(restarted.listTurnLifecycles({ ...ownerAddress, thread: "topic-1" })).toEqual([
+      expect.objectContaining({ id: "turn-complete", state: "completed" }),
+    ]);
+    restarted.close();
+  });
+
   test("imports legacy Telegram state once without ingesting a token or changing the source files", () => {
     const databasePath = temporaryDatabase();
     const directory = dirname(databasePath);

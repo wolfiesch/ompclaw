@@ -22,6 +22,27 @@ export interface PendingInteraction {
   readonly expiresAt?: number;
 }
 
+export type TurnLifecycleState = "queued" | "running" | "completed" | "stopped" | "failed" | "interrupted";
+
+export interface TurnLifecycle {
+  readonly id: string;
+  readonly principalId: string;
+  readonly address: ConversationAddress;
+  readonly prompt: string;
+  readonly state: TurnLifecycleState;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly currentTool?: string;
+  readonly finishedAt?: number;
+  readonly error?: string;
+}
+
+export interface GatewayTurnLifecycleStore {
+  putTurnLifecycle(turn: TurnLifecycle): void;
+  interruptActiveTurns(interruptedAt: number): number;
+  listTurnLifecycles(address: ConversationAddress, limit?: number): TurnLifecycle[];
+}
+
 export type ScheduledJobSchedule =
   | { readonly kind: "at"; readonly at: number }
   | { readonly kind: "cron"; readonly expression: string; readonly timezone?: string | undefined };
@@ -267,6 +288,78 @@ function decodeScheduledJob(row: SqlRow): ScheduledJob {
   };
 }
 
+function decodeTurnLifecycle(row: SqlRow): TurnLifecycle {
+  const context = "turn lifecycle";
+  const state = storedString(row, "state", context);
+  if (!["queued", "running", "completed", "stopped", "failed", "interrupted"].includes(state)) {
+    throw new Error("corrupt stored turn lifecycle: invalid state");
+  }
+  const thread = storedString(row, "thread", context);
+  const currentTool = row.current_tool;
+  const error = row.error;
+  if (currentTool !== null && typeof currentTool !== "string") {
+    throw new Error("corrupt stored turn lifecycle: current_tool is not text");
+  }
+  if (error !== null && typeof error !== "string") {
+    throw new Error("corrupt stored turn lifecycle: error is not text");
+  }
+  const finishedAt = optionalStoredTimestamp(row, "finished_at", context);
+  return {
+    id: storedString(row, "id", context),
+    principalId: storedString(row, "principal_id", context),
+    address: {
+      transport: storedString(row, "transport", context),
+      account: storedString(row, "account", context),
+      channel: storedString(row, "channel", context),
+      ...(thread === "" ? {} : { thread }),
+    },
+    prompt: storedString(row, "prompt", context),
+    state: state as TurnLifecycleState,
+    createdAt: storedTimestamp(row, "created_at", context),
+    updatedAt: storedTimestamp(row, "updated_at", context),
+    ...(currentTool === null ? {} : { currentTool }),
+    ...(finishedAt === undefined ? {} : { finishedAt }),
+    ...(error === null ? {} : { error }),
+  };
+}
+
+function validateTurnLifecycle(turn: TurnLifecycle): void {
+  requiredText(turn.id, "turn lifecycle id");
+  requiredText(turn.principalId, "turn lifecycle principal");
+  validateAddress(turn.address);
+  requiredText(turn.prompt, "turn lifecycle prompt");
+  if (!["queued", "running", "completed", "stopped", "failed", "interrupted"].includes(turn.state)) {
+    throw new Error("turn lifecycle state is invalid");
+  }
+  for (const [label, value] of [
+    ["created", turn.createdAt],
+    ["updated", turn.updatedAt],
+    ["finished", turn.finishedAt],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new Error(`turn lifecycle ${label} timestamp must be a safe nonnegative integer`);
+    }
+  }
+  if (turn.currentTool !== undefined) requiredText(turn.currentTool, "turn lifecycle current tool");
+  if (turn.error !== undefined) requiredText(turn.error, "turn lifecycle error");
+}
+
+const TURN_LIFECYCLE_FIELDS = [
+  "id",
+  "principal_id",
+  "transport",
+  "account",
+  "channel",
+  "thread",
+  "prompt",
+  "state",
+  "current_tool",
+  "created_at",
+  "updated_at",
+  "finished_at",
+  "error",
+].join(", ");
+
 const SCHEDULED_JOB_FIELDS = [
   "id",
   "principal_id",
@@ -477,6 +570,25 @@ export class GatewayStore {
       CREATE INDEX IF NOT EXISTS scheduled_jobs_due
         ON scheduled_jobs (enabled, retry_at, next_run_at);
 
+      CREATE TABLE IF NOT EXISTS turn_lifecycles (
+        id TEXT PRIMARY KEY NOT NULL,
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+        transport TEXT NOT NULL,
+        account TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'stopped', 'failed', 'interrupted')),
+        current_tool TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        error TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS turn_lifecycles_address_created
+        ON turn_lifecycles (transport, account, channel, thread, created_at DESC);
+
       CREATE TABLE IF NOT EXISTS migration_markers (
         marker TEXT PRIMARY KEY NOT NULL,
         completed_at INTEGER NOT NULL
@@ -667,6 +779,74 @@ export class GatewayStore {
     }
 
     return this.#database.query("DELETE FROM inbound_messages WHERE received_at < ?").run(before).changes;
+  }
+
+  putTurnLifecycle(turn: TurnLifecycle): void {
+    validateTurnLifecycle(turn);
+    this.#database
+      .query(
+        `INSERT INTO turn_lifecycles (
+           id, principal_id, transport, account, channel, thread, prompt, state,
+           current_tool, created_at, updated_at, finished_at, error
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           principal_id = excluded.principal_id,
+           transport = excluded.transport,
+           account = excluded.account,
+           channel = excluded.channel,
+           thread = excluded.thread,
+           prompt = excluded.prompt,
+           state = excluded.state,
+           current_tool = excluded.current_tool,
+           updated_at = excluded.updated_at,
+           finished_at = excluded.finished_at,
+           error = excluded.error`,
+      )
+      .run(
+        turn.id,
+        turn.principalId,
+        turn.address.transport,
+        turn.address.account,
+        turn.address.channel,
+        turn.address.thread ?? "",
+        turn.prompt,
+        turn.state,
+        turn.currentTool ?? null,
+        turn.createdAt,
+        turn.updatedAt,
+        turn.finishedAt ?? null,
+        turn.error ?? null,
+      );
+  }
+
+  interruptActiveTurns(interruptedAt: number): number {
+    if (!Number.isSafeInteger(interruptedAt) || interruptedAt < 0) {
+      throw new Error("turn lifecycle interrupted timestamp must be a safe nonnegative integer");
+    }
+    return this.#database
+      .query(
+        `UPDATE turn_lifecycles
+         SET state = 'interrupted', current_tool = NULL, updated_at = ?, finished_at = ?
+         WHERE state IN ('queued', 'running')`,
+      )
+      .run(interruptedAt, interruptedAt).changes;
+  }
+
+  listTurnLifecycles(address: ConversationAddress, limit = 10): TurnLifecycle[] {
+    validateAddress(address);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("turn lifecycle limit must be an integer from 1 to 100");
+    }
+    const rows = this.#database
+      .query(
+        `SELECT ${TURN_LIFECYCLE_FIELDS}
+         FROM turn_lifecycles
+         WHERE transport = ? AND account = ? AND channel = ? AND thread = ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(address.transport, address.account, address.channel, address.thread ?? "", limit) as SqlRow[];
+    return rows.map(decodeTurnLifecycle);
   }
 
   putPendingInteraction(interaction: PendingInteraction): void {

@@ -84,6 +84,17 @@ export class InboundReplyReceiptTransportMismatchError extends Error {
     super(`Inbound reply receipt transport ${actualTransport} does not match address transport ${expectedTransport}`);
   }
 }
+export class InboundSourceReceiptTransportMismatchError extends Error {
+  readonly name = "InboundSourceReceiptTransportMismatchError";
+
+  constructor(
+    readonly expectedTransport: string,
+    readonly actualTransport: string,
+  ) {
+    super(`Inbound source receipt transport ${actualTransport} does not match address transport ${expectedTransport}`);
+  }
+}
+
 
 
 export class InboundTransportMismatchError extends Error {
@@ -351,6 +362,9 @@ export class GatewayCore {
     }
     if (envelope.replyTo !== undefined && envelope.replyTo.transport !== envelope.address.transport) {
       throw new InboundReplyReceiptTransportMismatchError(envelope.address.transport, envelope.replyTo.transport);
+    }
+    if (envelope.sourceReceipt !== undefined && envelope.sourceReceipt.transport !== envelope.address.transport) {
+      throw new InboundSourceReceiptTransportMismatchError(envelope.address.transport, envelope.sourceReceipt.transport);
     }
   }
 

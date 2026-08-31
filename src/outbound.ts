@@ -1,3 +1,4 @@
+import { randomInt } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { extname } from "node:path";
@@ -20,6 +21,8 @@ const PHOTO_EXTENSIONS: Record<string, true> = {
   ".png": true,
   ".webp": true,
 };
+const DRAFT_RECEIPT_PREFIX = "draft:";
+const TYPING_RECEIPT_PREFIX = "typing:";
 
 export interface TelegramRequestOptions {
   readonly signal?: AbortSignal;
@@ -60,6 +63,7 @@ export interface OutboundOptions {
   readonly logger?: Logger;
   readonly callTelegram?: TelegramCall;
   readonly uploadTelegram?: TelegramUpload;
+  readonly nextDraftId?: () => number;
 }
 
 interface TelegramMessage {
@@ -87,6 +91,22 @@ function messageId(value: OutboundReceipt): number {
   const id = Number(value.messageId);
   if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Telegram message receipt must contain a positive numeric id");
   return id;
+}
+
+export function telegramDraftId(value: OutboundReceipt | undefined): number | undefined {
+  if (value?.transport !== "telegram" || !value.messageId.startsWith(DRAFT_RECEIPT_PREFIX)) return undefined;
+  const id = Number(value.messageId.slice(DRAFT_RECEIPT_PREFIX.length));
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
+function typingId(value: OutboundReceipt | undefined): number | undefined {
+  if (value?.transport !== "telegram" || !value.messageId.startsWith(TYPING_RECEIPT_PREFIX)) return undefined;
+  const id = Number(value.messageId.slice(TYPING_RECEIPT_PREFIX.length));
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
+function transientReceipt(prefix: string, id: number): OutboundReceipt {
+  return { transport: "telegram", messageId: `${prefix}${id}` };
 }
 
 function contentText(content: OutboundContent): string | undefined {
@@ -124,6 +144,14 @@ function isMarkdownParseError(error: unknown): boolean {
 function isMessageNotModifiedError(error: unknown): boolean {
   return error instanceof TgError && error.code === 400 && /message is not modified/i.test(error.message);
 }
+function isDraftUnsupportedError(error: unknown): boolean {
+  return error instanceof TgError && error.code === 400 && /method.*not found|private chat|not supported|draft/i.test(error.message);
+}
+
+function draftText(text: string): string {
+  if (text.length <= TELEGRAM_MAX_CHARS) return text;
+  return `…${text.slice(-(TELEGRAM_MAX_CHARS - 1))}`;
+}
 
 
 /**
@@ -137,6 +165,8 @@ export class Outbound {
   readonly #logger?: Logger;
   readonly #callTelegram: TelegramCall;
   readonly #uploadTelegram: TelegramUpload;
+  readonly #nextDraftId: () => number;
+  readonly #typingTimers = new Map<number, NodeJS.Timeout>();
 
   constructor(options: OutboundOptions) {
     if (!options.token) throw new Error("Telegram bot token is required");
@@ -151,6 +181,7 @@ export class Outbound {
       options.uploadTelegram ??
       ((method, fields, file, requestOptions) =>
         tgUpload(this.#token, method, fields, file, undefined, requestOptions?.signal));
+    this.#nextDraftId = options.nextDraftId ?? (() => randomInt(1, 2_147_483_647));
   }
 
   async send(
@@ -162,6 +193,9 @@ export class Outbound {
     await this.#assertAddress(address, context);
     signal?.throwIfAborted();
 
+    if (content.transient === true && !content.attachments?.length) {
+      return this.#sendTransient(address, contentText(content) ?? "", content, context, signal);
+    }
     const text = contentText(content);
     let first: OutboundReceipt | undefined;
     if (text !== undefined && text.length > 0) {
@@ -192,6 +226,27 @@ export class Outbound {
   ): Promise<OutboundReceipt> {
     await this.#assertAddress(address, context);
     signal?.throwIfAborted();
+    const draftId = telegramDraftId(target);
+    if (draftId !== undefined) {
+      try {
+        await this.#sendDraft(address, draftId, contentText(content) ?? "", signal);
+        return target;
+      } catch (error) {
+        if (!isDraftUnsupportedError(error)) throw error;
+        const text = contentText(content) ?? "";
+        return text.length === 0
+          ? this.#startTyping(address, draftId, signal)
+          : this.send(address, { ...content, transient: false }, context, signal);
+      }
+    }
+    const pendingTypingId = typingId(target);
+    if (pendingTypingId !== undefined) {
+      this.#stopTyping(pendingTypingId);
+      const text = contentText(content) ?? "";
+      return text.length === 0
+        ? this.#startTyping(address, pendingTypingId, signal)
+        : this.send(address, { ...content, transient: false }, context, signal);
+    }
     if (content.attachments?.length) throw new Error("Telegram message updates cannot replace attachments");
     const text = contentText(content);
     if (text === undefined) throw new Error("Telegram message updates require text");
@@ -210,6 +265,9 @@ export class Outbound {
     await this.#assertAddress(address, context);
     signal?.throwIfAborted();
     if (target === undefined) return [await this.send(address, content, context, signal)];
+    const draftId = telegramDraftId(target);
+    const pendingTypingId = typingId(target);
+    if (pendingTypingId !== undefined) this.#stopTyping(pendingTypingId);
 
     const text = contentText(content);
     const parts = text === undefined ? [] : this.#textParts(text, content.format);
@@ -217,9 +275,19 @@ export class Outbound {
       throw new Error("Telegram finalization requires text or at least one attachment");
     }
 
-    const receipts: OutboundReceipt[] = [target];
+    const receipts: OutboundReceipt[] = draftId !== undefined || pendingTypingId !== undefined ? [] : [target];
     const first = parts[0];
-    if (first !== undefined) await this.#editTextPart(address, target, first, true, signal);
+    if (first !== undefined) {
+      if (draftId !== undefined || pendingTypingId !== undefined) {
+        receipts.push(await this.sendMessage(address, first.text, context, {
+          ...(first.parseMode === "MarkdownV2"
+            ? { parseMode: "MarkdownV2" as const, plainFallbackText: first.plainFallbackText }
+            : {}),
+        }, signal));
+      } else {
+        await this.#editTextPart(address, target, first, true, signal);
+      }
+    }
     for (const part of parts.slice(1)) {
       receipts.push(await this.sendMessage(address, part.text, context, {
         ...(part.parseMode === "MarkdownV2"
@@ -305,6 +373,84 @@ export class Outbound {
       { chat_id: address.channel, message_id: messageId(target), reply_markup: replyMarkup },
       signal,
     );
+  }
+
+  async #sendTransient(
+    address: ConversationAddress,
+    text: string,
+    content: OutboundContent,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<OutboundReceipt> {
+    const id = this.#nextDraftId();
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Telegram draft ID must be a positive safe integer");
+    try {
+      await this.#sendDraft(address, id, text, signal);
+      return transientReceipt(DRAFT_RECEIPT_PREFIX, id);
+    } catch (error) {
+      if (!isDraftUnsupportedError(error)) throw error;
+      if (text.length > 0) return this.send(address, { ...content, transient: false }, context, signal);
+      return this.#startTyping(address, id, signal);
+    }
+  }
+
+  async #sendDraft(
+    address: ConversationAddress,
+    draftId: number,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const result = await this.#request(
+      "sendMessageDraft",
+      {
+        chat_id: address.channel,
+        ...(messageThread(address) === undefined ? {} : { message_thread_id: messageThread(address) }),
+        draft_id: draftId,
+        text: draftText(text),
+        can_stop: true,
+        keep_on_stop: true,
+      },
+      signal,
+    );
+    if (result !== true) throw new Error("Telegram sendMessageDraft did not return true");
+  }
+
+  async #startTyping(
+    address: ConversationAddress,
+    id: number,
+    signal?: AbortSignal,
+  ): Promise<OutboundReceipt> {
+    await this.#request(
+      "sendChatAction",
+      {
+        chat_id: address.channel,
+        ...(messageThread(address) === undefined ? {} : { message_thread_id: messageThread(address) }),
+        action: "typing",
+      },
+      signal,
+    );
+    this.#stopTyping(id);
+    const timer = setInterval(() => {
+      void this.#request(
+        "sendChatAction",
+        {
+          chat_id: address.channel,
+          ...(messageThread(address) === undefined ? {} : { message_thread_id: messageThread(address) }),
+          action: "typing",
+        },
+      ).catch((error: unknown) => {
+        this.#logger?.warn(`[telegram] could not refresh typing action: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, 4_000);
+    timer.unref?.();
+    this.#typingTimers.set(id, timer);
+    return transientReceipt(TYPING_RECEIPT_PREFIX, id);
+  }
+
+  #stopTyping(id: number): void {
+    const timer = this.#typingTimers.get(id);
+    if (timer !== undefined) clearInterval(timer);
+    this.#typingTimers.delete(id);
   }
 
   async #editTextPart(

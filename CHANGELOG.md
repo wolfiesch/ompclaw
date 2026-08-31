@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Persist queued, running, tool, completed, stopped, failed, and interrupted task states; expose recent tasks with `/tasks`; and render authenticated stop controls in Telegram.
+- Stream partial responses through native Telegram drafts with a typing fallback when the Bot API does not support drafts.
+
 ### Fixed
 
 - Deliver complete Telegram responses when a streamed final answer exceeds one message.
