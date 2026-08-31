@@ -357,6 +357,15 @@ export class TelegramTransportAdapter implements TransportAdapter {
   ): Promise<OutboundReceipt> {
     return this.#outbound.update(address, receipt, content, context, signal);
   }
+  async finalize(
+    address: ConversationAddress,
+    receipt: OutboundReceipt | undefined,
+    content: OutboundContent,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<readonly OutboundReceipt[]> {
+    return this.#outbound.finalize(address, receipt, content, context, signal);
+  }
 
   async react(
     address: ConversationAddress,

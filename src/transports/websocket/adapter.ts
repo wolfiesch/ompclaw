@@ -279,6 +279,16 @@ export class WebSocketTransportAdapter implements TransportAdapter {
     this.#sendRequired(connection, { type: "update", messageId: receipt.messageId, content });
     return receipt;
   }
+  async finalize(
+    address: ConversationAddress,
+    receipt: OutboundReceipt | undefined,
+    content: OutboundContent,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<readonly OutboundReceipt[]> {
+    if (receipt === undefined) return [await this.send(address, content, context, signal)];
+    return [await this.update(address, receipt, content, context, signal)];
+  }
 
   async react(
     address: ConversationAddress,

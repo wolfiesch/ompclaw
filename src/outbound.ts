@@ -121,6 +121,10 @@ function isPhoto(path: string, mediaType?: string): boolean {
 function isMarkdownParseError(error: unknown): boolean {
   return error instanceof TgError && error.code === 400 && /parse entities|markdown/i.test(error.message);
 }
+function isMessageNotModifiedError(error: unknown): boolean {
+  return error instanceof TgError && error.code === 400 && /message is not modified/i.test(error.message);
+}
+
 
 /**
  * Telegram-specific delivery implementation. It deliberately accepts a
@@ -191,31 +195,44 @@ export class Outbound {
     if (content.attachments?.length) throw new Error("Telegram message updates cannot replace attachments");
     const text = contentText(content);
     if (text === undefined) throw new Error("Telegram message updates require text");
-
-    const markdown = content.format === "markdown";
-    const body = markdown ? mdToMarkdownV2(text) : text;
-    const part = chunkLabeled(body, TELEGRAM_MAX_CHARS, "newline")[0] ?? "";
-    const payload: Record<string, unknown> = {
-      chat_id: address.channel,
-      message_id: messageId(target),
-      text: part,
-      ...(messageThread(address) === undefined ? {} : { message_thread_id: messageThread(address) }),
-      ...(markdown ? { parse_mode: "MarkdownV2" } : {}),
-    };
-
-    try {
-      await this.#request("editMessageText", payload, signal);
-    } catch (error) {
-      if (!markdown || !isMarkdownParseError(error)) throw error;
-      const fallback = chunkLabeled(text, TELEGRAM_MAX_CHARS, "newline")[0] ?? "";
-      await this.#request(
-        "editMessageText",
-        { ...payload, text: fallback, parse_mode: undefined },
-        signal,
-      );
-    }
+    const part = this.#textParts(text, content.format)[0] ?? { text: "" };
+    await this.#editTextPart(address, target, part, false, signal);
     return target;
   }
+
+  async finalize(
+    address: ConversationAddress,
+    target: OutboundReceipt | undefined,
+    content: OutboundContent,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<readonly OutboundReceipt[]> {
+    await this.#assertAddress(address, context);
+    signal?.throwIfAborted();
+    if (target === undefined) return [await this.send(address, content, context, signal)];
+
+    const text = contentText(content);
+    const parts = text === undefined ? [] : this.#textParts(text, content.format);
+    if (parts.length === 0 && !content.attachments?.length) {
+      throw new Error("Telegram finalization requires text or at least one attachment");
+    }
+
+    const receipts: OutboundReceipt[] = [target];
+    const first = parts[0];
+    if (first !== undefined) await this.#editTextPart(address, target, first, true, signal);
+    for (const part of parts.slice(1)) {
+      receipts.push(await this.sendMessage(address, part.text, context, {
+        ...(part.parseMode === "MarkdownV2"
+          ? { parseMode: "MarkdownV2" as const, plainFallbackText: part.plainFallbackText }
+          : {}),
+      }, signal));
+    }
+    for (const attachment of content.attachments ?? []) {
+      receipts.push(await this.#sendAttachment(address, attachment, context, undefined, signal));
+    }
+    return receipts;
+  }
+
 
   async react(
     address: ConversationAddress,
@@ -288,6 +305,38 @@ export class Outbound {
       { chat_id: address.channel, message_id: messageId(target), reply_markup: replyMarkup },
       signal,
     );
+  }
+
+  async #editTextPart(
+    address: ConversationAddress,
+    target: OutboundReceipt,
+    part: { readonly text: string; readonly parseMode?: "MarkdownV2"; readonly plainFallbackText?: string },
+    allowUnmodified: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const payload: Record<string, unknown> = {
+      chat_id: address.channel,
+      message_id: messageId(target),
+      text: part.text,
+      ...(messageThread(address) === undefined ? {} : { message_thread_id: messageThread(address) }),
+      ...(part.parseMode === undefined ? {} : { parse_mode: part.parseMode }),
+    };
+    try {
+      await this.#request("editMessageText", payload, signal);
+    } catch (error) {
+      if (allowUnmodified && isMessageNotModifiedError(error)) return;
+      if (part.parseMode !== "MarkdownV2" || !isMarkdownParseError(error)) throw error;
+      try {
+        await this.#request(
+          "editMessageText",
+          { ...payload, text: part.plainFallbackText ?? part.text, parse_mode: undefined },
+          signal,
+        );
+      } catch (fallbackError) {
+        if (allowUnmodified && isMessageNotModifiedError(fallbackError)) return;
+        throw fallbackError;
+      }
+    }
   }
 
   async #sendAttachment(

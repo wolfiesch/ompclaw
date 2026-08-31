@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Deliver complete Telegram responses when a streamed final answer exceeds one message.
+
 ## 0.3.2 (2026-08-30)
 
 ### Fixed

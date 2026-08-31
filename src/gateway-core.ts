@@ -248,6 +248,21 @@ export class GatewayCore {
     this.#requireCapability(adapter, "streamingUpdates", adapter.update !== undefined);
     return adapter.update!(address, receipt, content, context, signal);
   }
+  async finalize(
+    address: ConversationAddress,
+    receipt: OutboundReceipt | undefined,
+    content: OutboundContent,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<readonly OutboundReceipt[]> {
+    this.#assertDeliveryOrigin(context, address);
+    const adapter = this.#adapterFor(address);
+    if (receipt !== undefined) this.#assertReceiptTransport(address, receipt);
+    this.#assertAddressSupported(adapter, address);
+    this.#assertContentSupported(adapter, address, content);
+    return adapter.finalize(address, receipt, content, context, signal);
+  }
+
 
   async react(
     address: ConversationAddress,

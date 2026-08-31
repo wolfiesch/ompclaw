@@ -67,7 +67,8 @@ interface GatewayTurnTarget extends RpcGatewayUiTarget {
 
 interface ActiveTurn extends GatewayTurnTarget {
   receipt?: OutboundReceipt;
-  assistantText?: string;
+  previewText?: string;
+  finalText?: string;
   scheduledCompletion?: {
     readonly resolve: () => void;
     readonly reject: (error: Error) => void;
@@ -395,7 +396,7 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "message_update" || frame.type === "turn_end") {
-      await this.#deliverAssistantText(assistantText(frame.message));
+      await this.#deliverAssistantPreview(assistantText(frame.message));
       return;
     }
     if (frame.type === "command_output" && typeof frame.text === "string") {
@@ -413,7 +414,7 @@ export class RpcGatewayRuntime {
       if (this.#status.state) this.#status.state.isStreaming = false;
       const active = this.#activeTurn;
       try {
-        await this.#deliverAssistantText(finalAssistantText(frame.messages));
+        await this.#finalizeAssistantText(finalAssistantText(frame.messages));
         active?.scheduledCompletion?.resolve();
       } catch (error) {
         active?.scheduledCompletion?.reject(error instanceof Error ? error : new Error(String(error)));
@@ -829,16 +830,30 @@ export class RpcGatewayRuntime {
   }
 
 
-  async #deliverAssistantText(text: string): Promise<void> {
+  async #deliverAssistantPreview(text: string): Promise<void> {
     const active = this.#activeTurn;
-    if (!active || text.trim().length === 0 || active.assistantText === text) return;
+    if (!active || text.trim().length === 0 || active.previewText === text) return;
     const content = { text, format: "text" as const };
     if (active.receipt) {
       active.receipt = await this.#options.delivery.update(active.address, active.receipt, content, active.deliveryContext);
     } else {
       active.receipt = await this.#options.delivery.send(active.address, content, active.deliveryContext);
     }
-    active.assistantText = text;
+    active.previewText = text;
+  }
+
+  async #finalizeAssistantText(text: string): Promise<void> {
+    const active = this.#activeTurn;
+    if (!active || text.trim().length === 0 || active.finalText === text) return;
+    const receipts = await this.#options.delivery.finalize(
+      active.address,
+      active.receipt,
+      { text, format: "text" },
+      active.deliveryContext,
+    );
+    active.receipt = receipts[0] ?? active.receipt;
+    active.previewText = text;
+    active.finalText = text;
   }
 
   async #handleHostToolCall(call: RpcHostToolCall): Promise<void> {

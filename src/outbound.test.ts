@@ -118,6 +118,50 @@ test("returns string receipts for updates and consumes them for reactions", asyn
   ]);
 });
 
+test("finalizes a streamed preview into every segmented Telegram message", async () => {
+  const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+  const send = outbound(async (method, payload) => {
+    calls.push({ method, payload: payload ?? {} });
+    return { message_id: 15 + calls.length };
+  });
+  const preview = { transport: "telegram" as const, messageId: "15" };
+
+  const receipts = await send.finalize(
+    address,
+    preview,
+    { text: "word ".repeat(1_200), format: "text" },
+    delivery(),
+  );
+
+  expect(calls).toHaveLength(2);
+  expect(calls[0]).toEqual(
+    expect.objectContaining({
+      method: "editMessageText",
+      payload: expect.objectContaining({ chat_id: "42", message_id: 15 }),
+    }),
+  );
+  expect(calls[1]).toEqual(
+    expect.objectContaining({
+      method: "sendMessage",
+      payload: expect.objectContaining({ chat_id: "42" }),
+    }),
+  );
+  expect(calls.every(({ payload }) => String(payload.text).length <= 4_096)).toBe(true);
+  expect(receipts).toEqual([
+    preview,
+    { transport: "telegram", messageId: "17" },
+  ]);
+});
+
+test("treats an unchanged final streamed message as successful", async () => {
+  const send = outbound(async () => {
+    throw new TgError("Bad Request: message is not modified", 400);
+  });
+  const preview = { transport: "telegram" as const, messageId: "15" };
+
+  await expect(send.finalize(address, preview, { text: "same" }, delivery())).resolves.toEqual([preview]);
+});
+
 test("does not let an outbound caller override the authorized delivery address", async () => {
   const send = outbound(async () => ({ message_id: 1 }));
   await expect(send.send({ ...address, channel: "different" }, { text: "nope" }, delivery())).rejects.toThrow("authorized");

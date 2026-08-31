@@ -77,6 +77,14 @@ function adapter(
     ): Promise<OutboundReceipt> {
       return { transport: id, messageId: "message" };
     },
+    async finalize(
+      _address: ConversationAddress,
+      receipt: OutboundReceipt | undefined,
+      _content: OutboundContent,
+      _context: DeliveryContext,
+    ): Promise<readonly OutboundReceipt[]> {
+      return [receipt ?? { transport: id, messageId: "message" }];
+    },
   };
 }
 
@@ -269,6 +277,15 @@ describe("GatewayCore", () => {
         calls.push("update");
         return receipt;
       },
+      async finalize(
+        _address: ConversationAddress,
+        receipt: OutboundReceipt | undefined,
+        _content: OutboundContent,
+        _context: DeliveryContext,
+      ): Promise<readonly OutboundReceipt[]> {
+        calls.push("finalize");
+        return [receipt ?? { transport: "beta", messageId: "message" }];
+      },
       async react(
         _address: ConversationAddress,
         _receipt: OutboundReceipt,
@@ -291,6 +308,7 @@ describe("GatewayCore", () => {
     const context = deliveryContext(target);
     const receipt = await gateway.send(target, { text: "hello" }, context);
     await gateway.update(target, receipt, { text: "updated" }, context);
+    await gateway.finalize(target, receipt, { text: "final" }, context);
     await gateway.react(target, receipt, { emoji: "👍" }, context);
     const response = await gateway.presentUi(
       target,
@@ -300,7 +318,7 @@ describe("GatewayCore", () => {
 
     expect(receipt).toEqual({ transport: "beta", messageId: "message" });
     expect(response).toEqual({ type: "confirm", confirmed: true });
-    expect(calls).toEqual(["send", "update", "react", "ui"]);
+    expect(calls).toEqual(["send", "update", "finalize", "react", "ui"]);
   });
 
   test("rejects every cross-origin delivery before calling adapters", async () => {
@@ -322,6 +340,10 @@ describe("GatewayCore", () => {
         calls.push("update");
         return receipt;
       },
+      async finalize(): Promise<readonly OutboundReceipt[]> {
+        calls.push("finalize");
+        return [receipt];
+      },
       async react(): Promise<void> {
         calls.push("react");
       },
@@ -339,6 +361,7 @@ describe("GatewayCore", () => {
     for (const target of crossOriginAddresses) {
       await expect(gateway.send(target, { text: "send" }, context)).rejects.toThrow(CrossOriginDeliveryError);
       await expect(gateway.update(target, receipt, { text: "update" }, context)).rejects.toThrow(CrossOriginDeliveryError);
+      await expect(gateway.finalize(target, receipt, { text: "final" }, context)).rejects.toThrow(CrossOriginDeliveryError);
       await expect(gateway.react(target, receipt, { emoji: "👍" }, context)).rejects.toThrow(CrossOriginDeliveryError);
       await expect(gateway.presentUi(target, { type: "status", key: "state" }, context)).rejects.toThrow(
         CrossOriginDeliveryError,
