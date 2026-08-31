@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- Deliver Telegram receipt reactions for every prompt outcome without allowing optional reaction retries to gate prompt dispatch, RPC frame processing, or completed-turn cleanup.
+- Deliver Telegram receipt reactions for every prompt outcome in lifecycle order per source message without allowing optional reaction retries to gate prompt dispatch, RPC frame processing, or completed-turn cleanup.
 
 ## 0.6.2 (2026-08-31)
 

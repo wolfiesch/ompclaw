@@ -395,6 +395,42 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("serializes source reactions by lifecycle without blocking a non-agent turn", async () => {
+    const acknowledgement = Promise.withResolvers<void>();
+    let acknowledgementStarted = false;
+    let terminalReactionStarted = false;
+    const runtime = new RpcGatewayRuntime({
+      config,
+      delivery: delivery(async (reaction) => {
+        if (reaction.emoji === "👀") {
+          acknowledgementStarted = true;
+          await acknowledgement.promise;
+        } else if (reaction.emoji === "👍") {
+          terminalReactionStarted = true;
+        }
+      }),
+    });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0];
+    rpc.promptAgentInvoked = false;
+    const sourceReceipt = { transport: "test", messageId: "source-ordered-reactions" };
+    let inboundCompleted = false;
+
+    const inbound = runtime.handleInbound({ ...message("companion", "Finish quickly"), sourceReceipt }).then(() => {
+      inboundCompleted = true;
+    });
+    await waitFor(() => acknowledgementStarted);
+    await waitFor(() => inboundCompleted);
+    const terminalStartedBeforeAcknowledgement = terminalReactionStarted;
+    acknowledgement.resolve();
+    await inbound;
+    await waitFor(() => terminalReactionStarted);
+
+    expect(terminalStartedBeforeAcknowledgement).toBe(false);
+    expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
+    await runtime.stop();
+  });
+
   test("finishes a non-agent prompt without waiting for its terminal reaction", async () => {
     const terminalReaction = Promise.withResolvers<void>();
     let terminalReactionStarted = false;
