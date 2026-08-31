@@ -45,8 +45,6 @@ describe("GatewayStore", () => {
       ompSessionPath: "/sessions/42.jsonl",
       workspace: { root: "/work/project" },
     });
-    expect(restarted.hasConversationBindingForSession("/sessions/42.jsonl")).toBe(true);
-    expect(restarted.hasConversationBindingForSession("/sessions/missing.jsonl")).toBe(false);
     expect(restarted.getCheckpoint("telegram", "update_id")).toBe("100");
     expect(restarted.getPendingInteraction("approve-42")).toEqual({
       id: "approve-42",
@@ -89,6 +87,32 @@ describe("GatewayStore", () => {
     expect(store.getConversationBinding(ownerAddress)?.ompSessionPath).toBe("/sessions/dm.jsonl");
     expect(store.getConversationBinding(threadedAddress)?.ompSessionPath).toBe("/sessions/topic.jsonl");
     expect(store.getConversationBinding({ ...ownerAddress, account: "other" })).toBeUndefined();
+    store.close();
+  });
+
+  test("resets ambiguous topic bindings once while preserving the shared session", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const topic = { ...ownerAddress, thread: "topic-9" } as const;
+    const otherAccountTopic = { ...topic, account: "other" } as const;
+    store.bindConversation({ address: ownerAddress, ompSessionPath: "/sessions/shared.jsonl", workspace: "/work" });
+    const accidentalRoot = { transport: "websocket", account: "web", channel: "credential" } as const;
+    store.bindConversation({ address: accidentalRoot, ompSessionPath: "/sessions/accidental.jsonl", workspace: "/work" });
+    store.bindConversation({ address: topic, ompSessionPath: "/sessions/topic.jsonl", workspace: "/work" });
+    store.bindConversation({ address: otherAccountTopic, ompSessionPath: "/sessions/other.jsonl", workspace: "/work" });
+    store.setCheckpoint("omp", "session_file", "/sessions/topic.jsonl");
+    store.setCheckpoint("omp", "shared_session_file", "/sessions/shared.jsonl");
+
+    expect(store.migrateTelegramTopicSessions("default")).toBe(1);
+    expect(store.getConversationBinding(topic)).toBeUndefined();
+    expect(store.getConversationBinding(otherAccountTopic)?.ompSessionPath).toBe("/sessions/other.jsonl");
+    expect(store.getConversationBinding(accidentalRoot)?.ompSessionPath).toBe("/sessions/shared.jsonl");
+    expect(store.getSharedConversationSessionPath()).toBe("/sessions/shared.jsonl");
+    expect(store.getCheckpoint("omp", "session_file")).toBe("/sessions/shared.jsonl");
+    expect(store.getCheckpoint("omp", "shared_session_file")).toBe("/sessions/shared.jsonl");
+
+    store.bindConversation({ address: topic, ompSessionPath: "/sessions/new-topic.jsonl", workspace: "/work" });
+    expect(store.migrateTelegramTopicSessions("default")).toBe(0);
+    expect(store.getConversationBinding(topic)?.ompSessionPath).toBe("/sessions/new-topic.jsonl");
     store.close();
   });
 

@@ -78,6 +78,7 @@ class MemoryStore implements GatewayApplicationStore {
   readonly checkpoint = new Map<string, JsonValue>();
   readonly bindings: ConversationBinding[] = [];
   readonly releases: string[] = [];
+  readonly migrations = new Set<string>();
   closed = false;
 
   close() {
@@ -122,8 +123,22 @@ class MemoryStore implements GatewayApplicationStore {
     );
   }
 
-  hasConversationBindingForSession(sessionPath: string) {
-    return this.bindings.some((binding) => binding.ompSessionPath === sessionPath);
+
+  getSharedConversationSessionPath() {
+    return this.bindings.findLast((binding) => binding.address.thread === undefined)?.ompSessionPath;
+  }
+
+  migrateTelegramTopicSessions(account: string) {
+    if (this.migrations.has(account)) return 0;
+    this.migrations.add(account);
+    let removed = 0;
+    for (let index = this.bindings.length - 1; index >= 0; index--) {
+      const address = this.bindings[index].address;
+      if (address.transport !== "telegram" || address.account !== account || address.thread === undefined) continue;
+      this.bindings.splice(index, 1);
+      removed++;
+    }
+    return removed;
   }
 
   putPendingInteraction() {}
@@ -298,6 +313,7 @@ describe("GatewayApplication", () => {
     });
     let currentSession = "/sessions/root";
     let nextSession = 0;
+    let busy = false;
     const handled: Array<{ readonly id: string; readonly session: string }> = [];
     const created: string[] = [];
     const switched: string[] = [];
@@ -317,9 +333,13 @@ describe("GatewayApplication", () => {
           async handleInbound(message) {
             handled.push({ id: message.id, session: currentSession });
             if (message.id === "topic-9-first") {
+              busy = true;
               firstTopicStarted.resolve();
-              await finishFirstTopic.promise;
             }
+          },
+          async waitUntilIdle() {
+            await finishFirstTopic.promise;
+            busy = false;
           },
           async newSession(name) {
             created.push(name ?? "");
@@ -343,7 +363,7 @@ describe("GatewayApplication", () => {
             });
             return true;
           },
-          isBusy: () => false,
+          isBusy: () => busy,
         }),
         createTelegramAdapter: () => adapter("telegram"),
         acquireLock: () => ({ ok: true }),
@@ -356,6 +376,12 @@ describe("GatewayApplication", () => {
       address: { transport: "telegram", account: "bot", channel: "-1001", thread },
       content: { text },
     });
+    const otherRoot = { ...inbound("root-other"), address: { transport: "telegram", account: "bot", channel: "84" } };
+    const webRoot: InboundMessage = {
+      ...inbound("web-root"),
+      identity: { transport: "websocket", account: "web", subject: "web-user" },
+      address: { transport: "websocket", account: "web", channel: "web-user" },
+    };
 
     await app.start();
     await core.options().onInbound(inbound("root-first"));
@@ -367,14 +393,19 @@ describe("GatewayApplication", () => {
     finishFirstTopic.resolve();
     await Promise.all([firstTopic, secondTopic]);
     await core.options().onInbound(topicMessage("topic-9-again", "9", "Continue the first topic"));
+    await core.options().onInbound(otherRoot);
+    await core.options().onInbound(webRoot);
     await core.options().onInbound(inbound("root-again"));
 
+    expect(created).toEqual(["First topic request", "Second topic request"]);
     expect(switched).toEqual(["/sessions/topic-1", "/sessions/root"]);
     expect(handled).toEqual([
       { id: "root-first", session: "/sessions/root" },
       { id: "topic-9-first", session: "/sessions/topic-1" },
       { id: "topic-10-first", session: "/sessions/topic-2" },
       { id: "topic-9-again", session: "/sessions/topic-1" },
+      { id: "root-other", session: "/sessions/root" },
+      { id: "web-root", session: "/sessions/root" },
       { id: "root-again", session: "/sessions/root" },
     ]);
     expect(store.getConversationBinding(topicMessage("ignored", "9", "ignored").address)?.ompSessionPath).toBe("/sessions/topic-1");
