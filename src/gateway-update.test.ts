@@ -190,6 +190,7 @@ describe("transactional gateway updates", () => {
         }
         const process: ManagedGatewayProcess = {
           exitCode: null,
+          signalCode: null,
           kill() {
             process.exitCode = 0;
             return true;
@@ -253,6 +254,7 @@ describe("transactional gateway updates", () => {
         }
         const process: ManagedGatewayProcess = {
           exitCode: null,
+          signalCode: null,
           kill() {
             process.exitCode = 0;
             return true;
@@ -276,6 +278,58 @@ describe("transactional gateway updates", () => {
     ]);
     expect(readUpdateResult(gatewayUpdatePaths(stateDir).result)?.status).toBe("succeeded");
     expect(currentGatewayRelease(gatewayUpdatePaths(stateDir)).id).toBe(candidate.id);
+  });
+
+  test("preserves a committed update when stopped during candidate readiness", async () => {
+    const root = temporaryDirectory();
+    const repository = join(root, "repository");
+    const stateDir = join(root, "state");
+    mkdirSync(repository, { recursive: true });
+    const coordinator = new GatewayUpdateCoordinator({
+      config: { enabled: true, repository, healthTimeoutMs: 30_000 },
+      stateDir,
+    });
+    const previous = createRelease(stateDir, "0.7.0-aaaaaaaaaaaa", COMMIT_A);
+    const candidate = createRelease(stateDir, "0.8.0-bbbbbbbbbbbb", COMMIT_B);
+    coordinator.bootstrap(previous);
+    await coordinator.arm(candidate.id, {
+      address: { transport: "telegram", account: "default", channel: "42" },
+      principal: { id: "operator-42", roles: ["operator"] },
+    });
+    await coordinator.commitArmed();
+
+    const candidateStarted = Promise.withResolvers<void>();
+    const supervisor = new GatewayUpdateSupervisor({
+      stateDir,
+      configPath: join(root, "config.json"),
+      envFile: join(root, "ompclaw.env"),
+      healthTimeoutMs: 500,
+    }, {
+      spawnRelease(_release, requestId) {
+        if (requestId !== undefined) candidateStarted.resolve();
+        const process: ManagedGatewayProcess = {
+          exitCode: null,
+          signalCode: null,
+          kill() {
+            process.exitCode = 0;
+            return true;
+          },
+          once(_event, listener) {
+            listener();
+          },
+        };
+        return process;
+      },
+    });
+    const running = supervisor.run();
+    await candidateStarted.promise;
+    supervisor.stop();
+    await running;
+
+    expect(readUpdateResult(gatewayUpdatePaths(stateDir).result)).toBeUndefined();
+    expect(readUpdateRequest(gatewayUpdatePaths(stateDir).request)?.status).toBe("committed");
+    expect(currentGatewayRelease(gatewayUpdatePaths(stateDir)).id).toBe(previous.id);
+    expect(supervisor.replacementRequested).toBe(false);
   });
 
   test("supervisor restores the previous current link when recovered candidate fails", async () => {
@@ -309,7 +363,8 @@ describe("transactional gateway updates", () => {
       },
       spawnRelease(release) {
         const process: ManagedGatewayProcess = {
-          exitCode: release.id === candidate.id ? 1 : null,
+          exitCode: null,
+          signalCode: release.id === candidate.id ? "SIGKILL" : null,
           kill() {
             process.exitCode = 0;
             return true;

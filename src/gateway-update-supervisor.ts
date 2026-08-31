@@ -22,6 +22,7 @@ export interface SupervisorArgs {
 }
 export interface ManagedGatewayProcess {
   exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
   kill(signal: NodeJS.Signals): boolean;
   once(event: "exit", listener: () => void): unknown;
 }
@@ -34,6 +35,10 @@ export interface GatewayUpdateSupervisorSeams {
 const POLL_INTERVAL_MS = 250;
 const STOP_TIMEOUT_MS = 15_000;
 const RESTART_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const;
+
+function processIsRunning(child: ManagedGatewayProcess | undefined): child is ManagedGatewayProcess {
+  return child !== undefined && child.exitCode === null && child.signalCode === null;
+}
 
 export class GatewayUpdateSupervisor {
   readonly #args: SupervisorArgs;
@@ -79,7 +84,7 @@ export class GatewayUpdateSupervisor {
           active = await this.#applyUpdate(active, request.id, request.candidate.id, request.previous.id);
           continue;
         }
-        if (this.#child.exitCode !== null) {
+        if (!processIsRunning(this.#child)) {
           const delay = RESTART_DELAYS_MS[Math.min(this.#restartAttempt++, RESTART_DELAYS_MS.length - 1)]!;
           await this.#wait(delay);
           if (!this.#stopping) {
@@ -148,6 +153,7 @@ export class GatewayUpdateSupervisor {
       this.#restartAttempt = 0;
       return candidate;
     }
+    if (this.#stopping) return active;
 
     await this.#stopChild();
     switchCurrentRelease(this.#paths, previous.path);
@@ -161,8 +167,8 @@ export class GatewayUpdateSupervisor {
     const readyPath = join(this.#paths.ready, `${requestId}.json`);
     const deadline = Date.now() + this.#args.healthTimeoutMs;
     while (!this.#stopping && Date.now() < deadline) {
-      if (existsSync(readyPath)) return this.#child?.exitCode === null;
-      if (this.#child?.exitCode !== null) return false;
+      if (existsSync(readyPath)) return processIsRunning(this.#child);
+      if (!processIsRunning(this.#child)) return false;
       await this.#wait(POLL_INTERVAL_MS);
     }
     return false;
@@ -195,11 +201,11 @@ export class GatewayUpdateSupervisor {
   async #stopChild(): Promise<void> {
     const child = this.#child;
     this.#child = undefined;
-    if (child === undefined || child.exitCode !== null) return;
+    if (!processIsRunning(child)) return;
     child.kill("SIGTERM");
     const deadline = Date.now() + STOP_TIMEOUT_MS;
-    while (child.exitCode === null && Date.now() < deadline) await sleep(100);
-    if (child.exitCode === null) {
+    while (processIsRunning(child) && Date.now() < deadline) await sleep(100);
+    if (processIsRunning(child)) {
       child.kill("SIGKILL");
       await new Promise<void>((resolve) => child.once("exit", () => resolve()));
     }

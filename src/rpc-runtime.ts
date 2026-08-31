@@ -730,7 +730,7 @@ export class RpcGatewayRuntime {
         if (this.#status.state) this.#status.state.isStreaming = false;
         this.#wakeIdleWaiters();
         try {
-          if (finalDelivered) await this.#options.updates?.commitArmed();
+          if (finalDelivered && terminalState === "completed") await this.#options.updates?.commitArmed();
           else await this.#options.updates?.discardArmed();
         } catch (error) {
           this.#log.error(`[ompclaw update] failed to finalize armed update: ${error instanceof Error ? error.message : String(error)}`);

@@ -524,6 +524,40 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("discards activation when the terminal turn is stopped or failed", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    await runtime.start();
+    await runtime.handleInbound(message("update-stopped-final", "Activate"));
+    FakeOmpRpcClient.instances[0]!.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{
+        role: "assistant",
+        stopReason: "aborted",
+        content: [{ type: "text", text: "Activation scheduled" }],
+      }],
+    });
+    await waitFor(() => calls.includes("discard"));
+
+    expect(calls).toEqual(["discard"]);
+    await runtime.stop();
+  });
+
   test("discards activation when the terminal response is empty", async () => {
     const calls: string[] = [];
     const updates: GatewayUpdateControl = {
