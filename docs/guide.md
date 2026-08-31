@@ -155,6 +155,7 @@ A Telegram object is required only when Telegram is configured:
   "enabled": true,
   "account": "default",
   "tokenEnv": "TELEGRAM_BOT_TOKEN",
+  "transcribeCommand": ["whisper", "{file}", "--model", "base", "--output_format", "txt", "--output_dir", "{outputDir}"],
   "topicSessions": {
     "enabled": false,
     "createFromRoot": false
@@ -167,6 +168,7 @@ A Telegram object is required only when Telegram is configured:
 | `enabled` | whether to start this adapter |
 | `account` | stable local account identifier used in identities and checkpoints |
 | `tokenEnv` | environment variable containing the bot token; it must be `TELEGRAM_BOT_TOKEN` |
+| `transcribeCommand` | optional argv array for local voice transcription; `{file}` is required, stdout is accepted, and `{outputDir}` reads a Whisper-style `<audio-basename>.txt` result |
 | `topicSessions.enabled` | isolate each Telegram forum topic in its own persisted OMP session |
 | `topicSessions.createFromRoot` | create a new forum topic for each authorized non-command root message; requires topic sessions |
 
@@ -180,6 +182,10 @@ ompclaw telegram-allow <your-numeric-telegram-user-id> \
 It creates or updates an `operator` principal and binds the exact Telegram identity for the configured account. To use a custom principal or roles, create it with `principal-add` and bind the Telegram identity with `identity-bind`.
 
 Existing forum topics get separate sessions when `topicSessions.enabled` is true. Non-topic Telegram chats and WebSocket credentials continue to share the gateway's root OMP session. Set `createFromRoot` to true to turn an authorized root message into a newly named topic and route that same turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Telegram requires the bot to be a supergroup administrator with permission to manage topics. Topic creation is idempotent across update retries.
+
+The native Telegram command menu exposes the everyday controls: `/start`, `/home`, `/status`, `/stop`, `/new`, `/tasks`, and `/help`. `/start` explains the assistant without invoking the model. `/home` opens model, reasoning, and fast-mode controls. `/help` groups the rest of the OMP RPC command surface for advanced use.
+
+Voice notes always arrive as private inbox attachments. To also make them conversational, set `transcribeCommand`. Commands without `{outputDir}` must print the transcript to stdout. The example supports the OpenAI Whisper CLI, which writes a text file into the isolated temporary output directory. Transcription is local to the gateway host; OmpClaw deletes the temporary transcript directory after reading it.
 
 ### WebSocket transport
 
@@ -341,9 +347,11 @@ The importer reads only the two named JSON state files. It does not read or copy
 
 Telegram uses long polling, per-account update checkpointing, and a per-account polling lock. It ignores replayed or already completed updates and advances the durable checkpoint only across the completed update prefix. A failed earlier update is not skipped by a later successful one.
 
-Private chats and forum topics map to stable gateway conversation addresses. Incoming Telegram identity comes from the sender ID. Normal inbound content can include text, captions, reply metadata, supported media as private inbox files, and optional voice transcription when configured by the adapter. Images are passed to OMP as image input when readable; other attachment references are retained in the transport-message prompt.
+Private chats and forum topics map to stable gateway conversation addresses. Incoming Telegram identity comes from the sender ID. Normal inbound content can include text, captions, reply metadata, supported media as private inbox files, and optional voice transcription. Images are passed to OMP as image input when readable; other attachment references remain in the transport-message prompt. A voice transcript is treated as ordinary user speech rather than quoted metadata.
 
-Telegram supports assistant message creation and editing, reactions, attachments, threads, confirmation buttons, single and multi-select buttons, reply-based text/editor input, notifications, URL buttons, and rendered status surfaces. Interaction responses are bound to the original address and authorized principal. An expired, moved, or cross-user control is rejected.
+Telegram supports assistant message creation and editing, reactions, attachments, threads, confirmation buttons, single and multi-select buttons, reply-based text/editor input, notifications, URL buttons, and rendered status surfaces. Task cards use plain-language states such as `Queued`, `Working`, and `Done`; only active cards show a Stop button. Interaction responses remain bound to the original address and authorized principal. An expired, moved, or cross-user control is rejected.
+
+The gateway gives Telegram turns a mobile presentation contract: answer first, use short scannable paragraphs, omit internal harness narration, and acknowledge durable memory only after the memory write succeeds. When another authenticated conversation owns the single OMP session, the new conversation receives a queue acknowledgement and starts automatically when the active turn finishes.
 
 ### WebSocket
 
@@ -354,7 +362,7 @@ The server accepts a connection at `GET /` only after HTTP WebSocket upgrade. It
 ## Operational limitations
 
 - One gateway process owns one OMP session, one scheduler, and one SQLite writer. This is not a worker pool or a distributed multi-writer system.
-- Interactive and scheduled work serialize through the same OMP runtime. A due job waits while another turn is active. A different interactive conversation receives a busy response while another turn is active.
+- Interactive and scheduled work serialize through the same OMP runtime. A due job waits while another turn is active. A different interactive conversation is acknowledged, waits for the active turn to finish, and then starts automatically.
 - Job dispatch is at least once across gateway or host crashes. External side effects require idempotent prompts or downstream deduplication.
 - In-flight OMP work is not resumable after a process or child crash. Completed session and scheduled-job state remain durable.
 - One Telegram bot token has one long poller. Do not run multiple pollers or mix long polling with a Telegram webhook.

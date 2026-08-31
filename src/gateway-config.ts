@@ -34,6 +34,7 @@ export interface GatewayTelegramConfig {
   readonly account: string;
   readonly tokenEnv: string;
   readonly topicSessions: GatewayTelegramTopicSessionsConfig;
+  readonly transcribeCommand?: readonly string[];
 }
 
 export interface GatewayWebSocketCredentialConfig {
@@ -246,16 +247,21 @@ function parseTransports(value: unknown): GatewayConfig["transports"] {
 
 function parseTelegram(value: unknown): GatewayTelegramConfig {
   const telegram = object(value, "transports.telegram");
-  rejectUnknown(telegram, ["enabled", "account", "tokenEnv", "topicSessions"], "transports.telegram");
+  rejectUnknown(telegram, ["enabled", "account", "tokenEnv", "topicSessions", "transcribeCommand"], "transports.telegram");
   const tokenEnv = secretEnvName(telegram.tokenEnv, "transports.telegram.tokenEnv", true);
   const topicSessions = telegram.topicSessions === undefined
     ? { enabled: false, createFromRoot: false }
     : parseTelegramTopicSessions(telegram.topicSessions);
+  const transcribeCommand = stringArray(telegram.transcribeCommand, "transports.telegram.transcribeCommand", MAX_OMP_ARGS);
+  if (transcribeCommand.length > 0 && !transcribeCommand.some((part) => part.includes("{file}"))) {
+    throw new Error("transports.telegram.transcribeCommand must include a {file} placeholder");
+  }
   return {
     enabled: boolean(telegram.enabled, "transports.telegram.enabled"),
     account: identifier(telegram.account, "transports.telegram.account"),
     tokenEnv,
     topicSessions,
+    ...(transcribeCommand.length === 0 ? {} : { transcribeCommand }),
   };
 }
 

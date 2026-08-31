@@ -76,6 +76,7 @@ async function fixture(options: {
   readonly receive?: (message: InboundEnvelope) => Promise<void> | void;
   readonly resolveIdentity?: TransportStartContext["resolveIdentity"];
   readonly transcribe?: boolean;
+  readonly transcribeCommand?: readonly string[];
   readonly uiTimeoutMs?: number;
   readonly commands?: readonly { readonly command: string; readonly description: string }[];
   readonly createTopicsFromRoot?: boolean;
@@ -106,7 +107,7 @@ async function fixture(options: {
     store,
     uiTimeoutMs: options.uiTimeoutMs,
     commands: options.commands,
-    transcribeCommand: options.transcribe ? ["not-used", "{file}"] : undefined,
+    transcribeCommand: options.transcribeCommand ?? (options.transcribe ? ["not-used", "{file}"] : undefined),
     createTopicsFromRoot: options.createTopicsFromRoot,
     api: {
       poller: fakePoller,
@@ -122,7 +123,7 @@ async function fixture(options: {
         return { message_id: responseMessageId };
       },
       downloadFileBytes: async () => new Uint8Array([1, 2, 3]),
-      transcribe: async () => "spoken words",
+      ...(options.transcribe ? { transcribe: async () => "spoken words" } : {}),
       acquireLock: () => ({ ok: true }),
       releaseLock: () => {},
       startLockHeartbeat: () => () => {},
@@ -241,7 +242,7 @@ describe("TelegramTransportAdapter outbound delivery", () => {
     const { adapter, calls, received } = await fixture();
     await adapter.presentUi(
       privateAddress,
-      { type: "status", key: "Task", text: "Running\nDeploy carefully" },
+      { type: "status", key: "Task", text: "Working\nDeploy carefully" },
       delivery(privateAddress),
     );
     const taskMessage = calls.find(({ method }) => method === "sendMessage");
@@ -418,6 +419,25 @@ describe("TelegramTransportAdapter inbound conversion", () => {
       expect.objectContaining({ name: "voice-voice-unique.ogg", mediaType: "audio/ogg", url: expect.stringMatching(/^file:\/\//) }),
     ]);
     expect(envelope.content.attachments?.[0].url).toContain(`${stateDir}/inbox/`);
+    await adapter.stop();
+  });
+
+  test("reads transcripts written by Whisper-style commands into an isolated output directory", async () => {
+    const script = [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const [file, outputDir] = process.argv.slice(1);",
+      "fs.writeFileSync(path.join(outputDir, `${path.basename(file, path.extname(file))}.txt`), 'local words');",
+    ].join("");
+    const { adapter, received } = await fixture({
+      transcribeCommand: [process.execPath, "-e", script, "{file}", "{outputDir}"],
+    });
+    await adapter.handleUpdate({
+      update_id: 1,
+      message: message({ text: undefined, voice: { file_id: "voice-file", file_unique_id: "voice-unique", mime_type: "audio/ogg", file_size: 3 } }),
+    });
+
+    expect(received[0]?.content.text).toBe("[Voice transcript: local words]");
     await adapter.stop();
   });
 

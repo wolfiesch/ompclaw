@@ -232,6 +232,7 @@ export class GatewayApplication {
         store,
         commands: runtimeCommandMenu(this.#config.omp.allowRpcBash),
         createTopicsFromRoot: telegram.topicSessions.enabled && telegram.topicSessions.createFromRoot,
+        ...(telegram.transcribeCommand === undefined ? {} : { transcribeCommand: telegram.transcribeCommand }),
       }));
     }
 

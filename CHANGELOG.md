@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.5.0 (2026-08-30)
+
+### Added
+
+- Add optional local voice transcription through stdout commands or isolated Whisper-style output directories.
+- Add `/start` onboarding and a curated native Telegram command menu with advanced controls grouped under `/help`.
+
+### Changed
+
+- Present tool activity, task states, and controls in plain language, with Stop available only while work is active.
+- Give Telegram turns a concise mobile response contract and require successful durable writes before acknowledging memory.
+- Queue authenticated conversations behind the active OMP turn instead of requiring users to resend after a busy response.
+
 ## 0.4.0 (2026-08-30)
 
 ### Added

@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir } from "node:fs/promises";
-import { extname, resolve } from "node:path";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, extname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -709,7 +710,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       !surface?.message ||
       query.message.message_id !== Number(surface.message.messageId) ||
       !task ||
-      !/^(Queued|Running)(?:\n|$)/.test(task)
+      !/^(Queued|Working)(?:\n|$)/.test(task)
     ) {
       await this.#answerCallback(query.id, "This task is no longer running.", true);
       return true;
@@ -828,7 +829,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     else surface.editorText = request.text;
 
     const text = this.#surfaceText(surface);
-    const stopControlVisible = /^(Queued|Running)(?:\n|$)/.test(surface.statuses.get("Task") ?? "");
+    const stopControlVisible = /^(Queued|Working)(?:\n|$)/.test(surface.statuses.get("Task") ?? "");
     const replyMarkup = stopControlVisible
       ? { inline_keyboard: [[{ text: "Stop", callback_data: TASK_STOP_CALLBACK }]] }
       : { inline_keyboard: [] };
@@ -857,11 +858,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
 
 
   #surfaceText(surface: Surface): string {
-    const lines = [`Surface: ${surface.title}`];
-    for (const [key, text] of surface.statuses) lines.push(`${key}: ${text}`);
-    for (const [key, widget] of surface.widgets) lines.push(`${key}: ${widget.join(" | ")}`);
-    if (surface.editorText) lines.push(`Suggested input: ${surface.editorText}`);
-    return lines.join("\n").slice(0, 4096);
+    const lines: string[] = [];
+    if (surface.title && surface.title !== "OMP") lines.push(surface.title);
+    for (const [key, text] of surface.statuses) lines.push(key === "Task" ? text : `${key}: ${text}`);
+    for (const [key, widget] of surface.widgets) lines.push(`${key}\n${widget.join("\n")}`);
+    if (surface.editorText) lines.push(`Suggested reply\n${surface.editorText}`);
+    return (lines.join("\n\n") || "Ready").slice(0, 4096);
   }
 
   #pendingText(request: Extract<UiRequest, { readonly type: PendingKind }>): string {
@@ -1009,15 +1011,29 @@ export class TelegramTransportAdapter implements TransportAdapter {
   }
 
   async #runTranscription(command: readonly string[], file: string, signal?: AbortSignal): Promise<string> {
-    const [executable, ...args] = command.map((part) => part.replaceAll("{file}", file));
-    if (!executable) throw new Error("Telegram transcription command is empty");
-    const result = await execFileAsync(executable, args, {
-      encoding: "utf8",
-      timeout: 120_000,
-      maxBuffer: 1024 * 1024,
-      signal,
-    });
-    return result.stdout;
+    const needsOutputDirectory = command.some((part) => part.includes("{outputDir}"));
+    const outputDirectory = needsOutputDirectory
+      ? await mkdtemp(join(tmpdir(), "ompclaw-transcript-"))
+      : undefined;
+    try {
+      const [executable, ...args] = command.map((part) => part
+        .replaceAll("{file}", file)
+        .replaceAll("{outputDir}", outputDirectory ?? ""));
+      if (!executable) throw new Error("Telegram transcription command is empty");
+      const result = await execFileAsync(executable, args, {
+        encoding: "utf8",
+        timeout: 120_000,
+        maxBuffer: 1024 * 1024,
+        signal,
+      });
+      if (outputDirectory === undefined) return result.stdout;
+      const transcriptPath = join(outputDirectory, `${basename(file, extname(file))}.txt`);
+      return await readFile(transcriptPath, { encoding: "utf8", signal });
+    } finally {
+      if (outputDirectory !== undefined) {
+        await rm(outputDirectory, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
   }
 
   async #sendUnknownIdentityGuidance(message: TgMessage): Promise<void> {

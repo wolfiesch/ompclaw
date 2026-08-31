@@ -197,6 +197,13 @@ async function settle(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
 }
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) return;
+    await Bun.sleep(1);
+  }
+  throw new Error("condition was not met");
+}
 
 beforeEach(() => {
   FakeOmpRpcClient.instances = [];
@@ -268,35 +275,44 @@ describe("RpcGatewayRuntime", () => {
       .map((call) => call.request && "text" in call.request ? call.request.text : undefined);
     expect(taskCards).toEqual(expect.arrayContaining([
       "Queued\nDeploy carefully",
-      "Running\nDeploy carefully\nTool: bash",
-      "Completed\nDeploy carefully",
+      "Working\nDeploy carefully\nChecking the result",
+      "Done\nDeploy carefully",
     ]));
 
     await runtime.handleInbound(message("lifecycle", "/tasks"));
-    expect(deliveries.some((call) => textFromContent(call.content)?.includes("COMPLETED | Deploy carefully"))).toBe(true);
+    expect(deliveries.some((call) => textFromContent(call.content)?.includes("Done | Deploy carefully"))).toBe(true);
     await runtime.stop();
   });
 
-  test("streams and finalizes only to the exact active delivery context while another origin receives busy", async () => {
+  test("queues another conversation and keeps each response bound to its exact delivery context", async () => {
     const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
     await runtime.start();
     const first = message("first", "Build this");
-    const second = message("second", "Hijack this");
+    const second = message("second", "Handle this next");
     await runtime.handleInbound(first);
     const rpc = FakeOmpRpcClient.instances[0];
 
-    rpc.emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "streaming" }] } });
+    rpc.emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "first streaming" }] } });
     await settle();
-    await runtime.handleInbound(second);
-    rpc.emit({ type: "turn_end", message: { role: "assistant", content: [{ type: "text", text: "final" }] } });
-    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "final" }] }] });
-    await settle();
+    const queued = runtime.handleInbound(second);
+    await queued;
 
-    const assistantDeliveries = deliveries.filter((call) => call.method === "update" || call.method === "finalize" || (call.method === "send" && textFromContent(call.content) !== "OMP is currently serving another authenticated conversation. Try again when that run finishes."));
-    expect(assistantDeliveries.map((call) => call.address.channel)).toEqual(["first", "first"]);
-    expect(assistantDeliveries.every((call) => call.context.principal.id === "principal-first" && call.context.origin.channel === "first")).toBe(true);
-    const busy = deliveries.find((call) => textFromContent(call.content) === "OMP is currently serving another authenticated conversation. Try again when that run finishes.");
-    expect(busy).toMatchObject({ address: second.address, context: { principal: second.principal, origin: second.address } });
+    expect(rpc.sent.filter((command) => command.type === "prompt")).toHaveLength(1);
+    const acknowledgement = deliveries.find((call) => textFromContent(call.content)?.includes("finishing another conversation"));
+    expect(acknowledgement).toMatchObject({ address: second.address, context: { principal: second.principal, origin: second.address } });
+
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "first final" }] }] });
+    await waitFor(() => rpc.sent.filter((command) => command.type === "prompt").length === 2);
+    expect(rpc.sent.filter((command) => command.type === "prompt")).toHaveLength(2);
+    rpc.emit({ type: "agent_start" });
+    rpc.emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "second streaming" }] } });
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "second final" }] }] });
+    await runtime.waitUntilIdle();
+
+    const firstFinal = deliveries.find((call) => textFromContent(call.content) === "first final");
+    const secondFinal = deliveries.find((call) => textFromContent(call.content) === "second final");
+    expect(firstFinal).toMatchObject({ address: first.address, context: { principal: first.principal, origin: first.address } });
+    expect(secondFinal).toMatchObject({ address: second.address, context: { principal: second.principal, origin: second.address } });
     await runtime.stop();
   });
 
@@ -493,8 +509,37 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("onboards without invoking the model and gives Telegram turns a mobile conversation contract", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    await runtime.handleInbound(message("commands", "/start"));
+    await runtime.handleInbound(message("commands", "/help"));
+
+    const rpc = FakeOmpRpcClient.instances[0];
+    expect(rpc.sent.filter((command) => command.type === "prompt")).toHaveLength(0);
+    expect(deliveries.some((call) => textFromContent(call.content)?.includes("Send me a message, voice note, photo, or file"))).toBe(true);
+    expect(deliveries.some((call) => {
+      const text = textFromContent(call.content);
+      return text?.includes("Everyday") === true && text.includes("Advanced");
+    })).toBe(true);
+
+    const telegramMessage: InboundMessage = {
+      ...message("telegram", "[Voice transcript: remember that I prefer concise replies]"),
+      identity: { transport: "telegram", account: "default", subject: "42" },
+      address: { transport: "telegram", account: "default", channel: "42" },
+    };
+    await runtime.handleInbound(telegramMessage);
+    const prompt = rpc.sent.findLast((command) => command.type === "prompt");
+    expect(String(prompt?.message)).toContain("Write for a mobile conversation");
+    expect(String(prompt?.message)).toContain("Treat a voice transcript as ordinary user speech");
+    expect(String(prompt?.message)).toContain("Never claim that something was remembered unless the memory write actually succeeded");
+    await runtime.stop();
+  });
+
   test("publishes native commands and drives model selection through the home control center", async () => {
-    expect(runtimeCommandMenu().map(({ command }) => command)).toContain("home");
+    expect(runtimeCommandMenu().map(({ command }) => command)).toEqual([
+      "start", "home", "status", "stop", "new", "tasks", "help",
+    ]);
     expect(runtimeCommandMenu().map(({ command }) => command)).not.toContain("shell");
     expect(runtimeCommandMenu(true).map(({ command }) => command)).toContain("shell");
     present = async (request) => {
