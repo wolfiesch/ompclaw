@@ -481,6 +481,35 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("discards an armed update when the RPC child exits", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const runtime = new RpcGatewayRuntime(
+      { config, delivery: delivery(), updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
+    await runtime.start();
+    await runtime.handleInbound(message("update-rpc-exit", "Activate"));
+    FakeOmpRpcClient.instances[0]!.exit(new Error("RPC child exited"));
+    await waitFor(() => calls.includes("discard"));
+
+    expect(calls).toEqual(["discard"]);
+    await runtime.stop();
+  });
+
   test("dispatches a prompt without waiting for the receipt acknowledgement", async () => {
     const acknowledgement = Promise.withResolvers<void>();
     let acknowledgementStarted = false;

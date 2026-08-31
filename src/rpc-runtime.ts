@@ -557,6 +557,11 @@ export class RpcGatewayRuntime {
     await this.#setTurnLifecycle("interrupted", { error: error.message });
     const active = this.#activeTurn;
     this.#activeTurn = undefined;
+    try {
+      await this.#options.updates?.discardArmed();
+    } catch (discardError) {
+      this.#log.error(`[ompclaw update] failed to discard armed update after RPC exit: ${discardError instanceof Error ? discardError.message : String(discardError)}`);
+    }
     this.#failIdleWaiters(error);
     if (active) {
       active.scheduledCompletion?.reject(error);

@@ -141,7 +141,7 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
       await this.#runCommand(["tar", "-xf", archive, "-C", source], repository, signal);
       const bun = Bun.which("bun");
       if (bun === null) throw new Error("bun is required to stage an OmpClaw update");
-      await this.#runCommand([bun, "install", "--ignore-scripts"], source, signal);
+      await this.#runCommand([bun, "install", "--frozen-lockfile", "--ignore-scripts"], source, signal);
       await this.#runCommand([bun, "run", "check"], source, signal);
       await this.#runCommand([bun, "build", "--compile", "src/rpc-cli.ts", "--outfile", join(artifact, "ompclaw")], source, signal);
       await this.#runCommand([

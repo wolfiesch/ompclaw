@@ -196,7 +196,8 @@ export async function installRpcService(
     const unit = renderSystemdUnit(config, args);
     writeFileSync(path, unit, { mode: 0o600 });
     runManager("systemctl", ["--user", "daemon-reload"]);
-    runManager("systemctl", ["--user", "enable", "--now", SYSTEMD_UNIT]);
+    runManager("systemctl", ["--user", "enable", SYSTEMD_UNIT]);
+    runManager("systemctl", ["--user", "restart", SYSTEMD_UNIT]);
     return { path, manager: "systemd" };
   }
 
