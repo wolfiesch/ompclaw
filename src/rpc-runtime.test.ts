@@ -118,6 +118,7 @@ interface DeliveryCall {
   readonly context: DeliveryContext;
   readonly content?: unknown;
   readonly request?: UiRequest;
+  readonly reaction?: { readonly emoji: string };
   readonly signal?: AbortSignal;
 }
 
@@ -166,8 +167,8 @@ function delivery(): GatewayDelivery {
       deliveries.push({ method: "finalize", address, context, content, signal });
       return [receipt ?? { transport: address.transport, messageId: `receipt-${deliveries.length}` }];
     },
-    react: async (address, _receipt, _reaction, context, signal) => {
-      deliveries.push({ method: "react", address, context, signal });
+    react: async (address, _receipt, reaction, context, signal) => {
+      deliveries.push({ method: "react", address, context, reaction, signal });
     },
     presentUi: async <Request extends UiRequest>(address, request, context, signal): Promise<UiResponseFor<Request>> => {
       deliveries.push({ method: "presentUi", address, context, request, signal });
@@ -276,8 +277,9 @@ describe("RpcGatewayRuntime", () => {
     expect(taskCards).toEqual(expect.arrayContaining([
       "Queued\nDeploy carefully",
       "Working\nDeploy carefully\nChecking the result",
-      "Done\nDeploy carefully",
     ]));
+    expect(taskCards.at(-1)).toBeUndefined();
+    expect(taskCards).not.toContain("Done\nDeploy carefully");
 
     await runtime.handleInbound(message("lifecycle", "/tasks"));
     expect(deliveries.some((call) => textFromContent(call.content)?.includes("Done | Deploy carefully"))).toBe(true);
@@ -327,6 +329,39 @@ describe("RpcGatewayRuntime", () => {
     const secondFinal = deliveries.find((call) => textFromContent(call.content) === "second final");
     expect(firstFinal).toMatchObject({ address: first.address, context: { principal: first.principal, origin: first.address } });
     expect(secondFinal).toMatchObject({ address: second.address, context: { principal: second.principal, origin: second.address } });
+    await runtime.stop();
+  });
+
+  test("acknowledges a request immediately and finalizes a rich reply to its source message", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    const sourceReceipt = { transport: "test", messageId: "source-1" };
+    const inbound = { ...message("companion", "Handle this"), sourceReceipt };
+
+    await runtime.handleInbound(inbound);
+    expect(deliveries).toEqual([
+      expect.objectContaining({ method: "react", reaction: { emoji: "👀" } }),
+    ]);
+
+    const rpc = FakeOmpRpcClient.instances[0];
+    rpc.emit({ type: "agent_start" });
+    rpc.emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "**Working**" }] } });
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "**Finished**\n\n- First result" }] }],
+    });
+    await runtime.waitUntilIdle();
+    await settle();
+
+    expect(deliveries.find((call) => call.method === "finalize")).toMatchObject({
+      content: {
+        text: "**Finished**\n\n- First result",
+        format: "markdown",
+        replyTo: sourceReceipt,
+      },
+    });
+    expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
     await runtime.stop();
   });
 
@@ -566,7 +601,8 @@ describe("RpcGatewayRuntime", () => {
     };
     await runtime.handleInbound(telegramMessage);
     const prompt = rpc.sent.findLast((command) => command.type === "prompt");
-    expect(String(prompt?.message)).toContain("Write for a mobile conversation");
+    expect(String(prompt?.message)).toContain("Treat this as an ongoing personal conversation");
+    expect(String(prompt?.message)).toContain("add Markdown structure only when it helps on a phone");
     expect(String(prompt?.message)).toContain("Treat a voice transcript as ordinary user speech");
     expect(String(prompt?.message)).toContain("Never claim that something was remembered unless the memory write actually succeeded");
     await runtime.stop();
