@@ -148,6 +148,19 @@ describe("Telegram Bot API transport", () => {
     expect(waits).toEqual([500, 1_000]);
   });
 
+  test("retries Bun unable-to-connect failures", async () => {
+    let attempts = 0;
+    await expect(withTelegramRetry(
+      async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("Unable to connect. Is the computer able to access the url?");
+        return "delivered";
+      },
+      { sleep: async () => {} },
+    )).resolves.toBe("delivered");
+    expect(attempts).toBe(2);
+  });
+
   test("bounds retries and does not retry permanent Telegram failures", async () => {
     const transientWaits: number[] = [];
     let transientAttempts = 0;

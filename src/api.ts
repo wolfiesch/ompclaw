@@ -55,7 +55,7 @@ const TELEGRAM_RETRIES = 3;
 /** Upper bound on one `retry_after` wait, so a long ban cannot stall a turn indefinitely. */
 const MAX_RETRY_WAIT_MS = 30_000;
 const TRANSIENT_RETRY_BASE_MS = 500;
-const TRANSIENT_NETWORK_ERROR = /fetch failed|network|socket|connection.*closed|econnreset|etimedout|unexpected eof/i;
+const TRANSIENT_NETWORK_ERROR = /fetch failed|network|socket|unable to connect|connection.*closed|econnreset|etimedout|unexpected eof/i;
 
 function transientRetryDelay(err: unknown, attempt: number): number | undefined {
   if (err instanceof TgError) {
