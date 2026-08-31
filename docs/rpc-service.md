@@ -8,9 +8,13 @@
 
 The runtime starts one OMP child with `--mode rpc-ui`, the configured workspace and profile, and a persisted session path when one exists. It subscribes to OMP subagent progress, registers the gateway host tools, and asks OMP for session state.
 
-An inbound message or scheduled job establishes an active delivery context containing the authenticated principal and the exact transport address. Streamed updates, final assistant text, OMP UI, command output, host-tool delivery, and unexpected-exit notifications go only to that context. A message from a different authenticated conversation during an active turn receives a busy response. It does not join the active turn or receive its output. Due scheduled work defers while the runtime is busy.
+An inbound message or scheduled job establishes an active delivery context containing the authenticated principal and the exact transport address. Streamed updates, final assistant text, OMP UI, command output, host-tool delivery, and unexpected-exit notifications go only to that context. A message from a different authenticated conversation during an active turn is acknowledged and serialized behind it. Due scheduled work defers while the runtime is busy.
 
-Assistant updates are lossless and ordered at the gateway boundary. A first visible assistant update creates an outbound message; later visible updates edit that same receipt when the transport supports it. A terminal OMP response delivers the final visible assistant text and clears the active delivery context. Thinking and tool-call blocks are not forwarded as assistant text.
+The active conversation remains conversational while OMP works. An ordinary message maps to OMP `steer` by default, so "make that shorter" corrects the current response without requiring a slash command. Set `omp.busyInputMode` to `followup` to map those messages to OMP `follow_up` instead. Explicit `/steer` and `/followup` always retain their named behavior.
+
+For each turn, the gateway reacts to the source message, starts and renews the transport typing indicator, and maintains at most one task card. OMP tool intent such as "Reading deployment state" is preferred over generic tool labels. Repeated activities are deduplicated, card edits are coalesced to at most one every 1.25 seconds, raw tool arguments are never shown, and the card clears at terminal completion.
+
+Assistant updates are lossless and ordered at the gateway boundary. A first visible assistant update creates an outbound draft; later updates edit that same receipt when the transport supports it. When OMP completes an assistant segment before a tool call, the gateway finalizes that segment as a normal persistent message and starts a fresh draft for later text. The terminal answer is finalized as Markdown and linked to the source message. Thinking and tool-call blocks are not forwarded as assistant text.
 
 ## Gateway command matrix
 
@@ -57,7 +61,7 @@ Send these commands as a slash command in an authenticated conversation. Any oth
 | `/shell <command>` | execute OMP RPC bash only when `omp.allowRpcBash` is explicitly `true` |
 | `/abortbash` | abort OMP RPC bash only when `omp.allowRpcBash` is explicitly `true` |
 
-`/steer`, `/followup`, and `/stop` are the run-control surface. `/queue` changes OMP's queue policy, while the gateway itself maintains one active delivery context and rejects a different conversation as busy while that context is active.
+`/steer`, `/followup`, and `/stop` are the explicit run-control surface. An ordinary message in the active conversation follows `omp.busyInputMode`; the default is `steer`. `/queue` changes OMP's own queue policy. The gateway serializes other authenticated conversations behind the active delivery context.
 
 ## Session checkpoint and crash recovery
 

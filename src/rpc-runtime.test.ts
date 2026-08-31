@@ -115,7 +115,7 @@ mock.module("./rpc-client", () => ({
 const { RpcGatewayRuntime, runtimeCommandMenu } = await import("./rpc-runtime");
 
 interface DeliveryCall {
-  readonly method: "send" | "update" | "finalize" | "react" | "presentUi";
+  readonly method: "send" | "typing" | "update" | "finalize" | "react" | "presentUi";
   readonly address: ConversationAddress;
   readonly context: DeliveryContext;
   readonly content?: unknown;
@@ -137,6 +137,7 @@ const config: RpcRuntimeConfig = {
   allowRpcBash: false,
   inheritHarness: false,
   autoRestart: false,
+  busyInputMode: "steer",
 };
 
 function defaultUiResponse<Request extends UiRequest>(request: Request): UiResponseFor<Request> {
@@ -160,6 +161,9 @@ function delivery(onReact?: (reaction: { readonly emoji: string }) => Promise<vo
     send: async (address, content, context, signal) => {
       deliveries.push({ method: "send", address, context, content, signal });
       return { transport: address.transport, messageId: `message-${deliveries.length}` };
+    },
+    typing: async (address, context, signal) => {
+      deliveries.push({ method: "typing", address, context, signal });
     },
     update: async (address, receipt, content, context, signal) => {
       deliveries.push({ method: "update", address, context, content, signal });
@@ -251,23 +255,46 @@ describe("RpcGatewayRuntime", () => {
         .slice(0, limit),
     };
     let now = 100;
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), turnStore, now: () => now++ });
+    const runtime = new RpcGatewayRuntime({
+      config,
+      delivery: delivery(),
+      turnStore,
+      now: () => {
+        const current = now;
+        now += 2_000;
+        return current;
+      },
+    });
     await runtime.start();
     expect(turns.get("stale")).toMatchObject({ state: "interrupted", finishedAt: 100 });
 
     await runtime.handleInbound(message("lifecycle", "Deploy carefully"));
     const rpc = FakeOmpRpcClient.instances[0];
     rpc.emit({ type: "agent_start" });
-    rpc.emit({ type: "tool_execution_start", toolName: "bash" });
+    rpc.emit({
+      type: "tool_execution_start",
+      toolName: "bash",
+      args: { i: "Checking deployment result", command: "echo TOP_SECRET" },
+    });
+    await waitFor(() => deliveries.some((call) =>
+      call.method === "presentUi"
+      && call.request?.type === "status"
+      && call.request.key === "Task"
+      && call.request.text?.includes("Checking deployment result") === true
+    ));
     rpc.emit({ type: "tool_execution_end", toolName: "bash" });
     rpc.emit({
       type: "agent_end",
       isTerminal: true,
       messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }],
     });
-    await settle();
-    await Bun.sleep(0);
-    await settle();
+    await runtime.waitUntilIdle();
+    await waitFor(() => {
+      const cards = deliveries.filter((call) =>
+        call.method === "presentUi" && call.request?.type === "status" && call.request.key === "Task"
+      );
+      return cards.at(-1)?.request?.type === "status" && cards.at(-1)?.request?.text === undefined;
+    });
 
     expect(turns.get("lifecycle-Deploy carefully")).toMatchObject({
       state: "completed",
@@ -277,12 +304,10 @@ describe("RpcGatewayRuntime", () => {
     const taskCards = deliveries
       .filter((call) => call.method === "presentUi" && call.request?.type === "status" && call.request.key === "Task")
       .map((call) => call.request && "text" in call.request ? call.request.text : undefined);
-    expect(taskCards).toEqual(expect.arrayContaining([
-      "Queued\nDeploy carefully",
-      "Working\nDeploy carefully\nChecking the result",
-    ]));
+    expect(taskCards).toContain("Looking into it\n• Checking deployment result");
     expect(taskCards.at(-1)).toBeUndefined();
-    expect(taskCards).not.toContain("Done\nDeploy carefully");
+    expect(taskCards.join("\n")).not.toContain("bash");
+    expect(taskCards.join("\n")).not.toContain("TOP_SECRET");
 
     await runtime.handleInbound(message("lifecycle", "/tasks"));
     expect(deliveries.some((call) => textFromContent(call.content)?.includes("Done | Deploy carefully"))).toBe(true);
@@ -299,6 +324,7 @@ describe("RpcGatewayRuntime", () => {
     expect(runtime.isActiveConversation(first)).toBe(true);
     expect(runtime.isActiveConversation(second)).toBe(false);
     expect(runtime.canHandleInboundImmediately(message("first", "/steer correct this"))).toBe(true);
+    expect(runtime.canHandleInboundImmediately(message("first", "correct this naturally"))).toBe(true);
     expect(runtime.canHandleInboundImmediately(message("first", "/abortbash"))).toBe(false);
     expect(runtime.canHandleInboundImmediately(message("first", "/new"))).toBe(false);
     expect(runtime.canHandleInboundImmediately(message("first", "/switch /sessions/other"))).toBe(false);
@@ -335,6 +361,52 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("treats an ordinary message in the active conversation as a correction", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    await runtime.handleInbound(message("same", "Draft the rollout"));
+    const rpc = FakeOmpRpcClient.instances[0];
+    const correction = {
+      ...message("same", "Make it shorter and lead with the risk"),
+      sourceReceipt: { transport: "test", messageId: "source-correction" },
+    };
+
+    await runtime.handleInbound(correction);
+    await settle();
+
+    expect(rpc.sent.filter((command) => command.type === "prompt")).toHaveLength(1);
+    expect(rpc.sent.findLast((command) => command.type === "steer")).toMatchObject({
+      type: "steer",
+      message: expect.stringContaining("Make it shorter and lead with the risk"),
+    });
+    expect(deliveries.some((call) => textFromContent(call.content)?.includes("finishing another conversation"))).toBe(false);
+    expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
+
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Short result" }] }] });
+    await runtime.waitUntilIdle();
+    await runtime.stop();
+  });
+
+  test("can queue ordinary active-conversation messages as follow-ups by configuration", async () => {
+    const runtime = new RpcGatewayRuntime({
+      config: { ...config, busyInputMode: "followup" },
+      delivery: delivery(),
+    });
+    await runtime.start();
+    await runtime.handleInbound(message("same", "Investigate the issue"));
+    const rpc = FakeOmpRpcClient.instances[0];
+
+    await runtime.handleInbound(message("same", "Then summarize the evidence"));
+
+    expect(rpc.sent.findLast((command) => command.type === "follow_up")).toMatchObject({
+      type: "follow_up",
+      message: expect.stringContaining("Then summarize the evidence"),
+    });
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Finished" }] }] });
+    await runtime.waitUntilIdle();
+    await runtime.stop();
+  });
+
   test("acknowledges a request immediately and finalizes a rich reply to its source message", async () => {
     const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
     await runtime.start();
@@ -344,6 +416,7 @@ describe("RpcGatewayRuntime", () => {
     await runtime.handleInbound(inbound);
     expect(deliveries).toEqual([
       expect.objectContaining({ method: "react", reaction: { emoji: "👀" } }),
+      expect.objectContaining({ method: "typing" }),
     ]);
 
     const rpc = FakeOmpRpcClient.instances[0];
@@ -507,6 +580,47 @@ describe("RpcGatewayRuntime", () => {
     await waitFor(() => calls.includes("discard"));
 
     expect(calls).toEqual(["discard"]);
+    await runtime.stop();
+  });
+
+  test("publishes completed commentary before the final answer", async () => {
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    const sourceReceipt = { transport: "test", messageId: "source-segments" };
+    await runtime.handleInbound({ ...message("segments", "Investigate this"), sourceReceipt });
+    const rpc = FakeOmpRpcClient.instances[0];
+
+    rpc.emit({ type: "agent_start" });
+    rpc.emit({
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "text", text: "I found the first constraint." }] },
+    });
+    rpc.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "text", text: "I found the first constraint." }],
+      },
+    });
+    await waitFor(() => deliveries.some((call) =>
+      call.method === "finalize" && textFromContent(call.content) === "I found the first constraint."
+    ));
+
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "**Final answer**" }] }],
+    });
+    await runtime.waitUntilIdle();
+
+    const segments = deliveries
+      .filter((call) => call.method === "finalize")
+      .map((call) => textFromContent(call.content));
+    expect(segments).toEqual(["I found the first constraint.", "**Final answer**"]);
+    expect(deliveries.find((call) => textFromContent(call.content) === "**Final answer**")).toMatchObject({
+      content: { replyTo: sourceReceipt },
+    });
     await runtime.stop();
   });
 
@@ -761,10 +875,10 @@ describe("RpcGatewayRuntime", () => {
     rpc.emit({ type: "command_output", text: "first event" });
     rpc.emit({ type: "command_output", text: "second event" });
     await firstDeliveryStarted.promise;
-    expect(deliveries.map((call) => textFromContent(call.content))).toEqual(["first event"]);
+    expect(deliveries.filter((call) => call.method === "send").map((call) => textFromContent(call.content))).toEqual(["first event"]);
     firstDelivery.resolve({ transport: "test", messageId: "first" });
     await secondDeliveryStarted.promise;
-    expect(deliveries.map((call) => textFromContent(call.content))).toEqual(["first event", "second event"]);
+    expect(deliveries.filter((call) => call.method === "send").map((call) => textFromContent(call.content))).toEqual(["first event", "second event"]);
     await runtime.stop();
   });
 
@@ -789,7 +903,7 @@ describe("RpcGatewayRuntime", () => {
     rpc.emit({ type: "command_output", text: "failed event" });
     rpc.emit({ type: "command_output", text: "later event" });
     await laterDeliveryStarted.promise;
-    expect(deliveries.map((call) => textFromContent(call.content))).toEqual(["failed event", "later event"]);
+    expect(deliveries.filter((call) => call.method === "send").map((call) => textFromContent(call.content))).toEqual(["failed event", "later event"]);
     expect(await runtime.statusText()).toContain("Last error: delivery failed");
     expect(logErrors).toEqual(["[ompclaw rpc] frame handler failed: delivery failed"]);
     await runtime.stop();

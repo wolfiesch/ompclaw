@@ -8,6 +8,13 @@ All notable changes to this project will be documented in this file.
 
 - Add opt-in transactional self-update from a fixed trusted checkout, with isolated release builds, post-response activation, an external service supervisor, startup readiness verification, automatic rollback, and post-restart result delivery.
 
+## 0.8.0 (2026-08-31)
+
+### Changed
+
+- Present active Telegram turns with a renewed typing indicator, one throttled activity card based on OMP intent, persistent commentary segments, and a source-linked final answer.
+- Treat an ordinary message in the active conversation as an immediate correction by default, with configurable follow-up routing through `omp.busyInputMode`.
+
 ## 0.7.0 (2026-08-31)
 
 ### Changed

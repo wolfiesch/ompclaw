@@ -321,6 +321,27 @@ describe("GatewayCore", () => {
     expect(calls).toEqual(["send", "update", "finalize", "react", "ui"]);
   });
 
+  test("delegates typing when supported and resolves when the transport omits it", async () => {
+    const calls: Array<{ address: ConversationAddress; context: DeliveryContext; signal?: AbortSignal }> = [];
+    const gateway = core();
+    gateway.register(adapter("unsupported"));
+    gateway.register({
+      ...adapter("supported"),
+      async typing(target, context, signal): Promise<void> {
+        calls.push({ address: target, context, signal });
+      },
+    });
+
+    const unsupportedTarget = address("unsupported");
+    const supportedTarget = address("supported");
+    const supportedContext = deliveryContext(supportedTarget);
+    const controller = new AbortController();
+    await expect(gateway.typing(unsupportedTarget, deliveryContext(unsupportedTarget))).resolves.toBeUndefined();
+    await expect(gateway.typing(supportedTarget, supportedContext, controller.signal)).resolves.toBeUndefined();
+
+    expect(calls).toEqual([{ address: supportedTarget, context: supportedContext, signal: controller.signal }]);
+  });
+
   test("rejects every cross-origin delivery before calling adapters", async () => {
     const calls: string[] = [];
     const origin = address("telegram", { thread: "origin-thread" });

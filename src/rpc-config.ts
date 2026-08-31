@@ -14,6 +14,7 @@ export interface RpcRuntimeConfig {
   allowRpcBash: boolean;
   inheritHarness: boolean;
   autoRestart: boolean;
+  busyInputMode: "steer" | "followup";
 }
 
 export function buildOmpRpcArgv(config: RpcRuntimeConfig, resume = config.resume): string[] {

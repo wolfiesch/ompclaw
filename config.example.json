@@ -6,6 +6,7 @@
     "command": "omp",
     "configFiles": [],
     "args": [],
+    "busyInputMode": "steer",
     "allowRpcBash": false,
     "inheritHarness": false,
     "autoRestart": true

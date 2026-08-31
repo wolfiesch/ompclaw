@@ -22,6 +22,7 @@ export interface GatewayOmpConfig {
   readonly allowRpcBash: boolean;
   readonly inheritHarness: boolean;
   readonly autoRestart: boolean;
+  readonly busyInputMode: "steer" | "followup";
 }
 
 export interface GatewayTelegramTopicSessionsConfig {
@@ -186,6 +187,7 @@ export function gatewayRpcRuntimeConfig(config: GatewayConfig): RpcRuntimeConfig
     allowRpcBash: config.omp.allowRpcBash,
     inheritHarness: config.omp.inheritHarness,
     autoRestart: config.omp.autoRestart,
+    busyInputMode: config.omp.busyInputMode,
   };
 }
 
@@ -217,16 +219,33 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
       allowRpcBash: false,
       inheritHarness: false,
       autoRestart: true,
+      busyInputMode: "steer",
     };
   }
   const omp = object(value, "omp");
   rejectUnknown(
     omp,
-    ["command", "model", "resume", "sessionDir", "configFiles", "args", "authBrokerTokenFile", "allowRpcBash", "inheritHarness", "autoRestart"],
+    [
+      "command",
+      "model",
+      "resume",
+      "sessionDir",
+      "configFiles",
+      "args",
+      "authBrokerTokenFile",
+      "allowRpcBash",
+      "inheritHarness",
+      "autoRestart",
+      "busyInputMode",
+    ],
     "omp",
   );
   const configFiles = stringArray(omp.configFiles, "omp.configFiles", MAX_OMP_ARGS).map((path) => expandGatewayPath(path, cwd));
   const args = stringArray(omp.args, "omp.args", MAX_OMP_ARGS);
+  const busyInputMode = omp.busyInputMode === undefined ? "steer" : nonEmptyString(omp.busyInputMode, "omp.busyInputMode");
+  if (busyInputMode !== "steer" && busyInputMode !== "followup") {
+    throw new Error('omp.busyInputMode must be "steer" or "followup"');
+  }
   return {
     command: omp.command === undefined ? "omp" : nonEmptyString(omp.command, "omp.command"),
     ...(omp.model === undefined ? {} : { model: nonEmptyString(omp.model, "omp.model") }),
@@ -240,6 +259,7 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
     allowRpcBash: boolean(omp.allowRpcBash, "omp.allowRpcBash", false),
     inheritHarness: boolean(omp.inheritHarness, "omp.inheritHarness", false),
     autoRestart: boolean(omp.autoRestart, "omp.autoRestart", true),
+    busyInputMode,
   };
 }
 

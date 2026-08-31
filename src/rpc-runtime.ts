@@ -79,7 +79,16 @@ interface ActiveTurn extends GatewayTurnTarget {
   receipt?: OutboundReceipt;
   previewText?: string;
   finalText?: string;
+  lastCommentaryText?: string;
   lifecycle?: TurnLifecycle;
+  activities: string[];
+  statusText?: string;
+  statusUpdatedAt?: number;
+  statusTimer?: NodeJS.Timeout;
+  statusPending?: TurnLifecycle;
+  statusQueued?: boolean;
+  statusUrgent?: boolean;
+  typingTimer?: NodeJS.Timeout;
   scheduledCompletion?: {
     readonly resolve: () => void;
     readonly reject: (error: Error) => void;
@@ -260,6 +269,33 @@ function activityForTool(toolName: string): string {
   return "Working";
 }
 
+function conciseActivity(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (text.length === 0) return undefined;
+  return text.slice(0, 120);
+}
+
+function activityForFrame(frame: RpcRecord): string {
+  const intent = conciseActivity(frame.intent);
+  if (intent !== undefined) return intent;
+  const args = isRecord(frame.args) ? frame.args : undefined;
+  const described = conciseActivity(args?.i);
+  if (described !== undefined) return described;
+  return activityForTool(typeof frame.toolName === "string" ? frame.toolName : "tool");
+}
+
+function activityTimeline(activities: readonly string[]): string {
+  const limit = 8;
+  const hidden = Math.max(0, activities.length - limit);
+  const recent = activities.slice(-limit);
+  return [
+    "Looking into it",
+    ...(hidden > 0 ? [`• ${hidden} earlier ${hidden === 1 ? "step" : "steps"}`] : []),
+    ...recent.map((activity) => `• ${activity}`),
+  ].join("\n");
+}
+
 function lifecycleLabel(state: TurnLifecycleState): string {
   const labels: Record<TurnLifecycleState, string> = {
     queued: "Queued",
@@ -316,6 +352,8 @@ export class RpcGatewayRuntime {
   #queuedConversationCount = 0;
   readonly #reactionQueues = new Map<string, Promise<void>>();
   readonly #idleWaiters = new Set<PromiseWithResolvers<void>>();
+  static readonly #TURN_CARD_THROTTLE_MS = 1_250;
+  static readonly #TYPING_REFRESH_MS = 4_000;
 
   constructor(options: RpcGatewayRuntimeOptions, logger: RpcRuntimeLogger = console) {
     this.#options = options;
@@ -347,6 +385,7 @@ export class RpcGatewayRuntime {
     await this.#setTurnLifecycle("interrupted", { error: stopped.message });
     this.#hostTools.clear();
     const active = this.#activeTurn;
+    if (active) this.#stopTurnPresentation(active);
     this.#activeTurn = undefined;
     active?.scheduledCompletion?.reject(stopped);
     this.#failIdleWaiters(stopped);
@@ -354,13 +393,18 @@ export class RpcGatewayRuntime {
     this.#rpc = undefined;
     await rpc?.stop();
     await this.#frameQueue;
+    await this.#turnCardQueue;
   }
 
   async handleInbound(message: InboundMessage): Promise<void> {
     const delivery = this.#deliveryFor(message);
     const parsed = parseSlashCommand(message.content.text);
     const active = this.#activeTurn;
-    const differentConversation = active !== undefined && !this.#sameDelivery(active, delivery);
+    const sameActiveConversation = active !== undefined && this.#sameDelivery(active, delivery);
+    if (sameActiveConversation && parsed === undefined) {
+      return this.#deliverBusyInput(message, delivery);
+    }
+    const differentConversation = active !== undefined && !sameActiveConversation;
     if (differentConversation && parsed && CROSS_DELIVERY_COMMANDS.has(parsed.name)) {
       if (await this.#handleCommand(delivery, parsed.name, parsed.args)) return;
     }
@@ -383,8 +427,10 @@ export class RpcGatewayRuntime {
 
   canHandleInboundImmediately(message: InboundMessage): boolean {
     const parsed = parseSlashCommand(message.content.text);
-    if (parsed === undefined) return false;
     const active = this.#activeTurn;
+    if (parsed === undefined) {
+      return active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message));
+    }
     if (active !== undefined && this.#sameDelivery(active, this.#deliveryFor(message))) {
       return SAME_DELIVERY_IMMEDIATE_COMMANDS.has(parsed.name)
         && (parsed.name !== "abortbash" || this.#options.config.allowRpcBash);
@@ -556,6 +602,7 @@ export class RpcGatewayRuntime {
     this.#ui = undefined;
     await this.#setTurnLifecycle("interrupted", { error: error.message });
     const active = this.#activeTurn;
+    if (active) this.#stopTurnPresentation(active);
     this.#activeTurn = undefined;
     try {
       await this.#options.updates?.discardArmed();
@@ -618,17 +665,30 @@ export class RpcGatewayRuntime {
     if (frame.type === "agent_start") {
       await this.#setTurnLifecycle("running");
       if (this.#status.state) this.#status.state.isStreaming = true;
-      await this.#beginAssistantPreview();
+      const active = this.#activeTurn;
+      if (active) this.#startTypingHeartbeat(active);
       return;
     }
     if (frame.type === "tool_execution_start") {
-      this.#status.currentTool = activityForTool(typeof frame.toolName === "string" ? frame.toolName : "tool");
-      await this.#setTurnLifecycle("running", { currentTool: this.#status.currentTool });
+      const activity = activityForFrame(frame);
+      this.#status.currentTool = activity;
+      const active = this.#activeTurn;
+      if (active && !active.activities.includes(activity)) active.activities.push(activity);
+      await this.#setTurnLifecycle("running", { currentTool: activity });
       return;
     }
     if (frame.type === "tool_execution_end") {
       this.#status.currentTool = undefined;
       await this.#setTurnLifecycle("running", { clearCurrentTool: true });
+      return;
+    }
+    if (frame.type === "message_end") {
+      const text = assistantText(frame.message);
+      if (isRecord(frame.message) && frame.message.stopReason === "toolUse" && text.trim().length > 0) {
+        await this.#finalizeAssistantCommentary(text);
+      } else {
+        await this.#deliverAssistantPreview(text);
+      }
       return;
     }
     if (frame.type === "message_update" || frame.type === "turn_end") {
@@ -642,6 +702,7 @@ export class RpcGatewayRuntime {
     if (frame.type === "prompt_result" && frame.agentInvoked === false) {
       await this.#setTurnLifecycle("completed");
       const active = this.#activeTurn;
+      if (active) this.#stopTurnPresentation(active);
       this.#activeTurn = undefined;
       if (this.#status.state) this.#status.state.isStreaming = false;
       this.#wakeIdleWaiters();
@@ -664,6 +725,7 @@ export class RpcGatewayRuntime {
         active?.scheduledCompletion?.reject(error instanceof Error ? error : new Error(String(error)));
         throw error;
       } finally {
+        if (active) this.#stopTurnPresentation(active);
         this.#activeTurn = undefined;
         if (this.#status.state) this.#status.state.isStreaming = false;
         this.#wakeIdleWaiters();
@@ -710,6 +772,24 @@ export class RpcGatewayRuntime {
       await this.#setTurnLifecycle("failed", { error: error instanceof Error ? error.message : String(error) });
       this.#clearActiveDelivery(delivery);
       await this.#send(delivery, `Prompt failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => {});
+      throw error;
+    }
+  }
+
+  async #deliverBusyInput(message: InboundMessage, delivery: GatewayTurnTarget): Promise<void> {
+    const mode = this.#options.config.busyInputMode;
+    this.#queueSourceReaction(delivery, "👀");
+    try {
+      const input = await this.#promptInput(message);
+      await this.#sendRpc({
+        type: mode === "followup" ? "follow_up" : "steer",
+        message: input.prompt,
+        ...(input.images.length > 0 ? { images: input.images } : {}),
+      });
+      this.#queueSourceReaction(delivery, "👍");
+    } catch (error) {
+      this.#queueSourceReaction(delivery, "👎");
+      await this.#send(delivery, `${mode === "followup" ? "Follow-up" : "Correction"} failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => {});
       throw error;
     }
   }
@@ -1148,11 +1228,17 @@ export class RpcGatewayRuntime {
   }
 
   #activate(delivery: GatewayTurnTarget | ActiveTurn): void {
-    if (!this.#activeTurn) this.#activeTurn = { ...delivery };
+    if (!this.#activeTurn) {
+      this.#activeTurn = {
+        ...delivery,
+        activities: "activities" in delivery ? [...delivery.activities] : [],
+      };
+    }
   }
 
   #clearActiveDelivery(delivery: RpcGatewayUiTarget, terminal = false): void {
     if (!this.#activeTurn || !this.#sameDelivery(this.#activeTurn, delivery)) return;
+    this.#stopTurnPresentation(this.#activeTurn);
     this.#activeTurn = undefined;
     if (terminal && this.#status.state) this.#status.state.isStreaming = false;
     this.#wakeIdleWaiters();
@@ -1187,14 +1273,6 @@ export class RpcGatewayRuntime {
     scheduledCompletion?: ActiveTurn["scheduledCompletion"],
   ): Promise<void> {
     if (this.#activeTurn) return;
-    if (!this.#options.turnStore) {
-      this.#activeTurn = {
-        ...delivery,
-        ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
-      };
-      this.#queueSourceReaction(this.#activeTurn, "👀");
-      return;
-    }
     const now = this.#now();
     const prompt = (message.content.text ?? message.content.attachments?.[0]?.name ?? "Attachment")
       .replace(/\s+/g, " ")
@@ -1209,14 +1287,15 @@ export class RpcGatewayRuntime {
       createdAt: now,
       updatedAt: now,
     };
-    this.#options.turnStore.putTurnLifecycle(lifecycle);
+    this.#options.turnStore?.putTurnLifecycle(lifecycle);
     this.#activeTurn = {
       ...delivery,
       lifecycle,
+      activities: [],
       ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
     };
-    this.#queueTurnCard(this.#activeTurn);
     this.#queueSourceReaction(this.#activeTurn, "👀");
+    this.#startTypingHeartbeat(this.#activeTurn);
   }
 
   async #setTurnLifecycle(
@@ -1243,32 +1322,69 @@ export class RpcGatewayRuntime {
     };
     active.lifecycle = updated;
     this.#options.turnStore?.putTurnLifecycle(updated);
-    this.#queueTurnCard(active);
+    if (state !== "queued") this.#queueTurnCard(active, updated, terminal);
   }
 
-  #queueTurnCard(active: ActiveTurn): void {
-    const lifecycle = active.lifecycle;
-    if (!lifecycle) return;
-    this.#turnCardQueue = this.#turnCardQueue.then(() => this.#renderTurnCard(active, lifecycle));
+  #queueTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle, urgent = false): void {
+    active.statusPending = lifecycle;
+    active.statusUrgent = active.statusUrgent === true || urgent;
+    if (urgent && active.statusTimer !== undefined) {
+      clearTimeout(active.statusTimer);
+      active.statusTimer = undefined;
+    }
+    if (active.statusQueued || active.statusTimer !== undefined) return;
+    const elapsed = active.statusUpdatedAt === undefined ? Number.POSITIVE_INFINITY : this.#now() - active.statusUpdatedAt;
+    const delay = active.statusUrgent === true
+      ? 0
+      : Math.max(0, RpcGatewayRuntime.#TURN_CARD_THROTTLE_MS - elapsed);
+    if (delay === 0) {
+      this.#enqueueTurnCard(active);
+      return;
+    }
+    active.statusTimer = setTimeout(() => {
+      active.statusTimer = undefined;
+      this.#enqueueTurnCard(active);
+    }, delay);
+    active.statusTimer.unref?.();
+  }
+
+  #enqueueTurnCard(active: ActiveTurn): void {
+    if (active.statusQueued) return;
+    active.statusQueued = true;
+    this.#turnCardQueue = this.#turnCardQueue.then(async () => {
+      active.statusQueued = false;
+      const lifecycle = active.statusPending;
+      active.statusPending = undefined;
+      active.statusUrgent = false;
+      if (lifecycle !== undefined) await this.#renderTurnCard(active, lifecycle);
+      if (active.statusPending !== undefined) {
+        this.#queueTurnCard(active, active.statusPending, Boolean(active.statusUrgent));
+      }
+    });
   }
 
   async #renderTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle): Promise<void> {
     const text = lifecycle.state === "completed"
       ? undefined
-      : [
-        lifecycleLabel(lifecycle.state),
-        lifecycle.prompt,
-        lifecycle.currentTool ?? "",
-        lifecycle.error ? `Problem: ${lifecycle.error}` : "",
-      ].filter(Boolean).join("\n");
+      : lifecycle.state === "running"
+        ? activityTimeline(active.activities)
+        : [
+          lifecycleLabel(lifecycle.state),
+          ...active.activities.slice(-8).map((activity) => `• ${activity}`),
+          lifecycle.error ? `Problem: ${lifecycle.error}` : "",
+        ].filter(Boolean).join("\n");
+    if (text === active.statusText) return;
     try {
       await this.#options.delivery.presentUi(
         active.address,
         { type: "status", key: "Task", text },
         active.deliveryContext,
       );
+      active.statusText = text;
     } catch (error) {
       this.#log.warn(`[ompclaw rpc] Unable to render task lifecycle: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      active.statusUpdatedAt = this.#now();
     }
   }
 
@@ -1282,16 +1398,6 @@ export class RpcGatewayRuntime {
     }).join("\n");
   }
 
-  async #beginAssistantPreview(): Promise<void> {
-    const active = this.#activeTurn;
-    if (!active || active.receipt !== undefined) return;
-    active.receipt = await this.#options.delivery.send(
-      active.address,
-      { text: "", format: "text", transient: true },
-      active.deliveryContext,
-    );
-    active.previewText = "";
-  }
 
   #terminalState(messages: unknown): "completed" | "stopped" | "failed" {
     if (!Array.isArray(messages)) return "completed";
@@ -1359,9 +1465,27 @@ export class RpcGatewayRuntime {
     active.previewText = text;
   }
 
+  async #finalizeAssistantCommentary(text: string): Promise<void> {
+    const active = this.#activeTurn;
+    if (!active || text.trim().length === 0 || active.lastCommentaryText === text) return;
+    await this.#options.delivery.finalize(
+      active.address,
+      active.receipt,
+      { text, format: "markdown" },
+      active.deliveryContext,
+    );
+    active.receipt = undefined;
+    active.previewText = undefined;
+    active.lastCommentaryText = text;
+  }
+
   async #finalizeAssistantText(text: string): Promise<boolean> {
     const active = this.#activeTurn;
     if (!active || text.trim().length === 0 || active.finalText === text) return false;
+    if (active.receipt === undefined && active.lastCommentaryText === text) {
+      active.finalText = text;
+      return true;
+    }
     const receipts = await this.#options.delivery.finalize(
       active.address,
       active.receipt,
@@ -1372,6 +1496,27 @@ export class RpcGatewayRuntime {
     active.previewText = text;
     active.finalText = text;
     return true;
+  }
+
+  #startTypingHeartbeat(active: ActiveTurn): void {
+    if (active.typingTimer !== undefined || this.#options.delivery.typing === undefined) return;
+    const pulse = (): void => {
+      if (this.#activeTurn !== active) return;
+      void this.#options.delivery.typing?.(active.address, active.deliveryContext)
+        .catch((error: unknown) => {
+          this.#log.warn(`[ompclaw rpc] Unable to refresh typing status: ${error instanceof Error ? error.message : String(error)}`);
+        });
+    };
+    pulse();
+    active.typingTimer = setInterval(pulse, RpcGatewayRuntime.#TYPING_REFRESH_MS);
+    active.typingTimer.unref?.();
+  }
+
+  #stopTurnPresentation(active: ActiveTurn): void {
+    if (active.typingTimer !== undefined) clearInterval(active.typingTimer);
+    active.typingTimer = undefined;
+    if (active.statusTimer !== undefined) clearTimeout(active.statusTimer);
+    active.statusTimer = undefined;
   }
 
   async #handleHostToolCall(call: RpcHostToolCall): Promise<void> {

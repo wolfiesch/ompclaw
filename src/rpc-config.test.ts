@@ -19,6 +19,7 @@ function runtimeConfig(overrides: Partial<RpcRuntimeConfig> = {}): RpcRuntimeCon
     allowRpcBash: false,
     inheritHarness: false,
     autoRestart: true,
+    busyInputMode: "steer",
     ...overrides,
   };
 }

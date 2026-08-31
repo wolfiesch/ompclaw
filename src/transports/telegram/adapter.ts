@@ -471,6 +471,14 @@ export class TelegramTransportAdapter implements TransportAdapter {
     return sent;
   }
 
+  async typing(
+    address: ConversationAddress,
+    context: DeliveryContext,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.#outbound.typing(address, context, signal);
+  }
+
   async update(
     address: ConversationAddress,
     receipt: OutboundReceipt,
