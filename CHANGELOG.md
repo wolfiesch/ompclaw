@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.5.1 (2026-08-31)
+
+### Fixed
+
+- Retry bounded transient Telegram network and server failures so a completed OMP response is not dropped when final delivery is interrupted.
+
 ## 0.5.0 (2026-08-30)
 
 ### Added

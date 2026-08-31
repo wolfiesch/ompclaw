@@ -8,7 +8,7 @@
 
 Use it when a trusted operator needs remote access to an OMP workspace without placing transport credentials in OMP configuration or handing clients an OMP process directly. Telegram and WebSocket are authenticated adapters around the same serialized runtime. HTTP is health-only.
 
-- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.5.0`
+- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.5.1`
 - **Repository:** [`wolfiesch/ompclaw`](https://github.com/wolfiesch/ompclaw)
 - **License:** [MIT](LICENSE)
 - **Upstream provenance:** [TerrifiedBug/omp-telegram](https://github.com/TerrifiedBug/omp-telegram), preserved in [NOTICE](NOTICE)

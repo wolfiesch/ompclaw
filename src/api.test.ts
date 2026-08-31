@@ -22,7 +22,7 @@ import {
   tg,
   tgUpload,
   webhookConflictHint,
-  withRateLimit,
+  withTelegramRetry,
 } from "./api";
 
 const originalFetch = globalThis.fetch;
@@ -112,7 +112,7 @@ describe("Telegram Bot API transport", () => {
     const controller = new AbortController();
     const sleeping = Promise.withResolvers<void>();
     let attempts = 0;
-    const operation = withRateLimit(
+    const operation = withTelegramRetry(
       async () => {
         attempts++;
         throw new TgError("rate limited", 429, 30);
@@ -129,6 +129,44 @@ describe("Telegram Bot API transport", () => {
     controller.abort(new Error("cancelled"));
     await expect(operation).rejects.toThrow("cancelled");
     expect(attempts).toBe(1);
+  });
+
+  test("retries transient Bot API socket closures with exponential backoff", async () => {
+    const waits: number[] = [];
+    let attempts = 0;
+    const result = await withTelegramRetry(
+      async () => {
+        attempts++;
+        if (attempts < 3) throw new TypeError("The socket connection was closed unexpectedly");
+        return "delivered";
+      },
+      { sleep: async (ms) => void waits.push(ms) },
+    );
+
+    expect(result).toBe("delivered");
+    expect(attempts).toBe(3);
+    expect(waits).toEqual([500, 1_000]);
+  });
+
+  test("bounds retries and does not retry permanent Telegram failures", async () => {
+    const transientWaits: number[] = [];
+    let transientAttempts = 0;
+    await expect(withTelegramRetry(
+      async () => {
+        transientAttempts++;
+        throw new TypeError("fetch failed: ECONNRESET");
+      },
+      { sleep: async (ms) => void transientWaits.push(ms) },
+    )).rejects.toThrow("ECONNRESET");
+    expect(transientAttempts).toBe(4);
+    expect(transientWaits).toEqual([500, 1_000, 2_000]);
+
+    let permanentAttempts = 0;
+    await expect(withTelegramRetry(async () => {
+      permanentAttempts++;
+      throw new TgError("Bad Request", 400);
+    })).rejects.toThrow("Bad Request");
+    expect(permanentAttempts).toBe(1);
   });
 
   test("downloads exact file bytes and rejects HTTP failures", async () => {

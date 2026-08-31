@@ -210,6 +210,27 @@ test("uses native Telegram drafts for transient streaming and persists only the 
   ]);
 });
 
+test("retries a transient socket closure while finalizing a Telegram draft", async () => {
+  let sendAttempts = 0;
+  const send = outbound(
+    async (method) => {
+      if (method === "sendMessageDraft") return true;
+      sendAttempts++;
+      if (sendAttempts === 1) throw new TypeError("The socket connection was closed unexpectedly");
+      return { message_id: 22 };
+    },
+    undefined,
+    undefined,
+    () => 8,
+  );
+
+  const preview = await send.send(address, { text: "", transient: true }, delivery());
+  await expect(send.finalize(address, preview, { text: "complete" }, delivery())).resolves.toEqual([
+    { transport: "telegram", messageId: "22" },
+  ]);
+  expect(sendAttempts).toBe(2);
+});
+
 test("falls back to Telegram typing when native drafts are unavailable", async () => {
   const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
   const send = outbound(
