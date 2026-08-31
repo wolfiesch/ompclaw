@@ -631,12 +631,12 @@ export class RpcGatewayRuntime {
     if (frame.type === "prompt_result" && frame.agentInvoked === false) {
       await this.#setTurnLifecycle("completed");
       const active = this.#activeTurn;
-      await this.#reactToSource(active, "👍");
       this.#activeTurn = undefined;
       if (this.#status.state) this.#status.state.isStreaming = false;
       this.#wakeIdleWaiters();
       active?.scheduledCompletion?.resolve();
       await this.#refreshState();
+      await this.#reactToSource(active, "👍");
       return;
     }
     if (frame.type === "agent_end" && frame.isTerminal !== false) {
@@ -682,10 +682,11 @@ export class RpcGatewayRuntime {
     try {
       const response = await rpc.send(command);
       if (isRecord(response.data) && response.data.agentInvoked === false) {
+        const active = this.#activeTurn;
         await this.#setTurnLifecycle("completed");
-        await this.#reactToSource(this.#activeTurn, "👍");
         this.#clearActiveDelivery(delivery, true);
         await this.#refreshState();
+        await this.#reactToSource(active, "👍");
       }
     } catch (error) {
       await this.#setTurnLifecycle("failed", { error: error instanceof Error ? error.message : String(error) });
