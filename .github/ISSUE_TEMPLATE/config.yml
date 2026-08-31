@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Report a security vulnerability
-    url: https://github.com/wolfiesch/omp-gateway/security/advisories/new
+    url: https://github.com/wolfiesch/ompclaw/security/advisories/new
     about: Do not disclose vulnerabilities or credentials in a public issue.
   - name: Repository maintainers
-    url: https://github.com/wolfiesch/omp-gateway/issues
+    url: https://github.com/wolfiesch/ompclaw/issues
     about: Use the public issue tracker for non-private Code of Conduct reports.

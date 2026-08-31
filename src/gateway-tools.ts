@@ -58,7 +58,7 @@ export interface GatewayHostToolContext {
 
 const gatewayHostTools: readonly RpcHostToolDefinition[] = [
   {
-    name: "gateway_send",
+    name: "ompclaw_send",
     label: "Send message",
     description: "Send text and optional absolute local files to the active conversation.",
     loadMode: "essential",
@@ -77,7 +77,7 @@ const gatewayHostTools: readonly RpcHostToolDefinition[] = [
     },
   },
   {
-    name: "gateway_react",
+    name: "ompclaw_react",
     label: "React to message",
     description: "React to a message in the active conversation.",
     loadMode: "discoverable",
@@ -92,7 +92,7 @@ const gatewayHostTools: readonly RpcHostToolDefinition[] = [
     },
   },
   {
-    name: "gateway_ask",
+    name: "ompclaw_ask",
     label: "Ask operator",
     description: "Ask the active operator a free-text, single-select, or multi-select question.",
     loadMode: "essential",
@@ -116,7 +116,7 @@ const gatewayHostTools: readonly RpcHostToolDefinition[] = [
 
 const automationHostTools: readonly RpcHostToolDefinition[] = [
   {
-    name: "gateway_schedule_job",
+    name: "ompclaw_schedule_job",
     label: "Schedule unattended job",
     description: "Create a durable one-shot or cron job that runs in this gateway and reports to the active conversation.",
     loadMode: "essential",
@@ -135,7 +135,7 @@ const automationHostTools: readonly RpcHostToolDefinition[] = [
     },
   },
   {
-    name: "gateway_update_job",
+    name: "ompclaw_update_job",
     label: "Update scheduled job",
     description: "Update a durable job owned by the active principal. Supplying at or cron replaces its schedule.",
     loadMode: "discoverable",
@@ -154,14 +154,14 @@ const automationHostTools: readonly RpcHostToolDefinition[] = [
     },
   },
   {
-    name: "gateway_list_jobs",
+    name: "ompclaw_list_jobs",
     label: "List scheduled jobs",
     description: "List durable jobs owned by the active principal, including schedules, next runs, and failures.",
     loadMode: "essential",
     parameters: { type: "object", properties: {}, additionalProperties: false },
   },
   {
-    name: "gateway_set_job_enabled",
+    name: "ompclaw_set_job_enabled",
     label: "Enable or disable job",
     description: "Enable or disable a durable job owned by the active principal.",
     loadMode: "discoverable",
@@ -176,7 +176,7 @@ const automationHostTools: readonly RpcHostToolDefinition[] = [
     },
   },
   {
-    name: "gateway_delete_job",
+    name: "ompclaw_delete_job",
     label: "Delete scheduled job",
     description: "Permanently delete a durable job owned by the active principal.",
     loadMode: "discoverable",
@@ -188,7 +188,7 @@ const automationHostTools: readonly RpcHostToolDefinition[] = [
     },
   },
   {
-    name: "gateway_run_job",
+    name: "ompclaw_run_job",
     label: "Run scheduled job now",
     description: "Queue a durable job owned by the active principal to run as soon as the current turn finishes.",
     loadMode: "discoverable",
@@ -212,23 +212,23 @@ export async function executeGatewayHostTool(
   signal?: AbortSignal,
 ): Promise<unknown> {
   switch (call.toolName) {
-    case "gateway_send":
+    case "ompclaw_send":
       return executeSend(call.arguments, context, signal);
-    case "gateway_react":
+    case "ompclaw_react":
       return executeReact(call.arguments, context, signal);
-    case "gateway_ask":
+    case "ompclaw_ask":
       return executeAsk(call.arguments, context, signal);
-    case "gateway_schedule_job":
+    case "ompclaw_schedule_job":
       return executeScheduleJob(call.arguments, context);
-    case "gateway_update_job":
+    case "ompclaw_update_job":
       return executeUpdateJob(call.arguments, context);
-    case "gateway_list_jobs":
+    case "ompclaw_list_jobs":
       return executeListJobs(call.arguments, context);
-    case "gateway_set_job_enabled":
+    case "ompclaw_set_job_enabled":
       return executeSetJobEnabled(call.arguments, context);
-    case "gateway_delete_job":
+    case "ompclaw_delete_job":
       return executeDeleteJob(call.arguments, context);
-    case "gateway_run_job":
+    case "ompclaw_run_job":
       return executeRunJob(call.arguments, context);
     default:
       throw new Error(`Unknown host tool: ${call.toolName}`);
@@ -244,7 +244,7 @@ async function executeSend(
   const text = optionalNonEmptyString(argumentsRecord, "text");
   const files = optionalAbsoluteFiles(argumentsRecord, "files");
   if (text === undefined && files === undefined) {
-    throw new Error("gateway_send requires text or files");
+    throw new Error("ompclaw_send requires text or files");
   }
 
   const content: OutboundContent = {
@@ -278,7 +278,7 @@ async function executeAsk(
   const options = optionalOptions(argumentsRecord, "options");
   const multi = optionalBoolean(argumentsRecord, "multi");
   if (options === undefined && multi !== undefined) {
-    throw new Error("gateway_ask multi requires options");
+    throw new Error("ompclaw_ask multi requires options");
   }
 
   if (options === undefined) {
@@ -371,7 +371,7 @@ function executeRunJob(arguments_: unknown, context: GatewayHostToolContext): { 
 }
 
 function requireAutomation(context: GatewayHostToolContext): GatewayAutomationControl {
-  if (context.automation === undefined) throw new Error("Gateway automation is disabled");
+  if (context.automation === undefined) throw new Error("OmpClaw automation is disabled");
   return context.automation;
 }
 

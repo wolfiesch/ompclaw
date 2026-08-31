@@ -8,7 +8,7 @@ const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_STRING_LENGTH = 4_096;
 const MAX_OMP_ARGS = 64;
 const MAX_TRANSPORT_CREDENTIALS = 128;
-const GATEWAY_SECRET_ENV = /^OMP_GATEWAY_[A-Z][A-Z0-9_]*$/;
+const GATEWAY_SECRET_ENV = /^OMPCLAW_[A-Z][A-Z0-9_]*$/;
 const TELEGRAM_SECRET_ENV = "TELEGRAM_BOT_TOKEN";
 
 export interface GatewayOmpConfig {
@@ -107,28 +107,28 @@ export function loadGatewayConfig(options: LoadGatewayConfigOptions = {}): Gatew
 
   const path = expandGatewayPath(options.path, cwd);
   const info = lstatSync(path);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error("Gateway config must be a regular file, not a symlink");
-  if (info.size > MAX_CONFIG_BYTES) throw new Error(`Gateway config exceeds ${MAX_CONFIG_BYTES} bytes`);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("OmpClaw config must be a regular file, not a symlink");
+  if (info.size > MAX_CONFIG_BYTES) throw new Error(`OmpClaw config exceeds ${MAX_CONFIG_BYTES} bytes`);
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch (error) {
-    throw new Error(`Gateway config is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`OmpClaw config is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
   return parseGatewayConfig(parsed, cwd);
 }
 
 /** Parse a JSON value for callers that already bound file loading. */
 export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()): GatewayConfig {
-  const root = object(value, "Gateway config");
-  rejectUnknown(root, ["workspace", "stateDir", "profile", "omp", "transports", "automation", "learning"], "Gateway config");
+  const root = object(value, "OmpClaw config");
+  rejectUnknown(root, ["workspace", "stateDir", "profile", "omp", "transports", "automation", "learning"], "OmpClaw config");
 
   const workspace = root.workspace === undefined ? resolve(cwd) : expandGatewayPath(string(root.workspace, "workspace"), cwd);
   const stateDir = root.stateDir === undefined
-    ? resolve(homedir(), ".omp", "agent", "gateway")
+    ? resolve(homedir(), ".omp", "agent", "ompclaw")
     : expandGatewayPath(string(root.stateDir, "stateDir"), cwd);
-  const profile = root.profile === undefined ? "gateway" : identifier(root.profile, "profile");
+  const profile = root.profile === undefined ? "ompclaw" : identifier(root.profile, "profile");
   const omp = parseOmp(root.omp, cwd);
   const transports = parseTransports(root.transports);
   const automation = parseAutomation(root.automation);
@@ -155,7 +155,7 @@ export function resolveGatewaySecrets(config: GatewayConfig, env: NodeJS.Process
   };
 }
 
-/** Convert gateway-owned OMP settings into the existing RPC runtime contract. */
+/** Convert OmpClaw-owned OMP settings into the existing RPC runtime contract. */
 export function gatewayRpcRuntimeConfig(config: GatewayConfig): RpcRuntimeConfig {
   return {
     cwd: config.workspace,
@@ -180,6 +180,7 @@ export function stripGatewaySecretsFromChildEnv(env: NodeJS.ProcessEnv): Record<
   for (const key of Object.keys(child)) {
     if (
       key === TELEGRAM_SECRET_ENV ||
+      key.startsWith("OMPCLAW_") ||
       key.startsWith("OMP_GATEWAY_") ||
       key.startsWith("GATEWAY_") ||
       key.startsWith("OMP_TRANSPORT_") ||
@@ -366,7 +367,7 @@ function secretEnvName(value: unknown, label: string, telegram: boolean): string
   const name = nonEmptyString(value, label);
   if (name === TELEGRAM_SECRET_ENV && telegram) return name;
   if (!GATEWAY_SECRET_ENV.test(name)) {
-    throw new Error(`${label} must name an OMP_GATEWAY_ environment variable${telegram ? ` or ${TELEGRAM_SECRET_ENV}` : ""}`);
+    throw new Error(`${label} must name an OMPCLAW_ environment variable${telegram ? ` or ${TELEGRAM_SECRET_ENV}` : ""}`);
   }
   return name;
 }

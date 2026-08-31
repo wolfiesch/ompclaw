@@ -23,7 +23,7 @@ afterEach(() => {
 });
 
 function gatewayConfig(): GatewayConfig {
-  const stateDir = mkdtempSync(join(tmpdir(), "omp-gateway-app-"));
+  const stateDir = mkdtempSync(join(tmpdir(), "ompclaw-app-"));
   directories.push(stateDir);
   return parseGatewayConfig({
     workspace: "/workspace/gateway",
@@ -35,7 +35,7 @@ function gatewayConfig(): GatewayConfig {
         hostname: "127.0.0.1",
         port: 0,
         account: "web",
-        credentials: [{ tokenEnv: "OMP_GATEWAY_TEST_TOKEN", subject: "web-user", channel: "web-user" }],
+        credentials: [{ tokenEnv: "OMPCLAW_TEST_TOKEN", subject: "web-user", channel: "web-user" }],
       },
     },
   });
@@ -415,7 +415,7 @@ describe("GatewayApplication", () => {
     writeFileSync(rpcStatePath, JSON.stringify({ sessionFile: "/sessions/legacy", lastUpdateId: 7 }));
     expect(migrateTelegram(config, [accessPath, rpcStatePath]).imported).toBe(true);
 
-    const store = new GatewayStore(join(config.stateDir, "gateway.sqlite"));
+    const store = new GatewayStore(join(config.stateDir, "ompclaw.sqlite"));
     try {
       expect(store.resolvePrincipal({ transport: "websocket", account: "web", subject: "subject-a" })?.id).toBe("principal-a");
       expect(store.resolvePrincipal({ transport: "telegram", account: "bot", subject: "12345" })?.id).toBe("telegram:bot:12345");

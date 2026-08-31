@@ -67,7 +67,7 @@ test("chunks long Markdown delivery within Telegram's maximum message length", a
 });
 
 test("validates local files and uploads photos and documents to the authorized topic", async () => {
-  const root = await mkdtemp(join(tmpdir(), "omp-gateway-outbound-"));
+  const root = await mkdtemp(join(tmpdir(), "ompclaw-outbound-"));
   temporaryPaths.push(root);
   const photo = join(root, "image.png");
   const document = join(root, "report.pdf");

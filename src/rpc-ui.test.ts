@@ -154,8 +154,8 @@ describe("RpcGatewayUiBroker", () => {
     expect(ui.statusText()).toContain("queue: one");
     expect(responses).toEqual([{ type: "extension_ui_response", id: "confirm", cancelled: true }]);
     expect(warnings).toEqual([
-      "[gateway rpc] Cannot present confirm: no active delivery context",
-      "[gateway rpc] Cannot present notify: no active delivery context",
+      "[ompclaw rpc] Cannot present confirm: no active delivery context",
+      "[ompclaw rpc] Cannot present notify: no active delivery context",
     ]);
   });
 

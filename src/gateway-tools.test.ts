@@ -92,7 +92,7 @@ function expectDeliveryContext(invocation: DeliveryInvocation, signal: AbortSign
 describe("gateway host tools", () => {
   test("defines only the transport-neutral host tools without routing arguments", () => {
     const definitions = gatewayHostToolDefinitions();
-    expect(definitions.map((definition) => definition.name)).toEqual(["gateway_send", "gateway_react", "gateway_ask"]);
+    expect(definitions.map((definition) => definition.name)).toEqual(["ompclaw_send", "ompclaw_react", "ompclaw_ask"]);
 
     for (const definition of definitions) {
       const parameters = definition.parameters as { readonly properties: Record<string, unknown>; readonly additionalProperties: boolean };
@@ -105,15 +105,15 @@ describe("gateway host tools", () => {
 
   test("advertises automation tools only when durable scheduling is enabled", () => {
     expect(gatewayHostToolDefinitions(true).map((definition) => definition.name)).toEqual([
-      "gateway_send",
-      "gateway_react",
-      "gateway_ask",
-      "gateway_schedule_job",
-      "gateway_update_job",
-      "gateway_list_jobs",
-      "gateway_set_job_enabled",
-      "gateway_delete_job",
-      "gateway_run_job",
+      "ompclaw_send",
+      "ompclaw_react",
+      "ompclaw_ask",
+      "ompclaw_schedule_job",
+      "ompclaw_update_job",
+      "ompclaw_list_jobs",
+      "ompclaw_set_job_enabled",
+      "ompclaw_delete_job",
+      "ompclaw_run_job",
     ]);
   });
 
@@ -122,7 +122,7 @@ describe("gateway host tools", () => {
     const signal = new AbortController().signal;
 
     const result = await executeGatewayHostTool(
-      hostToolCall("gateway_send", {
+      hostToolCall("ompclaw_send", {
         text: "Sent from OMP",
         files: ["/tmp/quarterly report.txt", "/tmp/diagram.png"],
       }),
@@ -151,7 +151,7 @@ describe("gateway host tools", () => {
     const signal = new AbortController().signal;
 
     const result = await executeGatewayHostTool(
-      hostToolCall("gateway_react", { message_id: "source-9", emoji: "👍" }),
+      hostToolCall("ompclaw_react", { message_id: "source-9", emoji: "👍" }),
       context,
       signal,
     );
@@ -172,7 +172,7 @@ describe("gateway host tools", () => {
     const inputSignal = new AbortController().signal;
 
     await expect(
-      executeGatewayHostTool(hostToolCall("gateway_ask", { question: "What should happen?" }), context, inputSignal),
+      executeGatewayHostTool(hostToolCall("ompclaw_ask", { question: "What should happen?" }), context, inputSignal),
     ).resolves.toEqual({ answer: "free text" });
     const inputInvocation = invocations.at(-1)!;
     expect(inputInvocation.request).toEqual({ type: "input", title: "OMP question", prompt: "What should happen?" });
@@ -182,7 +182,7 @@ describe("gateway host tools", () => {
     const singleSignal = new AbortController().signal;
     await expect(
       executeGatewayHostTool(
-        hostToolCall("gateway_ask", { title: "Release", question: "Choose one", options: ["Ship", "Hold"] }),
+        hostToolCall("ompclaw_ask", { title: "Release", question: "Choose one", options: ["Ship", "Hold"] }),
         context,
         singleSignal,
       ),
@@ -202,7 +202,7 @@ describe("gateway host tools", () => {
     const multiSignal = new AbortController().signal;
     await expect(
       executeGatewayHostTool(
-        hostToolCall("gateway_ask", { question: "Choose any", options: ["Green", "Blue"], multi: true }),
+        hostToolCall("ompclaw_ask", { question: "Choose any", options: ["Green", "Blue"], multi: true }),
         context,
         multiSignal,
       ),
@@ -262,7 +262,7 @@ describe("gateway host tools", () => {
     const { context } = harness(undefined, automation);
 
     await expect(executeGatewayHostTool(
-      hostToolCall("gateway_schedule_job", {
+      hostToolCall("ompclaw_schedule_job", {
         name: "daily report",
         prompt: "Summarize work",
         cron: "0 9 * * *",
@@ -271,24 +271,24 @@ describe("gateway host tools", () => {
       context,
     )).resolves.toEqual({ job: expect.stringContaining("daily report") });
     expect(capturedContext).toEqual({ principal: deliveryContext.principal, identity, address });
-    await expect(executeGatewayHostTool(hostToolCall("gateway_list_jobs", {}), context)).resolves.toEqual({
+    await expect(executeGatewayHostTool(hostToolCall("ompclaw_list_jobs", {}), context)).resolves.toEqual({
       jobs: [expect.stringContaining("job-1")],
     });
-    await expect(executeGatewayHostTool(hostToolCall("gateway_delete_job", { id: "job-1" }), context)).resolves.toEqual({ deleted: true });
+    await expect(executeGatewayHostTool(hostToolCall("ompclaw_delete_job", { id: "job-1" }), context)).resolves.toEqual({ deleted: true });
   });
 
   test("rejects unknown and malformed arguments before invoking delivery", async () => {
     const { context, invocations } = harness();
     const malformedCalls = [
-      hostToolCall("gateway_send", {}),
-      hostToolCall("gateway_send", { text: "", files: ["/tmp/valid"] }),
-      hostToolCall("gateway_send", { files: ["relative.txt"] }),
-      hostToolCall("gateway_send", { text: "hello", channel: "other-channel" }),
-      hostToolCall("gateway_react", { message_id: 42, emoji: "👍" }),
-      hostToolCall("gateway_react", { message_id: "source-1", emoji: "" }),
-      hostToolCall("gateway_ask", { question: "Pick", options: [] }),
-      hostToolCall("gateway_ask", { question: "Pick", multi: true }),
-      hostToolCall("gateway_ask", { question: "Pick", account: "other-account" }),
+      hostToolCall("ompclaw_send", {}),
+      hostToolCall("ompclaw_send", { text: "", files: ["/tmp/valid"] }),
+      hostToolCall("ompclaw_send", { files: ["relative.txt"] }),
+      hostToolCall("ompclaw_send", { text: "hello", channel: "other-channel" }),
+      hostToolCall("ompclaw_react", { message_id: 42, emoji: "👍" }),
+      hostToolCall("ompclaw_react", { message_id: "source-1", emoji: "" }),
+      hostToolCall("ompclaw_ask", { question: "Pick", options: [] }),
+      hostToolCall("ompclaw_ask", { question: "Pick", multi: true }),
+      hostToolCall("ompclaw_ask", { question: "Pick", account: "other-account" }),
       hostToolCall("unknown_tool", {}),
     ];
 

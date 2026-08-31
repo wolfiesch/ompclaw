@@ -14,9 +14,9 @@ export interface GatewayServicePaths {
   readonly envFile: string;
 }
 
-const SERVICE_NAME = "com.omp.gateway";
-const SYSTEMD_UNIT = "omp-gateway.service";
-const GATEWAY_COMMAND = "omp-gateway";
+const SERVICE_NAME = "com.ompclaw";
+const SYSTEMD_UNIT = "ompclaw.service";
+const GATEWAY_COMMAND = "ompclaw";
 
 function xml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
@@ -135,7 +135,7 @@ export function installRpcService(
     const path = join(dir, SYSTEMD_UNIT);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const unit = `[Unit]
-Description=omp-gateway authenticated OMP gateway
+Description=OmpClaw authenticated OMP gateway
 After=network-online.target
 Wants=network-online.target
 

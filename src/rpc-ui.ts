@@ -111,7 +111,7 @@ export class RpcGatewayUiBroker {
       if (!this.#pendingByRpcId.delete(pending.rpcId)) return;
       clearTimeout(pending.timer);
       if (pending.controller.signal.aborted) return;
-      this.#options.log.warn(`[gateway rpc] UI ${pending.request.method} failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#options.log.warn(`[ompclaw rpc] UI ${pending.request.method} failed: ${error instanceof Error ? error.message : String(error)}`);
       this.#sendCancelled(pending);
     }
   }
@@ -210,7 +210,7 @@ export class RpcGatewayUiBroker {
       || request.method === "setTitle"
       || request.method === "set_editor_text"
     ) return;
-    this.#options.log.warn(`[gateway rpc] Cannot present ${request.method}: no active delivery context`);
+    this.#options.log.warn(`[ompclaw rpc] Cannot present ${request.method}: no active delivery context`);
     if (request.method === "select" || request.method === "confirm" || request.method === "input" || request.method === "editor") {
       this.#options.sendResponse({ type: "extension_ui_response", id: request.id, cancelled: true });
     }

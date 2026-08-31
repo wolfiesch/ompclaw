@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md)
 
-`omp-gateway` runs one persistent OMP RPC session and exposes it through enabled, authenticated transport adapters. It is a gateway process, not an OMP extension and not a per-chat session launcher. Telegram and WebSocket clients feed the same OMP session.
+`ompclaw` runs one persistent OMP RPC session and exposes it through enabled, authenticated transport adapters. It is a gateway process, not an OMP extension and not a per-chat session launcher. Telegram and WebSocket clients feed the same OMP session.
 
 ## Before you start
 
@@ -19,7 +19,7 @@ The following operating assumptions are intentional:
 
 ## Architecture and persistence
 
-At startup the gateway acquires `gateway.lock` in `stateDir`, opens `gateway.sqlite`, resolves transport secrets, constructs the OMP runtime, starts OMP, then starts the transport adapters. If another process holds the gateway lock, startup stops before opening the database.
+At startup the gateway acquires `ompclaw.lock` in `stateDir`, opens `ompclaw.sqlite`, resolves transport secrets, constructs the OMP runtime, starts OMP, then starts the transport adapters. If another process holds the gateway lock, startup stops before opening the database.
 
 ```text
 Telegram long poller  ─┐
@@ -34,7 +34,7 @@ WebSocket client      ─┘                                    │
 
 The start order prevents an adapter or scheduler from accepting work before the OMP session is available. On shutdown, the scheduler stops first, then adapters stop before OMP, and the state store closes before the lock is released.
 
-The SQLite database is `~/.omp/agent/gateway/gateway.sqlite` by default. A newly created database is private to its owner. It records:
+The SQLite database is `~/.omp/agent/ompclaw/ompclaw.sqlite` by default. A newly created database is private to its owner. It records:
 
 | Data | Purpose |
 | --- | --- |
@@ -59,8 +59,8 @@ The JSON document never contains a token value. It names environment variables t
 | Field | Type and default | Meaning |
 | --- | --- | --- |
 | `workspace` | path, current directory | OMP working directory |
-| `stateDir` | path, `~/.omp/agent/gateway` | gateway lock, SQLite database, inbox, exports, and checkpoints |
-| `profile` | identifier, `gateway` | OMP profile passed to the RPC child |
+| `stateDir` | path, `~/.omp/agent/ompclaw` | gateway lock, SQLite database, inbox, exports, and checkpoints |
+| `profile` | identifier, `ompclaw` | OMP profile passed to the RPC child |
 | `omp` | object | OMP runtime settings |
 | `transports` | object | enabled transport settings |
 | `automation` | object | optional durable unattended job runner |
@@ -105,7 +105,7 @@ Automation is off by default. Enable it explicitly:
 | `retryDelayMs` | integer, `15000` | base retry delay from 1000 to 3600000 milliseconds |
 | `maxAttempts` | integer, `3` | maximum failed attempts from 1 to 10 before a one-shot job is disabled |
 
-An authenticated operator can ask OMP to schedule a one-shot job at an ISO 8601 time with an explicit UTC offset, or a recurring cron job with an optional IANA timezone. OMP receives `gateway_schedule_job`, `gateway_update_job`, `gateway_list_jobs`, `gateway_set_job_enabled`, `gateway_delete_job`, and `gateway_run_job` host tools. The model never supplies a principal or delivery route. The gateway binds each job to the active server-derived principal, identity, and conversation.
+An authenticated operator can ask OMP to schedule a one-shot job at an ISO 8601 time with an explicit UTC offset, or a recurring cron job with an optional IANA timezone. OMP receives `ompclaw_schedule_job`, `ompclaw_update_job`, `ompclaw_list_jobs`, `ompclaw_set_job_enabled`, `ompclaw_delete_job`, and `ompclaw_run_job` host tools. The model never supplies a principal or delivery route. The gateway binds each job to the active server-derived principal, identity, and conversation.
 
 Use `/jobs` to inspect your jobs, `/job_pause <id>` or `/job_resume <id>` to change dispatch, `/job_run <id>` to make a job due immediately, and `/job_delete <id>` to remove it. Job IDs are intentionally exact and principal-scoped.
 
@@ -165,8 +165,8 @@ A Telegram object is required only when Telegram is configured:
 Authorizing a user is an explicit local database operation:
 
 ```bash
-omp-gateway telegram-allow <your-numeric-telegram-user-id> \
-  --config ~/.config/omp-gateway/config.json
+ompclaw telegram-allow <your-numeric-telegram-user-id> \
+  --config ~/.config/ompclaw/config.json
 ```
 
 It creates or updates an `operator` principal and binds the exact Telegram identity for the configured account. To use a custom principal or roles, create it with `principal-add` and bind the Telegram identity with `identity-bind`.
@@ -183,7 +183,7 @@ The following loopback configuration is the recommended starting point:
   "account": "local",
   "credentials": [
     {
-      "tokenEnv": "OMP_GATEWAY_WS_TOKEN",
+      "tokenEnv": "OMPCLAW_WS_TOKEN",
       "subject": "local-operator",
       "channel": "local"
     }
@@ -198,7 +198,7 @@ The following loopback configuration is the recommended starting point:
 | `port` | integer from 0 to 65535; `0` lets Bun choose a port |
 | `account` | stable local account identifier |
 | `credentials` | non-empty list of credential metadata |
-| `credentials[].tokenEnv` | environment variable holding the token; use an `OMP_GATEWAY_...` name |
+| `credentials[].tokenEnv` | environment variable holding the token; use an `OMPCLAW_...` name |
 | `credentials[].subject` | stable identity subject derived after authentication |
 | `credentials[].channel` | stable delivery channel derived after authentication |
 | `credentials[].thread` | optional stable delivery thread derived after authentication |
@@ -206,10 +206,10 @@ The following loopback configuration is the recommended starting point:
 Credential metadata is configuration, not client input. Tokens are compared by hash. Each configured token and conversation origin must be unique, and one live connection is allowed for an origin. Bind each credential identity before clients can use it:
 
 ```bash
-omp-gateway principal-add local-operator \
-  --config ~/.config/omp-gateway/config.json
-omp-gateway identity-bind websocket local local-operator local-operator \
-  --config ~/.config/omp-gateway/config.json
+ompclaw principal-add local-operator \
+  --config ~/.config/ompclaw/config.json
+ompclaw identity-bind websocket local local-operator local-operator \
+  --config ~/.config/ompclaw/config.json
 ```
 
 ## Secret environment file
@@ -217,11 +217,11 @@ omp-gateway identity-bind websocket local local-operator local-operator \
 Create the environment file outside the repository and make it mode `0600`:
 
 ```bash
-cat > ~/.config/omp-gateway/gateway.env <<'ENV'
+cat > ~/.config/ompclaw/ompclaw.env <<'ENV'
 TELEGRAM_BOT_TOKEN=replace-with-telegram-bot-token
-OMP_GATEWAY_WS_TOKEN=replace-with-a-long-random-websocket-token
+OMPCLAW_WS_TOKEN=replace-with-a-long-random-websocket-token
 ENV
-chmod 600 ~/.config/omp-gateway/gateway.env
+chmod 600 ~/.config/ompclaw/ompclaw.env
 ```
 
 The loader accepts literal `KEY=VALUE` lines, optional `export ` prefixes, comments, and quoted values. Existing process variables take precedence over values in the file. On Unix-like systems it refuses an environment file that is a symlink, not a regular file, not owned by the current user, or readable by group or others.
@@ -233,9 +233,9 @@ Before launching OMP, the gateway removes Telegram and gateway transport secret 
 Use `doctor` before the first start and whenever credentials or OMP configuration change:
 
 ```bash
-omp-gateway doctor \
-  --config ~/.config/omp-gateway/config.json \
-  --env-file ~/.config/omp-gateway/gateway.env
+ompclaw doctor \
+  --config ~/.config/ompclaw/config.json \
+  --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
 `doctor` resolves all enabled transport secrets, opens the SQLite store, verifies Telegram's bot identity and the absence of a webhook when Telegram is enabled, starts a short OMP RPC child, requests session state, then stops that child. A successful run ends with `Doctor: ready`.
@@ -243,9 +243,9 @@ omp-gateway doctor \
 Run in the foreground during setup:
 
 ```bash
-omp-gateway run \
-  --config ~/.config/omp-gateway/config.json \
-  --env-file ~/.config/omp-gateway/gateway.env
+ompclaw run \
+  --config ~/.config/ompclaw/config.json \
+  --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
 The process stops cleanly on `SIGINT` or `SIGTERM`. It starts the OMP session first, then the adapters.
@@ -253,18 +253,18 @@ The process stops cleanly on `SIGINT` or `SIGTERM`. It starts the OMP session fi
 For a persistent user service:
 
 ```bash
-omp-gateway service-install \
-  --config ~/.config/omp-gateway/config.json \
-  --env-file ~/.config/omp-gateway/gateway.env
+ompclaw service-install \
+  --config ~/.config/ompclaw/config.json \
+  --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
-The installer requires both `--config` and `--env-file` as absolute regular-file paths, requires the environment file to be exactly mode `0600`, verifies that configured secrets resolve, and reports its manager and installed path. It uses launchd label `com.omp.gateway` on macOS and user systemd unit `omp-gateway.service` on Linux. The environment file is referenced by the service command rather than copied into the service definition.
+The installer requires both `--config` and `--env-file` as absolute regular-file paths, requires the environment file to be exactly mode `0600`, verifies that configured secrets resolve, and reports its manager and installed path. It uses launchd label `com.ompclaw` on macOS and user systemd unit `ompclaw.service` on Linux. The environment file is referenced by the service command rather than copied into the service definition.
 
 Remove a user service with:
 
 ```bash
-omp-gateway service-uninstall \
-  --config ~/.config/omp-gateway/config.json
+ompclaw service-uninstall \
+  --config ~/.config/ompclaw/config.json
 ```
 
 The command reports the stopped and removed service path. Stop the service before making manual database backups or state-directory copies.
@@ -289,6 +289,24 @@ If the OMP child exits unexpectedly and `omp.autoRestart` is true, the gateway n
 
 The checkpoint allows a restarted gateway to resume a completed OMP session. It does not resume a partly executed prompt, an in-flight tool call, a transport connection, or a pending user interaction. Send a new message after recovery when the interrupted result matters.
 
+## Migration from omp-gateway 0.2.x
+
+The OmpClaw rename changes the package, CLI, service identifiers, default profile and state paths, environment prefix, database filenames, and OMP host-tool names. There are no legacy aliases.
+
+1. Stop the old service while the `omp-gateway` command is still installed:
+
+   ```bash
+   omp-gateway service-uninstall \
+     --config ~/.config/omp-gateway/config.json
+   ```
+
+2. Move `~/.config/omp-gateway` to `~/.config/ompclaw` and `~/.omp/agent/gateway` to `~/.omp/agent/ompclaw`.
+3. In the stopped state directory, rename `gateway.sqlite` to `ompclaw.sqlite` and any matching `gateway.sqlite-wal` or `gateway.sqlite-shm` sidecars to the same `ompclaw.sqlite-*` suffixes. Rename `gateway.lock` to `ompclaw.lock` if it remains after the clean stop.
+4. Update the JSON config to use the new state directory. Change `profile` from `gateway` to `ompclaw` only when the old config used the default; keep an explicitly configured custom profile unchanged. Rename `OMP_GATEWAY_*` environment variable names to `OMPCLAW_*`, and rename the environment file if desired.
+5. Install `ompclaw`, run `doctor`, then install the new `com.ompclaw` or `ompclaw.service` user service.
+
+The SQLite schema and stored conversation, principal, scheduler, inbox, and checkpoint records are unchanged. OMP sees the renamed host tools only after the new process starts.
+
 ## Migration from standalone omp-telegram RPC state
 
 Migration is for state created by the old standalone `omp-telegram` RPC service. It is not an extension activation step and it does not reuse legacy pairing commands.
@@ -299,8 +317,8 @@ Migration is for state created by the old standalone `omp-telegram` RPC service.
 4. Run the idempotent importer:
 
    ```bash
-   omp-gateway migrate-telegram <legacy-access-state.json> <legacy-rpc-state.json> \
-     --config ~/.config/omp-gateway/config.json
+   ompclaw migrate-telegram <legacy-access-state.json> <legacy-rpc-state.json> \
+     --config ~/.config/ompclaw/config.json
    ```
 
 5. Run `telegram-allow` if you want to establish or replace the Telegram operator binding explicitly, then run `doctor` and start the gateway.

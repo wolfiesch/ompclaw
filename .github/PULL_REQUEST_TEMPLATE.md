@@ -1,6 +1,6 @@
 ## Summary
 
-Describe the user-visible behavior changed by this pull request and why it belongs in `omp-gateway`.
+Describe the user-visible behavior changed by this pull request and why it belongs in `ompclaw`.
 
 ## Architecture impact
 

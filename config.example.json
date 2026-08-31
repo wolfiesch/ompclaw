@@ -1,7 +1,7 @@
 {
   "workspace": ".",
-  "stateDir": "~/.omp/agent/gateway",
-  "profile": "gateway",
+  "stateDir": "~/.omp/agent/ompclaw",
+  "profile": "ompclaw",
   "omp": {
     "command": "omp",
     "configFiles": [],
@@ -23,9 +23,9 @@
       "account": "local",
       "credentials": [
         {
-          "tokenEnv": "OMP_GATEWAY_WEBSOCKET_TOKEN",
+          "tokenEnv": "OMPCLAW_WEBSOCKET_TOKEN",
           "subject": "local-client",
-          "channel": "gateway"
+          "channel": "ompclaw"
         }
       ]
     }

@@ -2,7 +2,7 @@
 
 [Back to the operator guide](guide.md) · [Back to the README](../README.md)
 
-`omp-gateway` presents one persistent OMP RPC session through authenticated transport adapters. It is not an HTTP RPC server. HTTP is limited to the WebSocket adapter's health endpoint. The OMP child uses its RPC UI mode; Telegram and WebSocket clients receive the gateway-level behavior described here.
+`ompclaw` presents one persistent OMP RPC session through authenticated transport adapters. It is not an HTTP RPC server. HTTP is limited to the WebSocket adapter's health endpoint. The OMP child uses its RPC UI mode; Telegram and WebSocket clients receive the gateway-level behavior described here.
 
 ## Session and delivery model
 
@@ -100,17 +100,17 @@ The OMP child always receives three delivery host tools. When `automation.enable
 
 | Tool | Parameters | Behavior |
 | --- | --- | --- |
-| `gateway_send` | `text` and/or `files` | send text and optional absolute local file paths to the active conversation; at least one is required |
-| `gateway_ask` | `question`, optional `title`, `options`, and `multi` | ask the operator a free-text, single-select, or multi-select question in the active conversation |
-| `gateway_react` | `message_id`, `emoji` | react to a message in the active conversation |
-| `gateway_schedule_job` | `name`, `prompt`, exactly one of `at` or `cron`, optional `timezone` | create an owned one-shot or recurring job bound to the active conversation |
-| `gateway_update_job` | `id`, optional mutable job fields | update an owned job and recompute its next occurrence |
-| `gateway_list_jobs` | none | list the active principal's jobs |
-| `gateway_set_job_enabled` | `id`, `enabled` | pause or resume an owned job |
-| `gateway_delete_job` | `id` | permanently remove an owned job |
-| `gateway_run_job` | `id` | make an owned job due now |
+| `ompclaw_send` | `text` and/or `files` | send text and optional absolute local file paths to the active conversation; at least one is required |
+| `ompclaw_ask` | `question`, optional `title`, `options`, and `multi` | ask the operator a free-text, single-select, or multi-select question in the active conversation |
+| `ompclaw_react` | `message_id`, `emoji` | react to a message in the active conversation |
+| `ompclaw_schedule_job` | `name`, `prompt`, exactly one of `at` or `cron`, optional `timezone` | create an owned one-shot or recurring job bound to the active conversation |
+| `ompclaw_update_job` | `id`, optional mutable job fields | update an owned job and recompute its next occurrence |
+| `ompclaw_list_jobs` | none | list the active principal's jobs |
+| `ompclaw_set_job_enabled` | `id`, `enabled` | pause or resume an owned job |
+| `ompclaw_delete_job` | `id` | permanently remove an owned job |
+| `ompclaw_run_job` | `id` | make an owned job due now |
 
-`gateway_send` accepts only absolute local paths for `files`. Transport adapters enforce their own attachment and message rules. `gateway_ask` without `options` uses text input; with options it uses selection, and `multi: true` requests multi-select. Host-tool cancellation aborts the in-progress gateway delivery operation.
+`ompclaw_send` accepts only absolute local paths for `files`. Transport adapters enforce their own attachment and message rules. `ompclaw_ask` without `options` uses text input; with options it uses selection, and `multi: true` requests multi-select. Host-tool cancellation aborts the in-progress gateway delivery operation.
 
 One-shot `at` values must be ISO 8601 date-times with an explicit UTC offset. Cron timezones must be valid IANA names. Names, prompts, expressions, and retry state are bounded and validated before SQLite mutation. Job lookup and mutation always include the server-derived principal ID.
 

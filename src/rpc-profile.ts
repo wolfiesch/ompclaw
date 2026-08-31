@@ -38,7 +38,7 @@ const SNAPSHOT_IGNORED_DIRECTORIES = new Set([
   "chrome-profile",
 ]);
 
-/** Materialize OMP's experimental memory and auto-learn settings in gateway-owned state. */
+/** Materialize OMP's experimental memory and auto-learn settings in OmpClaw-owned state. */
 export function prepareLearningOverlay(config: Pick<GatewayConfig, "stateDir" | "learning">): string | undefined {
   if (!config.learning.enabled) return undefined;
   const memoryDirectory = join(config.stateDir, "memory");

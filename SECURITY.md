@@ -2,13 +2,13 @@
 
 ## Supported versions
 
-`omp-gateway` is Alpha. Security fixes are considered for the newest published `0.1.x` release only. There is no guaranteed response or remediation timeline during Alpha. If a security fix requires an upgrade, use the newest release rather than expecting backports.
+OmpClaw is Alpha. Security fixes are considered for the newest published release only. There is no guaranteed response or remediation timeline during Alpha. If a security fix requires an upgrade, use the newest release rather than expecting backports.
 
 ## Report a vulnerability privately
 
 Do not open a public issue, discussion, pull request, or chat message for a suspected vulnerability. Use GitHub's private vulnerability reporting flow for this repository:
 
-<https://github.com/wolfiesch/omp-gateway/security/advisories/new>
+<https://github.com/wolfiesch/ompclaw/security/advisories/new>
 
 A useful report includes:
 
