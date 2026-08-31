@@ -214,6 +214,68 @@ describe("transactional gateway updates", () => {
     expect(currentGatewayRelease(gatewayUpdatePaths(stateDir)).id).toBe(candidate.id);
   });
 
+  test("relaunches a current candidate with its request after supervisor recovery", async () => {
+    const root = temporaryDirectory();
+    const repository = join(root, "repository");
+    const stateDir = join(root, "state");
+    mkdirSync(repository, { recursive: true });
+    const coordinator = new GatewayUpdateCoordinator({
+      config: { enabled: true, repository, healthTimeoutMs: 30_000 },
+      stateDir,
+    });
+    const previous = createRelease(stateDir, "0.7.0-aaaaaaaaaaaa", COMMIT_A);
+    const candidate = createRelease(stateDir, "0.8.0-bbbbbbbbbbbb", COMMIT_B);
+    coordinator.bootstrap(previous);
+    await coordinator.arm(candidate.id, {
+      address: { transport: "telegram", account: "default", channel: "42" },
+      principal: { id: "operator-42", roles: ["operator"] },
+    });
+    await coordinator.commitArmed();
+    const request = readUpdateRequest(coordinator.paths.request)!;
+    coordinator.bootstrap(candidate);
+
+    const spawns: string[] = [];
+    const resultReady = Promise.withResolvers<void>();
+    const supervisor = new GatewayUpdateSupervisor({
+      stateDir,
+      configPath: join(root, "config.json"),
+      envFile: join(root, "ompclaw.env"),
+      healthTimeoutMs: 500,
+    }, {
+      onResult(result) {
+        if (result.status === "succeeded") resultReady.resolve();
+      },
+      spawnRelease(release, requestId) {
+        spawns.push(`${release.id}:${requestId ?? "none"}`);
+        if (requestId !== undefined) {
+          writeFileSync(join(gatewayUpdatePaths(stateDir).ready, `${requestId}.json`), "{}\n");
+        }
+        const process: ManagedGatewayProcess = {
+          exitCode: null,
+          kill() {
+            process.exitCode = 0;
+            return true;
+          },
+          once(_event, listener) {
+            listener();
+          },
+        };
+        return process;
+      },
+    });
+    const running = supervisor.run();
+    await resultReady.promise;
+    supervisor.stop();
+    await running;
+
+    expect(spawns).toEqual([
+      `${candidate.id}:none`,
+      `${candidate.id}:${request.id}`,
+    ]);
+    expect(readUpdateResult(gatewayUpdatePaths(stateDir).result)?.status).toBe("succeeded");
+    expect(currentGatewayRelease(gatewayUpdatePaths(stateDir)).id).toBe(candidate.id);
+  });
+
   test("supervisor rolls back a candidate that never becomes ready", async () => {
     const root = temporaryDirectory();
     const repository = join(root, "repository");

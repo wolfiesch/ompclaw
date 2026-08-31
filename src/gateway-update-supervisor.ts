@@ -121,11 +121,9 @@ export class GatewayUpdateSupervisor {
     }
 
     rmSync(join(this.#paths.ready, `${requestId}.json`), { force: true });
-    if (candidate.id !== active.id) {
-      await this.#stopChild();
-      if (this.#stopping) return active;
-      this.#child = this.#spawnRelease(candidate, requestId);
-    }
+    await this.#stopChild();
+    if (this.#stopping) return active;
+    this.#child = this.#spawnRelease(candidate, requestId);
 
     const ready = await this.#waitForCandidate(requestId);
     if (ready) {
