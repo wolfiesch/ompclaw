@@ -19,7 +19,7 @@ import {
   type ServiceInstallResult,
 } from "./rpc-service";
 import type { RpcResponse, RpcSessionState } from "./rpc-protocol";
-import { tg } from "./api";
+import { tg } from "./transports/telegram/bot-api";
 
 const COMMANDS = [
   "run",

@@ -1,733 +1,421 @@
-import { afterEach, describe, expect, test, vi } from "bun:test";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import type { TgMessage, TgUpdate } from "../../api";
-import type { JsonValue, PendingInboundMessage, PendingInteraction } from "../../gateway-store";
-import type { ConversationAddress, DeliveryContext, InboundEnvelope, Principal, TransportStartContext } from "../../gateway-types";
+import type { PendingInteraction } from "../../gateway-store";
+import type {
+  ConversationAddress,
+  DeliveryContext,
+  InboundEnvelope,
+  Principal,
+  TransportStartContext,
+} from "../../gateway-types";
+import type { TgMessage, TgUpdate } from "./bot-api";
 import { TelegramTransportAdapter, type TelegramPoller } from "./adapter";
+import { telegramDraftId } from "./delivery";
 
-const temporaryPaths: string[] = [];
-
-afterEach(async () => {
-  await Promise.all(temporaryPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
-});
-
-const privateAddress: ConversationAddress = { transport: "telegram", account: "default", channel: "42" };
-const topicAddress: ConversationAddress = { transport: "telegram", account: "default", channel: "-1001", thread: "9" };
-const owner: Principal = { id: "principal-42", roles: ["operator"] };
-
-interface TelegramApiCall {
+interface ApiCall {
   readonly method: string;
   readonly payload: Record<string, unknown>;
-  readonly responseMessageId?: number;
 }
 
-type CallWaiter = (call: TelegramApiCall, index: number) => void;
+const owner: Principal = { id: "principal-owner", roles: ["operator"] };
+const baseAddress: ConversationAddress = {
+  transport: "telegram",
+  account: "primary",
+  channel: "42",
+};
+const delivery: DeliveryContext = { principal: owner, origin: baseAddress };
+const scratch: string[] = [];
 
-class MemoryStore {
-  readonly checkpoints = new Map<string, JsonValue>();
-  readonly pending = new Map<string, PendingInteraction>();
-  readonly writes: Array<{ adapter: string; key: string; value: JsonValue }> = [];
-  readonly pendingInbound: PendingInboundMessage[] = [];
-  readonly #pendingWaiters = new Set<(interaction: PendingInteraction) => void>();
+afterEach(async () => {
+  await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
 
-  getCheckpoint(adapter: string, key: string): JsonValue | undefined {
-    return this.checkpoints.get(`${adapter}:${key}`);
+class TestPoller implements TelegramPoller {
+  started = false;
+  stopped = false;
+  handle?: (update: TgUpdate) => void | Promise<void>;
+
+  start(_token: string, handle: (update: TgUpdate) => void | Promise<void>): void {
+    this.started = true;
+    this.handle = handle;
   }
-
-  setCheckpoint(adapter: string, key: string, value: JsonValue): void {
-    this.writes.push({ adapter, key, value });
-    this.checkpoints.set(`${adapter}:${key}`, value);
+  stop(): void {
+    this.stopped = true;
   }
-
-  putPendingInteraction(interaction: PendingInteraction): void {
-    this.pending.set(interaction.id, interaction);
-    for (const resolve of this.#pendingWaiters) resolve(interaction);
-    this.#pendingWaiters.clear();
-  }
-
-  deletePendingInteraction(id: string): boolean {
-    return this.pending.delete(id);
-  }
-
-  listPendingInboundMessages(): PendingInboundMessage[] {
-    return this.pendingInbound;
-  }
-
-  waitForPending(): Promise<PendingInteraction> {
-    const pending = this.pending.values().next().value;
-    if (pending !== undefined) return Promise.resolve(pending);
-    const deferred = Promise.withResolvers<PendingInteraction>();
-    this.#pendingWaiters.add(deferred.resolve);
-    return deferred.promise;
-  }
-}
-
-function poller(): TelegramPoller & { handler?: (update: TgUpdate) => Promise<void> | void; stopped: boolean } {
-  return {
-    stopped: false,
-    start(_token, handler) {
-      this.handler = handler;
-    },
-    stop() {
-      this.stopped = true;
-    },
-    done: async () => {},
-  };
+  async done(): Promise<void> {}
 }
 
 async function fixture(options: {
-  readonly receive?: (message: InboundEnvelope) => Promise<void> | void;
-  readonly resolveIdentity?: TransportStartContext["resolveIdentity"];
-  readonly transcribe?: boolean;
-  readonly transcribeCommand?: readonly string[];
-  readonly uiTimeoutMs?: number;
+  readonly resolve?: (subject: string) => Principal | undefined;
   readonly commands?: readonly { readonly command: string; readonly description: string }[];
+  readonly transcribe?: boolean;
   readonly createTopicsFromRoot?: boolean;
+  readonly failFirstReceive?: boolean;
+  readonly receive?: (message: InboundEnvelope) => Promise<void>;
 } = {}) {
-  const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-telegram-"));
-  temporaryPaths.push(stateDir);
-  const calls: TelegramApiCall[] = [];
-  const store = new MemoryStore();
-  const fakePoller = poller();
-  let nextMessageId = 100;
+  const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-adapter-"));
+  scratch.push(stateDir);
+  const calls: ApiCall[] = [];
   const received: InboundEnvelope[] = [];
-  const callWaiters = new Set<CallWaiter>();
-  const waitForCall = (fromIndex: number, predicate: (call: TelegramApiCall) => boolean): Promise<TelegramApiCall> => {
-    const existing = calls.slice(fromIndex).find(predicate);
-    if (existing) return Promise.resolve(existing);
-    const deferred = Promise.withResolvers<TelegramApiCall>();
-    const waiter: CallWaiter = (call, index) => {
-      if (index < fromIndex || !predicate(call)) return;
-      callWaiters.delete(waiter);
-      deferred.resolve(call);
-    };
-    callWaiters.add(waiter);
-    return deferred.promise;
-  };
+  const checkpoints = new Map<string, unknown>();
+  const pending = new Map<string, PendingInteraction>();
+  const poller = new TestPoller();
+  let messageId = 200;
+  const key = (adapter: string, checkpoint: string): string => `${adapter}\0${checkpoint}`;
   const adapter = new TelegramTransportAdapter({
-    token: "bot-token",
+    token: "token",
+    account: "primary",
     stateDir,
-    store,
-    uiTimeoutMs: options.uiTimeoutMs,
     commands: options.commands,
-    transcribeCommand: options.transcribeCommand ?? (options.transcribe ? ["not-used", "{file}"] : undefined),
     createTopicsFromRoot: options.createTopicsFromRoot,
+    store: {
+      getCheckpoint: (adapterId, checkpoint) => checkpoints.get(key(adapterId, checkpoint)),
+      setCheckpoint: (adapterId, checkpoint, value) => { checkpoints.set(key(adapterId, checkpoint), value); },
+      putPendingInteraction: (interaction) => { pending.set(interaction.id, interaction); },
+      deletePendingInteraction: (id) => { pending.delete(id); },
+      listPendingInboundMessages: () => [],
+    },
     api: {
-      poller: fakePoller,
-      callTelegram: async (method, payload) => {
-        const call: TelegramApiCall = { method, payload: payload ?? {} };
-        const callIndex = calls.push(call) - 1;
-        for (const waiter of callWaiters) waiter(call, callIndex);
-        if (method === "getFile") return { file_path: `private/${payload?.file_id}.ogg` };
-        if (method === "sendMessageDraft") return true;
-        if (method === "createForumTopic") return { message_thread_id: 55 };
-        const responseMessageId = nextMessageId++;
-        call.responseMessageId = responseMessageId;
-        return { message_id: responseMessageId };
-      },
-      downloadFileBytes: async () => new Uint8Array([1, 2, 3]),
-      ...(options.transcribe ? { transcribe: async () => "spoken words" } : {}),
+      poller,
       acquireLock: () => ({ ok: true }),
       releaseLock: () => {},
       startLockHeartbeat: () => () => {},
-      now: () => 1_700_000_000_000,
-      randomId: () => "test-interaction",
+      now: () => 1_800_000_000_000,
+      randomId: () => "interaction-id",
+      callTelegram: async (method, payload = {}) => {
+        calls.push({ method, payload });
+        if (method === "sendMessageDraft") return true;
+        if (method === "getFile") return { file_path: "uploads/file.bin" };
+        if (method === "createForumTopic") return { message_thread_id: 77 };
+        if (method === "sendMessage") return { message_id: ++messageId };
+        return true;
+      },
+      downloadFileBytes: async () => new Uint8Array([4, 5, 6]),
+      ...(options.transcribe ? { transcribe: async () => "voice transcript" } : {}),
     },
+    ...(options.transcribe ? { transcribeCommand: ["speech-to-text"] } : {}),
+    uiTimeoutMs: 10_000,
   });
+  let receiveAttempt = 0;
   const context: TransportStartContext = {
     receive: async (message) => {
-      received.push(message);
+      receiveAttempt += 1;
+      if (options.failFirstReceive && receiveAttempt === 1) throw new Error("temporary receive failure");
       await options.receive?.(message);
+      received.push(message);
     },
-    resolveIdentity: options.resolveIdentity ?? ((identity) => (identity.subject === "42" ? owner : undefined)),
+    resolveIdentity: (identity) => options.resolve?.(identity.subject) ?? (identity.subject === "42" ? owner : undefined),
   };
   await adapter.start(context);
-  return { adapter, calls, context, fakePoller, received, stateDir, store, waitForCall };
+  return { adapter, calls, checkpoints, pending, poller, received, stateDir };
 }
 
 function message(overrides: Partial<TgMessage> = {}): TgMessage {
   return {
-    message_id: 7,
-    date: 1_700_000_000,
-    text: "hello",
+    message_id: 10,
+    date: 1_800_000_000,
     chat: { id: 42, type: "private" },
-    from: { id: 42 },
+    from: { id: 42, first_name: "Wolfgang" },
+    text: "hello",
     ...overrides,
   };
 }
 
-function replyMessage(messageId: number): TgMessage {
-  return message({ message_id: messageId });
+function sentMessage(calls: readonly ApiCall[]): ApiCall {
+  const call = calls.findLast((entry) => entry.method === "sendMessage");
+  if (!call) throw new Error("expected sendMessage call");
+  return call;
 }
 
-function delivery(origin: ConversationAddress): DeliveryContext {
-  return { principal: owner, origin };
-}
-
-function inlineKeyboard(payload: Record<string, unknown>): Array<Array<Record<string, unknown>>> {
-  const markup = payload.reply_markup;
-  if (!markup || typeof markup !== "object" || !("inline_keyboard" in markup) || !Array.isArray(markup.inline_keyboard)) {
-    throw new Error("expected an inline Telegram keyboard");
+function callbackData(call: ApiCall, label: string): string {
+  const markup = call.payload.reply_markup;
+  if (markup === null || typeof markup !== "object" || !("inline_keyboard" in markup) || !Array.isArray(markup.inline_keyboard)) {
+    throw new Error("expected inline keyboard");
   }
-  if (!markup.inline_keyboard.every((row) => Array.isArray(row))) throw new Error("expected inline keyboard rows");
-  return markup.inline_keyboard as Array<Array<Record<string, unknown>>>;
+  for (const row of markup.inline_keyboard) {
+    if (!Array.isArray(row)) continue;
+    for (const button of row) {
+      if (button !== null && typeof button === "object" && "text" in button && button.text === label
+          && "callback_data" in button && typeof button.callback_data === "string") return button.callback_data;
+    }
+  }
+  throw new Error(`missing button ${label}`);
 }
 
-function callbackData(payload: Record<string, unknown>): string {
-  const firstButton = inlineKeyboard(payload)[0]?.[0];
-  if (!firstButton || typeof firstButton.callback_data !== "string") throw new Error("expected a callback button");
-  return firstButton.callback_data;
+async function flush(): Promise<void> {
+  await Bun.sleep(0);
 }
 
-describe("TelegramTransportAdapter outbound delivery", () => {
-  test("registers the native Telegram command menu at startup", async () => {
-    const commands = [
-      { command: "home", description: "Open the control center" },
-      { command: "status", description: "Show runtime status" },
-    ];
-    const { adapter, calls } = await fixture({ commands });
-
+describe("Telegram transport lifecycle", () => {
+  test("advertises the full gateway surface, registers commands, and stops polling", async () => {
+    const { adapter, calls, poller } = await fixture({
+      commands: [{ command: "home", description: "Open control center" }],
+    });
+    expect(adapter.capabilities).toMatchObject({
+      streamingUpdates: true,
+      buttons: true,
+      multiSelect: true,
+      textInput: true,
+      attachments: true,
+      reactions: true,
+      threads: true,
+    });
+    expect(adapter.capabilities.maxMessageLength).toBe(Number.MAX_SAFE_INTEGER);
     expect(calls[0]).toEqual({
       method: "setMyCommands",
-      payload: { commands },
-      responseMessageId: 100,
+      payload: { commands: [{ command: "home", description: "Open control center" }] },
     });
+    expect(poller.started).toBe(true);
     await adapter.stop();
+    expect(poller.stopped).toBe(true);
   });
 
-  test("advertises and performs streaming message updates", async () => {
-    const { adapter, calls } = await fixture();
-    expect(adapter.capabilities.streamingUpdates).toBe(true);
-
-    const receipt = await adapter.send(privateAddress, { text: "GATE", format: "text" }, delivery(privateAddress));
-    await adapter.update(
-      privateAddress,
-      receipt,
-      { text: "GATEWAY_E2E_0830", format: "text" },
-      delivery(privateAddress),
-    );
-
-    expect(calls.map(({ method }) => method)).toEqual(["sendMessage", "editMessageText"]);
-    expect(calls[1]?.payload).toMatchObject({ chat_id: "42", message_id: 100, text: "GATEWAY_E2E_0830" });
+  test("waits for an in-flight polled update before shutdown completes", async () => {
+    let entered = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { adapter, poller } = await fixture({
+      receive: async () => {
+        entered = true;
+        await gate;
+      },
+    });
+    const update = poller.handle?.({ update_id: 99, message: message() });
+    if (!update) throw new Error("poller did not capture its update handler");
+    while (!entered) await flush();
+    let stopped = false;
+    const stopping = adapter.stop().then(() => { stopped = true; });
+    await flush();
+    expect(stopped).toBe(false);
+    release();
+    await Promise.all([update, stopping]);
+    expect(stopped).toBe(true);
   });
 
-  test("turns a private native draft stop into an authenticated same-origin stop command", async () => {
-    const { adapter, calls, received } = await fixture();
-    const preview = await adapter.send(
-      privateAddress,
-      { text: "", format: "text", transient: true },
-      delivery(privateAddress),
-    );
-    const draftCall = calls.find(({ method }) => method === "sendMessageDraft");
-    const draftId = Number(draftCall?.payload.draft_id);
+  test("rejects a second starter when another process owns the account poll lock", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-adapter-lock-"));
+    scratch.push(stateDir);
+    const adapter = new TelegramTransportAdapter({
+      token: "token",
+      stateDir,
+      store: {
+        getCheckpoint: () => undefined,
+        setCheckpoint: () => {},
+        putPendingInteraction: () => {},
+        deletePendingInteraction: () => {},
+        listPendingInboundMessages: () => [],
+      },
+      api: { acquireLock: () => ({ ok: false, holder: 912 }) },
+    });
+    await expect(adapter.start({ receive: async () => {}, resolveIdentity: () => owner })).rejects.toThrow("process 912");
+  });
+});
 
+describe("Telegram inbound conversion", () => {
+  test("converts a private message into a principal-free gateway envelope", async () => {
+    const { adapter, received, checkpoints } = await fixture();
+    await adapter.handleUpdate({ update_id: 5, message: message() });
+    expect(received).toEqual([{
+      id: "telegram:primary:42:10",
+      sentAt: 1_800_000_000_000,
+      identity: { transport: "telegram", account: "primary", subject: "42" },
+      address: baseAddress,
+      content: { text: "hello" },
+      sourceReceipt: { transport: "telegram", messageId: "10" },
+      edited: false,
+    }]);
+    expect(checkpoints.get("telegram\0update_id:primary")).toBe(5);
+  });
+
+  test("preserves topic, reply, and edited-message metadata", async () => {
+    const { adapter, received } = await fixture();
+    await adapter.handleUpdate({
+      update_id: 6,
+      edited_message: message({
+        message_id: 11,
+        chat: { id: -100, type: "supergroup" },
+        is_topic_message: true,
+        message_thread_id: 19,
+        reply_to_message: message({ message_id: 3 }),
+      }),
+    });
+    expect(received[0]).toMatchObject({
+      address: { channel: "-100", thread: "19" },
+      replyTo: { transport: "telegram", messageId: "3" },
+      edited: true,
+    });
+  });
+
+  test("answers identity help locally for an unresolved user", async () => {
+    const { adapter, calls, received } = await fixture({ resolve: () => undefined });
+    await adapter.handleUpdate({ update_id: 7, message: message({ from: { id: 99 }, text: "/whoami" }) });
+    expect(received).toEqual([]);
+    expect(sentMessage(calls).payload.text).toContain("99");
+  });
+  test("drops unresolved attachments before any Telegram download or gateway dispatch", async () => {
+    const { adapter, calls, received } = await fixture({ resolve: () => undefined });
+    await adapter.handleUpdate({
+      update_id: 8,
+      message: message({
+        from: { id: 99 },
+        text: undefined,
+        document: { file_id: "remote", file_unique_id: "stable", file_name: "payload.bin", file_size: 3 },
+      }),
+    });
+    expect(received).toEqual([]);
+    expect(calls.some((entry) => entry.method === "getFile")).toBe(false);
+  });
+
+
+  test("downloads attachments into the private inbox before dispatch", async () => {
+    const { adapter, received } = await fixture();
+    await adapter.handleUpdate({
+      update_id: 8,
+      message: message({
+        text: undefined,
+        document: { file_id: "remote", file_unique_id: "stable", file_name: "../unsafe?.bin", file_size: 3 },
+      }),
+    });
+    const attachment = received[0]?.content.attachments?.[0];
+    expect(attachment?.name).toBe("unsafe_.bin");
+    expect(attachment?.url.startsWith("file://")).toBe(true);
+    if (!attachment) throw new Error("expected attachment");
+    expect(await readFile(new URL(attachment.url))).toEqual(Buffer.from([4, 5, 6]));
+  });
+
+  test("adds voice transcription beside the saved attachment", async () => {
+    const { adapter, received } = await fixture({ transcribe: true });
     await adapter.handleUpdate({
       update_id: 9,
-      stopped_message_generation: {
-        chat: { id: 42, type: "private" },
-        draft_id: draftId,
-      },
-    });
-
-    expect(preview.messageId).toBe(`draft:${draftId}`);
-    expect(received).toEqual([
-      expect.objectContaining({
-        id: `telegram:default:draft-stop:${draftId}:9`,
-        identity: { transport: "telegram", account: "default", subject: "42" },
-        address: privateAddress,
-        content: { text: "/stop" },
+      message: message({
+        text: undefined,
+        voice: { file_id: "voice", file_unique_id: "voice-stable", file_size: 3, mime_type: "audio/ogg" },
       }),
-    ]);
-    await adapter.stop();
+    });
+    expect(received[0]?.content.text).toBe("[Voice transcript: voice transcript]");
+    expect(received[0]?.content.attachments?.length).toBe(1);
   });
 
-  test("exposes an authenticated inline stop fallback on running task cards", async () => {
-    const { adapter, calls, received } = await fixture();
-    await adapter.presentUi(
-      privateAddress,
-      { type: "status", key: "Task", text: "Working\nDeploy carefully" },
-      delivery(privateAddress),
-    );
-    const taskMessage = calls.find(({ method }) => method === "sendMessage");
-    expect(inlineKeyboard(taskMessage?.payload ?? {})).toEqual([
-      [{ text: "Stop", callback_data: "ompctl:stop" }],
-    ]);
-
-    await adapter.handleUpdate({
+  test("reuses one forum topic when an authorized root message is retried", async () => {
+    const { adapter, calls, received } = await fixture({ createTopicsFromRoot: true, failFirstReceive: true });
+    const update = {
       update_id: 10,
-      callback_query: {
-        id: "task-stop",
-        from: { id: 42 },
-        data: "ompctl:stop",
-        message: { message_id: taskMessage?.responseMessageId ?? 0, chat: { id: 42, type: "private" } },
-      },
-    });
-    expect(received).toEqual([
-      expect.objectContaining({
-        id: "telegram:default:task-stop:task-stop",
-        identity: { transport: "telegram", account: "default", subject: "42" },
-        address: privateAddress,
-        content: { text: "/stop" },
-      }),
-    ]);
-
-    await adapter.presentUi(
-      privateAddress,
-      { type: "status", key: "Task", text: "Stopped\nDeploy carefully" },
-      delivery(privateAddress),
-    );
-    expect(calls.findLast(({ method }) => method === "editMessageReplyMarkup")?.payload).toMatchObject({
-      chat_id: "42",
-      reply_markup: { inline_keyboard: [] },
-    });
-    await adapter.stop();
-  });
-
-  test("ignores native draft stop events outside the mapped private conversation", async () => {
-    const { adapter, calls, received } = await fixture();
-    await adapter.send(privateAddress, { text: "", transient: true }, delivery(privateAddress));
-    const draftId = Number(calls.find(({ method }) => method === "sendMessageDraft")?.payload.draft_id);
-
-    await adapter.handleUpdate({
-      update_id: 10,
-      stopped_message_generation: {
-        chat: { id: -1001, type: "supergroup" },
-        message_thread_id: 9,
-        draft_id: draftId,
-      },
-    });
-
-    expect(received).toEqual([]);
-    await adapter.stop();
-  });
-});
-
-describe("TelegramTransportAdapter inbound conversion", () => {
-  test("converts private and topic messages into principal-free envelopes", async () => {
-    const { adapter, received } = await fixture();
-    await adapter.handleUpdate({ update_id: 1, message: message({ reply_to_message: replyMessage(4) }) });
-    await adapter.handleUpdate({
-      update_id: 2,
-      message: message({ message_id: 8, chat: { id: -1001, type: "supergroup" }, is_topic_message: true, message_thread_id: 9 }),
-    });
-
-    expect(received).toEqual([
-      expect.objectContaining({
-        id: "telegram:default:42:7",
-        sentAt: 1_700_000_000_000,
-        identity: { transport: "telegram", account: "default", subject: "42" },
-        address: privateAddress,
-        replyTo: { transport: "telegram", messageId: "4" },
-        sourceReceipt: { transport: "telegram", messageId: "7" },
-      }),
-      expect.objectContaining({
-        address: topicAddress,
-        id: "telegram:default:-1001:8",
-        sourceReceipt: { transport: "telegram", messageId: "8" },
-      }),
-    ]);
-    await adapter.stop();
-  });
-
-  test("creates one forum topic for an authorized root message and routes the turn into it", async () => {
-    const { adapter, calls, received, store } = await fixture({ createTopicsFromRoot: true });
-    const rootMessage = message({
-      message_id: 12,
-      text: "Plan the release\nwith a safe rollout",
-      chat: { id: -1001, type: "supergroup", is_forum: true },
-    });
-    await adapter.handleUpdate({ update_id: 1, message: rootMessage });
-    await adapter.handleUpdate({ update_id: 2, message: rootMessage });
-
-    expect(calls.filter(({ method }) => method === "createForumTopic")).toEqual([{
+      message: message({ chat: { id: -100, type: "supergroup", is_forum: true }, text: "Plan a release" }),
+    } as const;
+    await expect(adapter.handleUpdate(update)).rejects.toThrow("temporary receive failure");
+    await adapter.handleUpdate(update);
+    expect(calls.filter((entry) => entry.method === "createForumTopic")).toEqual([{
       method: "createForumTopic",
-      payload: { chat_id: -1001, name: "Plan the release with a safe rollout" },
+      payload: { chat_id: -100, name: "Plan a release" },
     }]);
-    expect(received.map(({ address }) => address)).toEqual([
-      { transport: "telegram", account: "default", channel: "-1001", thread: "55" },
-      { transport: "telegram", account: "default", channel: "-1001", thread: "55" },
-    ]);
-    expect(store.checkpoints.get("telegram:root_topic:-1001:12")).toBe(55);
-    await adapter.stop();
-  });
-
-  test("never creates forum topics for unauthorized users or root commands", async () => {
-    const unauthorized = await fixture({
-      createTopicsFromRoot: true,
-      resolveIdentity: () => undefined,
-    });
-    await unauthorized.adapter.handleUpdate({
-      update_id: 1,
-      message: message({ chat: { id: -1001, type: "supergroup", is_forum: true } }),
-    });
-    expect(unauthorized.calls.some(({ method }) => method === "createForumTopic")).toBe(false);
-    expect(unauthorized.received[0]?.address.thread).toBeUndefined();
-    await unauthorized.adapter.stop();
-
-    const authorized = await fixture({ createTopicsFromRoot: true });
-    await authorized.adapter.handleUpdate({
-      update_id: 1,
-      message: message({
-        text: "/status",
-        chat: { id: -1001, type: "supergroup", is_forum: true },
-      }),
-    });
-    expect(authorized.calls.some(({ method }) => method === "createForumTopic")).toBe(false);
-    expect(authorized.received[0]?.address.thread).toBeUndefined();
-    await authorized.adapter.stop();
-  });
-
-  test("checkpoints only completed updates and ignores their replay", async () => {
-    const receiveFinished = Promise.withResolvers<void>();
-    const { adapter, received, store } = await fixture({ receive: () => receiveFinished.promise });
-    const inFlight = adapter.handleUpdate({ update_id: 8, message: message() });
-    await Promise.resolve();
-    expect(store.writes).toEqual([]);
-    receiveFinished.resolve();
-    await inFlight;
-    await adapter.handleUpdate({ update_id: 8, message: message() });
-
-    expect(store.writes).toEqual([{ adapter: "telegram", key: "update_id", value: 8 }]);
-    expect(received).toHaveLength(1);
-    await adapter.stop();
-  });
-
-  test("does not advance a checkpoint past an earlier failed update", async () => {
-    let failFirst = true;
-    const { adapter, store } = await fixture({
-      receive: (envelope) => {
-        if (envelope.id.endsWith(":8") && failFirst) throw new Error("temporary receiver failure");
-      },
-    });
-    await expect(adapter.handleUpdate({ update_id: 8, message: message({ message_id: 8 }) })).rejects.toThrow("temporary receiver failure");
-    await adapter.handleUpdate({ update_id: 9, message: message({ message_id: 9 }) });
-    expect(store.writes).toEqual([]);
-
-    failFirst = false;
-    await adapter.handleUpdate({ update_id: 8, message: message({ message_id: 8 }) });
-    expect(store.writes).toEqual([{ adapter: "telegram", key: "update_id", value: 9 }]);
-    await adapter.stop();
-  });
-
-  test("downloads supported media into the bounded private inbox and transcribes voice", async () => {
-    const { adapter, received, stateDir } = await fixture({ transcribe: true });
-    await adapter.handleUpdate({
-      update_id: 1,
-      message: message({ text: undefined, voice: { file_id: "voice-file", file_unique_id: "voice-unique", mime_type: "audio/ogg", file_size: 3 } }),
-    });
-
-    const envelope = received[0];
-    expect(envelope.content.text).toBe("[Voice transcript: spoken words]");
-    expect(envelope.content.attachments).toEqual([
-      expect.objectContaining({ name: "voice-voice-unique.ogg", mediaType: "audio/ogg", url: expect.stringMatching(/^file:\/\//) }),
-    ]);
-    expect(envelope.content.attachments?.[0].url).toContain(`${stateDir}/inbox/`);
-    await adapter.stop();
-  });
-
-
-  test("preserves inbox files referenced by pending durable messages during media pruning", async () => {
-    const { adapter, stateDir, store } = await fixture();
-    const inboxDir = join(stateDir, "inbox");
-    const protectedPath = join(inboxDir, "pending-photo.jpg");
-    await mkdir(inboxDir, { recursive: true });
-    await writeFile(protectedPath, new Uint8Array([9, 8, 7]));
-    await utimes(protectedPath, 0, 0);
-    store.pendingInbound.push({
-      message: {
-        id: "pending-photo",
-        sentAt: 1,
-        identity: { transport: "telegram", account: "default", subject: "42" },
-        address: privateAddress,
-        principal: owner,
-        content: {
-          attachments: [{ url: pathToFileURL(protectedPath).href, name: "pending-photo.jpg", mediaType: "image/jpeg" }],
-        },
-      },
-      receivedAt: 1,
-      scheduled: false,
-    });
-
-    await adapter.handleUpdate({
-      update_id: 2,
-      message: message({
-        message_id: 8,
-        photo: [{ file_id: "new-photo", file_unique_id: "new-photo", width: 100, height: 100, file_size: 3 }],
-      }),
-    });
-
-    expect(await Bun.file(protectedPath).exists()).toBe(true);
-    await adapter.stop();
-  });
-
-  test("reads transcripts written by Whisper-style commands into an isolated output directory", async () => {
-    const script = [
-      "const fs = require('node:fs');",
-      "const path = require('node:path');",
-      "const [file, outputDir] = process.argv.slice(1);",
-      "fs.writeFileSync(path.join(outputDir, `${path.basename(file, path.extname(file))}.txt`), 'local words');",
-    ].join("");
-    const { adapter, received } = await fixture({
-      transcribeCommand: [process.execPath, "-e", script, "{file}", "{outputDir}"],
-    });
-    await adapter.handleUpdate({
-      update_id: 1,
-      message: message({ text: undefined, voice: { file_id: "voice-file", file_unique_id: "voice-unique", mime_type: "audio/ogg", file_size: 3 } }),
-    });
-
-    expect(received[0]?.content.text).toBe("[Voice transcript: local words]");
-    await adapter.stop();
-  });
-
-
-  test("stores every supported Telegram media kind as a private file attachment", async () => {
-    const { adapter, received } = await fixture();
-    const variants: readonly Partial<TgMessage>[] = [
-      { photo: [{ file_id: "photo", file_unique_id: "photo-unique", width: 100, height: 100, file_size: 3 }] },
-      { document: { file_id: "document", file_unique_id: "document-unique", file_name: "notes.txt", mime_type: "text/plain", file_size: 3 } },
-      { audio: { file_id: "audio", file_unique_id: "audio-unique", file_name: "song.mp3", mime_type: "audio/mpeg", file_size: 3 } },
-      { video: { file_id: "video", file_unique_id: "video-unique", file_name: "clip.mp4", mime_type: "video/mp4", file_size: 3 } },
-      { voice: { file_id: "voice", file_unique_id: "voice-unique", mime_type: "audio/ogg", file_size: 3 } },
-      { video_note: { file_id: "video-note", file_unique_id: "video-note-unique", file_size: 3 } },
-      { sticker: { file_id: "sticker", file_unique_id: "sticker-unique", file_size: 3 } },
-    ];
-    for (const [index, media] of variants.entries()) {
-      await adapter.handleUpdate({ update_id: index + 1, message: message({ ...media, message_id: index + 1 }) });
-    }
-
-    expect(received.map((envelope) => envelope.content.attachments?.[0])).toEqual([
-      expect.objectContaining({ name: "photo-photo-unique.jpg", mediaType: "image/jpeg", url: expect.stringMatching(/^file:\/\//) }),
-      expect.objectContaining({ name: "notes.txt", mediaType: "text/plain", url: expect.stringMatching(/^file:\/\//) }),
-      expect.objectContaining({ name: "song.mp3", mediaType: "audio/mpeg", url: expect.stringMatching(/^file:\/\//) }),
-      expect.objectContaining({ name: "clip.mp4", mediaType: "video/mp4", url: expect.stringMatching(/^file:\/\//) }),
-      expect.objectContaining({ name: "voice-voice-unique.ogg", mediaType: "audio/ogg", url: expect.stringMatching(/^file:\/\//) }),
-      expect.objectContaining({ name: "video-note-video-note-unique.mp4", mediaType: "video/mp4", url: expect.stringMatching(/^file:\/\//) }),
-      expect.objectContaining({ name: "sticker-sticker-unique.webp", mediaType: "image/webp", url: expect.stringMatching(/^file:\/\//) }),
-    ]);
-    await adapter.stop();
-  });
-  test("gives unknown users only safe identity guidance for /start and /whoami", async () => {
-    const { adapter, calls, received } = await fixture({ resolveIdentity: () => undefined });
-    await adapter.handleUpdate({ update_id: 1, message: message({ text: "/whoami" }) });
-    await adapter.handleUpdate({ update_id: 2, message: message({ text: "ordinary message" }) });
-
-    expect(received).toHaveLength(1);
-    expect(received[0].content.text).toBe("ordinary message");
-    expect(calls).toContainEqual(
-      expect.objectContaining({ method: "sendMessage", payload: expect.objectContaining({ text: expect.stringContaining("user_id: 42") }) }),
-    );
-    await adapter.stop();
+    expect(received.map((entry) => entry.address.thread)).toEqual(["77"]);
   });
 });
 
-  test("paginates large native select controls and resolves a later page", async () => {
-    const { adapter, calls, store, waitForCall } = await fixture();
-    const options = Array.from({ length: 10 }, (_, index) => ({
-      value: `value-${index}`,
-      label: `Option ${index + 1}`,
-      description: `Description ${index + 1}`,
-    }));
-    const sendFrom = calls.length;
-    const stored = store.waitForPending();
-    const sentCall = waitForCall(sendFrom, (call) => call.method === "sendMessage");
-    const response = adapter.presentUi(
-      privateAddress,
-      { type: "select", title: "Choose model", options },
-      delivery(privateAddress),
-    );
-    const sent = await sentCall;
-    await stored;
-    const firstKeyboard = inlineKeyboard(sent.payload);
-    expect(firstKeyboard).toHaveLength(9);
-    expect(firstKeyboard[0]?.[0]?.text).toBe("Option 1");
-    expect(firstKeyboard[8]?.[0]?.text).toBe("Next");
-
-    await adapter.handleUpdate({
-      update_id: 20,
-      callback_query: {
-        id: "next-page",
-        from: { id: 42 },
-        data: String(firstKeyboard[8]?.[0]?.callback_data),
-        message: { message_id: sent.responseMessageId!, chat: { id: 42, type: "private" } },
-      },
-    });
-    const pageEdit = calls.findLast((call) => call.method === "editMessageText");
-    expect(pageEdit?.payload.text).toContain("Page 2 of 2");
-    expect(pageEdit?.payload.text).toContain("9. Option 9: Description 9");
-    const markupEdit = calls.findLast((call) => call.method === "editMessageReplyMarkup");
-    const secondKeyboard = inlineKeyboard(markupEdit?.payload ?? {});
-    expect(secondKeyboard[0]?.[0]?.text).toBe("Option 9");
-    expect(secondKeyboard[2]?.[0]?.text).toBe("Previous");
-
-    await adapter.handleUpdate({
-      update_id: 21,
-      callback_query: {
-        id: "pick-page-two",
-        from: { id: 42 },
-        data: String(secondKeyboard[0]?.[0]?.callback_data),
-        message: { message_id: sent.responseMessageId!, chat: { id: 42, type: "private" } },
-      },
-    });
-    await expect(response).resolves.toEqual({ type: "select", selected: ["value-8"] });
-    await adapter.stop();
-  });
-
-describe("TelegramTransportAdapter UI", () => {
-  test("presents every UI request class using messages, controls, replies, and bounded surface edits", async () => {
-    const { adapter, calls, store, waitForCall } = await fixture();
-    await expect(adapter.presentUi(privateAddress, { type: "notify", message: "notice" }, delivery(privateAddress))).resolves.toEqual({ type: "notify", acknowledged: true });
-
-    const openUrlFrom = calls.length;
-    const openUrlCall = waitForCall(openUrlFrom, (call) => call.method === "sendMessage");
-    const openUrl = adapter.presentUi(privateAddress, { type: "open_url", url: "https://example.test", label: "Open" }, delivery(privateAddress));
-    const openUrlMessage = await openUrlCall;
-    await expect(openUrl).resolves.toEqual({ type: "open_url", opened: true });
-    expect(inlineKeyboard(openUrlMessage.payload)).toEqual([[{ text: "Open", url: "https://example.test" }]]);
-
-    await expect(adapter.presentUi(privateAddress, { type: "status", key: "state", text: "ready" }, delivery(privateAddress))).resolves.toEqual({ type: "status", acknowledged: true });
-    await expect(adapter.presentUi(privateAddress, { type: "widget", key: "agents", lines: ["one", "two"] }, delivery(privateAddress))).resolves.toEqual({ type: "widget", acknowledged: true });
-    await expect(adapter.presentUi(privateAddress, { type: "title", title: "Review" }, delivery(privateAddress))).resolves.toEqual({ type: "title", acknowledged: true });
-    const displayFrom = calls.length;
-    const displayCall = waitForCall(displayFrom, (call) => call.method === "editMessageText");
-    const display = adapter.presentUi(privateAddress, { type: "editor_text", text: "draft".repeat(2_000) }, delivery(privateAddress));
-    const boundedSurface = await displayCall;
-    await expect(display).resolves.toEqual({ type: "editor_text", acknowledged: true });
-    expect(boundedSurface.payload.reply_markup).toBeUndefined();
-    expect(String(boundedSurface.payload.text).length).toBeLessThanOrEqual(4_096);
-
-    const confirmFrom = calls.length;
-    const confirmStored = store.waitForPending();
-    const confirmCall = waitForCall(confirmFrom, (call) => call.method === "sendMessage");
-    const confirm = adapter.presentUi(privateAddress, { type: "confirm", title: "Proceed", message: "Continue?" }, delivery(privateAddress));
-    const confirmMessage = await confirmCall;
-    await confirmStored;
+describe("Telegram interactive UI", () => {
+  test("settles a confirm request from its owning principal and clears persistence", async () => {
+    const { adapter, calls, pending } = await fixture();
+    const answer = adapter.presentUi(baseAddress, {
+      type: "confirm",
+      title: "Deploy",
+      message: "Ship this build?",
+      confirmLabel: "Ship",
+      cancelLabel: "Wait",
+    }, delivery);
+    await flush();
+    const prompt = sentMessage(calls);
+    expect(pending.has("interaction-id")).toBe(true);
     await adapter.handleUpdate({
       update_id: 11,
       callback_query: {
-        id: "confirm-callback",
+        id: "callback-1",
         from: { id: 42 },
-        data: callbackData(confirmMessage.payload),
-        message: { message_id: confirmMessage.responseMessageId!, chat: { id: 42, type: "private" } },
+        data: callbackData(prompt, "Ship"),
+        message: message({ message_id: Number(prompt.payload.chat_id) + 159 }),
       },
     });
-    await expect(confirm).resolves.toEqual({ type: "confirm", confirmed: true });
+    await expect(answer).resolves.toEqual({ type: "confirm", confirmed: true });
+    expect(pending.size).toBe(0);
+  });
 
-    const selectFrom = calls.length;
-    const selectStored = store.waitForPending();
-    const selectCall = waitForCall(selectFrom, (call) => call.method === "sendMessage");
-    const select = adapter.presentUi(privateAddress, { type: "select", title: "Pick", options: [{ value: "a", label: "A" }] }, delivery(privateAddress));
-    const selectMessage = await selectCall;
-    await selectStored;
+  test("accepts text input only as a reply to the correlated prompt", async () => {
+    const { adapter, calls } = await fixture();
+    const answer = adapter.presentUi(baseAddress, {
+      type: "input",
+      title: "Release name",
+      prompt: "Enter a name",
+    }, delivery);
+    await flush();
+    const prompt = sentMessage(calls);
+    const promptId = 201;
+    expect(prompt.payload.reply_markup).toMatchObject({ force_reply: true });
     await adapter.handleUpdate({
       update_id: 12,
-      callback_query: {
-        id: "select-callback",
-        from: { id: 42 },
-        data: callbackData(selectMessage.payload),
-        message: { message_id: selectMessage.responseMessageId!, chat: { id: 42, type: "private" } },
-      },
+      message: message({
+        message_id: 44,
+        text: "Summer release",
+        reply_to_message: message({ message_id: promptId }),
+      }),
     });
-    await expect(select).resolves.toEqual({ type: "select", selected: ["a"] });
-
-    const multiFrom = calls.length;
-    const multiStored = store.waitForPending();
-    const multiCall = waitForCall(multiFrom, (call) => call.method === "sendMessage");
-    const multi = adapter.presentUi(privateAddress, { type: "select", title: "Pick", multiSelect: true, options: [{ value: "a", label: "A" }, { value: "b", label: "B" }] }, delivery(privateAddress));
-    const multiMessage = await multiCall;
-    await multiStored;
-    const multiData = callbackData(multiMessage.payload);
-    const multiMessageId = multiMessage.responseMessageId!;
-    await adapter.handleUpdate({ update_id: 13, callback_query: { id: "multi-choice", from: { id: 42 }, data: multiData, message: { message_id: multiMessageId, chat: { id: 42, type: "private" } } } });
-    await adapter.handleUpdate({ update_id: 14, callback_query: { id: "multi-done", from: { id: 42 }, data: multiData.replace(/:0$/, ":done"), message: { message_id: multiMessageId, chat: { id: 42, type: "private" } } } });
-    await expect(multi).resolves.toEqual({ type: "select", selected: ["a"] });
-
-    const inputFrom = calls.length;
-    const inputStored = store.waitForPending();
-    const inputCall = waitForCall(inputFrom, (call) => call.method === "sendMessage");
-    const input = adapter.presentUi(privateAddress, { type: "input", title: "Input", prompt: "Reply" }, delivery(privateAddress));
-    const inputMessage = await inputCall;
-    await inputStored;
-    expect(inputMessage.payload.reply_markup).toEqual(expect.objectContaining({ force_reply: true, selective: true }));
-    await adapter.handleUpdate({ update_id: 15, message: message({ message_id: 300, text: "answer", reply_to_message: replyMessage(inputMessage.responseMessageId!) }) });
-    await expect(input).resolves.toEqual({ type: "input", cancelled: false, value: "answer" });
-
-    const editorFrom = calls.length;
-    const editorStored = store.waitForPending();
-    const editorCall = waitForCall(editorFrom, (call) => call.method === "sendMessage");
-    const editor = adapter.presentUi(privateAddress, { type: "editor", title: "Edit", initialValue: "before" }, delivery(privateAddress));
-    const editorMessage = await editorCall;
-    await editorStored;
-    expect(editorMessage.payload.reply_markup).toEqual(expect.objectContaining({ force_reply: true, selective: true }));
-    await adapter.handleUpdate({ update_id: 16, message: message({ message_id: 301, text: "after", reply_to_message: replyMessage(editorMessage.responseMessageId!) }) });
-    await expect(editor).resolves.toEqual({ type: "editor", cancelled: false, value: "after" });
-    await adapter.stop();
+    await expect(answer).resolves.toEqual({ type: "input", cancelled: false, value: "Summer release" });
   });
 
-  test("rejects a resolved-but-wrong responder without settling the interaction", async () => {
-    const { adapter, calls, store, waitForCall } = await fixture({ resolveIdentity: (identity) => (identity.subject === "42" ? owner : { id: "principal-9", roles: ["operator"] }) });
-    const promptFrom = calls.length;
-    const promptStored = store.waitForPending();
-    const promptCall = waitForCall(promptFrom, (call) => call.method === "sendMessage");
-    const response = adapter.presentUi(privateAddress, { type: "confirm", title: "Proceed", message: "Continue?" }, delivery(privateAddress));
-    const prompt = await promptCall;
-    await promptStored;
+  test("maps a native running-task stop button back to /stop", async () => {
+    const { adapter, calls, received } = await fixture();
+    await adapter.presentUi(baseAddress, { type: "status", key: "Task", text: "Working\nDeploying" }, delivery);
+    const card = sentMessage(calls);
     await adapter.handleUpdate({
-      update_id: 1,
+      update_id: 13,
       callback_query: {
-        id: "wrong",
-        from: { id: 9 },
-        data: callbackData(prompt.payload),
-        message: { message_id: prompt.responseMessageId!, chat: { id: 42, type: "private" } },
-      },
-    });
-    expect(store.pending.size).toBe(1);
-    await adapter.handleUpdate({
-      update_id: 2,
-      callback_query: {
-        id: "right",
+        id: "stop-1",
         from: { id: 42 },
-        data: callbackData(prompt.payload),
-        message: { message_id: prompt.responseMessageId!, chat: { id: 42, type: "private" } },
+        data: callbackData(card, "Stop"),
+        message: message({ message_id: 201 }),
       },
     });
-    await expect(response).resolves.toEqual({ type: "confirm", confirmed: true });
-    expect(store.pending.size).toBe(0);
-    expect(calls).toContainEqual(expect.objectContaining({ method: "answerCallbackQuery", payload: expect.objectContaining({ show_alert: true }) }));
-    await adapter.stop();
+    expect(received[0]).toMatchObject({ content: { text: "/stop" }, address: baseAddress });
   });
 
-  test("cancels pending UI for aborts, timeouts, and shutdown while deleting store state", async () => {
-    vi.useFakeTimers();
-    try {
-      const { adapter, store } = await fixture({ uiTimeoutMs: 5 });
-      const controller = new AbortController();
-      const abortedStored = store.waitForPending();
-      const aborted = adapter.presentUi(privateAddress, { type: "input", title: "Input" }, delivery(privateAddress), controller.signal);
-      await abortedStored;
-      expect(store.pending.size).toBe(1);
-      controller.abort();
-      await expect(aborted).resolves.toEqual({ type: "input", cancelled: true });
-      expect(store.pending.size).toBe(0);
+  test("rejects a stop button click from a different authorized principal", async () => {
+    const attacker: Principal = { id: "principal-attacker", roles: ["operator"] };
+    const { adapter, calls, received } = await fixture({
+      resolve: (subject) => subject === "42" ? owner : attacker,
+    });
+    await adapter.presentUi(baseAddress, { type: "status", key: "Task", text: "Working\nDeploying" }, delivery);
+    const card = sentMessage(calls);
+    await adapter.handleUpdate({
+      update_id: 14,
+      callback_query: {
+        id: "stop-attacker",
+        from: { id: 99 },
+        data: callbackData(card, "Stop"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    expect(received).toEqual([]);
+    expect(calls.findLast((entry) => entry.method === "answerCallbackQuery")?.payload).toMatchObject({
+      show_alert: true,
+    });
+  });
 
-      const timeoutStored = store.waitForPending();
-      const timeout = adapter.presentUi(privateAddress, { type: "editor", title: "Editor", initialValue: "x" }, delivery(privateAddress));
-      await timeoutStored;
-      vi.advanceTimersByTime(5);
-      await expect(timeout).resolves.toEqual({ type: "editor", cancelled: true });
-      expect(store.pending.size).toBe(0);
-
-      const stoppedStored = store.waitForPending();
-      const stopped = adapter.presentUi(privateAddress, { type: "confirm", title: "Confirm", message: "x" }, delivery(privateAddress));
-      await stoppedStored;
-      expect(store.pending.size).toBe(1);
-      await adapter.stop();
-      await expect(stopped).resolves.toEqual({ type: "confirm", confirmed: false });
-      expect(store.pending.size).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
+  test("maps Telegram's native draft-stop update back to /stop", async () => {
+    const { adapter, received } = await fixture();
+    const receipt = await adapter.send(baseAddress, { text: "Working", transient: true }, delivery);
+    const draftId = telegramDraftId(receipt);
+    if (draftId === undefined) throw new Error("expected a Telegram draft receipt");
+    await adapter.handleUpdate({
+      update_id: 14,
+      stopped_message_generation: {
+        draft_id: draftId,
+        chat: { id: 42, type: "private" },
+      },
+    });
+    expect(received[0]).toMatchObject({
+      content: { text: "/stop" },
+      identity: { subject: "42" },
+      address: baseAddress,
+    });
   });
 });

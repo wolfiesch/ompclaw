@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.0 (2026-08-31)
+
+### Changed
+
+- Reimplement the Telegram transport as project-owned Bot API, delivery, formatting, inbox, and adapter modules while preserving the gateway's public transport contract.
+- Package only the maintained transport modules and remove obsolete source-provenance artifacts.
+
+### Fixed
+
+- Validate malformed Telegram API envelopes without unchecked generic casts and preserve retry, cancellation, lock, attachment, topic, streaming, and interactive UI behavior behind focused contract tests.
+- Preserve long OMP output for Telegram's multipart delivery path instead of rejecting it at the gateway boundary.
+- Route native Telegram draft-stop events through authenticated `/stop`, reuse forum topics across retried updates, and migrate legacy poll offsets to account-scoped checkpoints.
+- Propagate update-handler failures into bounded long-poll retries and drain in-flight update work before shutdown.
+
 ## 0.5.1 (2026-08-31)
 
 ### Fixed

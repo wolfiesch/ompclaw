@@ -88,6 +88,7 @@ class MemoryStore implements GatewayApplicationStore {
   readonly bindings: ConversationBinding[] = [];
   readonly releases: string[] = [];
   readonly migrations = new Set<string>();
+  readonly updateCheckpointMigrations: string[] = [];
   closed = false;
   failBindings = 0;
   resolvedPrincipal: Principal | undefined = { id: "operator", roles: ["operator"] };
@@ -163,6 +164,11 @@ class MemoryStore implements GatewayApplicationStore {
       removed++;
     }
     return removed;
+  }
+
+  migrateTelegramUpdateCheckpoint(account: string) {
+    this.updateCheckpointMigrations.push(account);
+    return false;
   }
 
   putPendingInteraction() {}
@@ -306,6 +312,7 @@ describe("GatewayApplication", () => {
     });
 
     await app.start();
+    expect(store.updateCheckpointMigrations).toEqual(["bot"]);
     expect(await core.options().identityResolver({ transport: "telegram", account: "bot", subject: "42" })).toEqual({ id: "operator", roles: ["operator"] });
     await core.options().onInbound(inbound("message-1"));
     await waitFor(() => store.bindings.length === 1);
@@ -1063,7 +1070,7 @@ describe("GatewayApplication", () => {
     try {
       expect(store.resolvePrincipal({ transport: "websocket", account: "web", subject: "subject-a" })?.id).toBe("principal-a");
       expect(store.resolvePrincipal({ transport: "telegram", account: "bot", subject: "12345" })?.id).toBe("telegram:bot:12345");
-      expect(store.getCheckpoint("telegram", "update_id")).toBe("7");
+      expect(store.getCheckpoint("telegram", "update_id:default")).toBe(7);
     } finally {
       store.close();
     }
