@@ -481,6 +481,8 @@ export class RpcGatewayRuntime {
       await this.#setTurnLifecycle("completed");
       const active = this.#activeTurn;
       this.#activeTurn = undefined;
+      if (this.#status.state) this.#status.state.isStreaming = false;
+      this.#wakeIdleWaiters();
       active?.scheduledCompletion?.resolve();
       await this.#refreshState();
       return;
