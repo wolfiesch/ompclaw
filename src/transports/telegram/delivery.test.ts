@@ -130,6 +130,14 @@ describe("Telegram outbound delivery", () => {
     expect(compact).toEqual([{ transport: "telegram", messageId: "101" }]);
     expect(calls).toEqual([
       {
+        method: "deleteMessage",
+        payload: {
+          chat_id: "42",
+          message_thread_id: 7,
+          message_id: 102,
+        },
+      },
+      {
         method: "editMessageText",
         payload: {
           chat_id: "42",
@@ -139,15 +147,43 @@ describe("Telegram outbound delivery", () => {
           reply_markup: replyMarkup,
         },
       },
-      {
-        method: "deleteMessage",
-        payload: {
-          chat_id: "42",
-          message_thread_id: 7,
-          message_id: 102,
-        },
-      },
     ]);
+  });
+
+  test("retains and refreshes control-card chunks that Telegram can no longer delete", async () => {
+    let messageId = 100;
+    const { outbound, calls } = harness(async (method) => {
+      if (method === "deleteMessage") throw new TgError("Bad Request: message can't be deleted", 400);
+      if (method === "sendMessage") return { message_id: ++messageId };
+      return true;
+    });
+    const replyMarkup = { inline_keyboard: [[{ text: "Stop", callback_data: "stop" }]] };
+    const initial = await outbound.sendMessages(
+      address,
+      "x".repeat(TELEGRAM_MAX_CHARS + 200),
+      context,
+      { replyMarkup },
+    );
+    calls.splice(0);
+
+    const retained = await outbound.replaceMessages(address, initial, "updated", context, { replyMarkup });
+    expect(retained).toEqual(initial);
+    expect(calls.map((entry) => entry.method)).toEqual([
+      "deleteMessage",
+      "editMessageText",
+      "editMessageText",
+    ]);
+    const edits = calls.filter((entry) => entry.method === "editMessageText");
+    expect(edits[0]?.payload).toMatchObject({
+      message_id: 101,
+      text: "updated",
+      reply_markup: { inline_keyboard: [] },
+    });
+    expect(edits[1]?.payload).toMatchObject({
+      message_id: 102,
+      text: "Control card content is shown above.",
+      reply_markup: replyMarkup,
+    });
   });
 
   test("retries malformed Markdown once as plain text", async () => {

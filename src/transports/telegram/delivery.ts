@@ -300,22 +300,37 @@ export class Outbound {
   ): Promise<readonly OutboundReceipt[]> {
     await this.#assertTarget(address, context);
     const pieces = renderDirectText(text, options);
-    const results: OutboundReceipt[] = [];
     const emptyMarkup = { inline_keyboard: [] };
-    const count = Math.max(targets.length, pieces.length);
-    for (let index = 0; index < count; index += 1) {
-      const target = targets[index];
-      const piece = pieces[index];
-      if (piece === undefined) {
-        if (target !== undefined) {
+    const retainedNotice: RenderedText = {
+      wireText: "Control card content is shown above.",
+      plainText: "Control card content is shown above.",
+    };
+    let retainedTargets = targets;
+    if (targets.length > pieces.length) {
+      let retainedCount = pieces.length;
+      for (let index = targets.length - 1; index >= pieces.length; index -= 1) {
+        const target = targets[index]!;
+        try {
           await this.#request("deleteMessage", {
             ...messageBase(address),
             message_id: messageId(target),
           }, signal, address);
+        } catch (error) {
+          retainedCount = index + 1;
+          this.#log?.warn(
+            `[telegram] stale control card chunk ${target.messageId} could not be deleted and will be retained: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          break;
         }
-        continue;
       }
-      const replyMarkup = index === pieces.length - 1 ? options.replyMarkup ?? emptyMarkup : emptyMarkup;
+      retainedTargets = targets.slice(0, retainedCount);
+    }
+    const results: OutboundReceipt[] = [];
+    const count = Math.max(retainedTargets.length, pieces.length);
+    for (let index = 0; index < count; index += 1) {
+      const target = retainedTargets[index];
+      const piece = pieces[index] ?? retainedNotice;
+      const replyMarkup = index === count - 1 ? options.replyMarkup ?? emptyMarkup : emptyMarkup;
       if (target === undefined) {
         results.push(await this.#sendOneText(address, piece, { replyMarkup }, signal));
         continue;
