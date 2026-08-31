@@ -312,6 +312,7 @@ export class RpcGatewayRuntime {
   #turnCardQueue: Promise<void> = Promise.resolve();
   #conversationQueue: Promise<void> = Promise.resolve();
   #queuedConversationCount = 0;
+  readonly #reactionQueues = new Map<string, Promise<void>>();
   readonly #idleWaiters = new Set<PromiseWithResolvers<void>>();
 
   constructor(options: RpcGatewayRuntimeOptions, logger: RpcRuntimeLogger = console) {
@@ -636,7 +637,7 @@ export class RpcGatewayRuntime {
       this.#wakeIdleWaiters();
       active?.scheduledCompletion?.resolve();
       await this.#refreshState();
-      void this.#reactToSource(active, "👍");
+      this.#queueSourceReaction(active, "👍");
       return;
     }
     if (frame.type === "agent_end" && frame.isTerminal !== false) {
@@ -656,7 +657,7 @@ export class RpcGatewayRuntime {
         if (this.#status.state) this.#status.state.isStreaming = false;
         this.#wakeIdleWaiters();
         await this.#refreshState();
-        void this.#reactToSource(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
+        this.#queueSourceReaction(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
       }
       return;
     }
@@ -686,7 +687,7 @@ export class RpcGatewayRuntime {
         await this.#setTurnLifecycle("completed");
         this.#clearActiveDelivery(delivery, true);
         await this.#refreshState();
-        void this.#reactToSource(active, "👍");
+        this.#queueSourceReaction(active, "👍");
       }
     } catch (error) {
       await this.#setTurnLifecycle("failed", { error: error instanceof Error ? error.message : String(error) });
@@ -1174,7 +1175,7 @@ export class RpcGatewayRuntime {
         ...delivery,
         ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
       };
-      void this.#reactToSource(this.#activeTurn, "👀");
+      this.#queueSourceReaction(this.#activeTurn, "👀");
       return;
     }
     const now = this.#now();
@@ -1198,7 +1199,7 @@ export class RpcGatewayRuntime {
       ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
     };
     this.#queueTurnCard(this.#activeTurn);
-    void this.#reactToSource(this.#activeTurn, "👀");
+    this.#queueSourceReaction(this.#activeTurn, "👀");
   }
 
   async #setTurnLifecycle(
@@ -1284,6 +1285,26 @@ export class RpcGatewayRuntime {
       if (message.stopReason === "error") return "failed";
     }
     return "completed";
+  }
+
+  #queueSourceReaction(delivery: GatewayTurnTarget | undefined, emoji: string): void {
+    if (!delivery?.sourceReceipt) return;
+    const key = JSON.stringify([
+      delivery.address.transport,
+      delivery.address.account,
+      delivery.address.channel,
+      delivery.address.thread ?? "",
+      delivery.sourceReceipt.transport,
+      delivery.sourceReceipt.messageId,
+    ]);
+    const previous = this.#reactionQueues.get(key);
+    const queued = previous === undefined
+      ? this.#reactToSource(delivery, emoji)
+      : previous.then(() => this.#reactToSource(delivery, emoji));
+    this.#reactionQueues.set(key, queued);
+    void queued.finally(() => {
+      if (this.#reactionQueues.get(key) === queued) this.#reactionQueues.delete(key);
+    });
   }
 
   async #reactToSource(delivery: GatewayTurnTarget | undefined, emoji: string): Promise<void> {
