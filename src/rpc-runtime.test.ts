@@ -12,6 +12,7 @@ import type {
   UiResponseFor,
 } from "./gateway-types";
 import type { GatewayDelivery } from "./gateway-tools";
+import type { GatewayTurnLifecycleStore, TurnLifecycle } from "./gateway-store";
 import type { RpcCommandInput } from "./rpc-client";
 import type { RpcRuntimeConfig } from "./rpc-config";
 import type { RpcRecord, RpcResponse, RpcSessionState } from "./rpc-protocol";
@@ -184,7 +185,6 @@ function textFromContent(content: unknown): string | undefined {
   if (!content || typeof content !== "object" || !("text" in content) || typeof content.text !== "string") return undefined;
   return content.text;
 }
-
 async function settle(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
@@ -202,6 +202,72 @@ describe("RpcGatewayRuntime", () => {
     // Module mocking requires loading the runtime after the replacement client is registered.
     const source = await Bun.file(new URL("./rpc-runtime.ts", import.meta.url)).text();
     expect(source).not.toMatch(/from "\.\/(?:access|api|bridge|control|inbox|outbound)"/);
+  });
+
+  test("persists queued, running, tool, terminal, and restart-interrupted task states", async () => {
+    const turns = new Map<string, TurnLifecycle>([
+      ["stale", {
+        id: "stale",
+        principalId: "principal-lifecycle",
+        address: { transport: "test", account: "account", channel: "lifecycle" },
+        prompt: "Old unfinished turn",
+        state: "running",
+        createdAt: 1,
+        updatedAt: 2,
+      }],
+    ]);
+    const turnStore: GatewayTurnLifecycleStore = {
+      putTurnLifecycle: (turn) => turns.set(turn.id, turn),
+      interruptActiveTurns: (interruptedAt) => {
+        let changed = 0;
+        for (const [id, turn] of turns) {
+          if (turn.state !== "queued" && turn.state !== "running") continue;
+          turns.set(id, { ...turn, state: "interrupted", updatedAt: interruptedAt, finishedAt: interruptedAt });
+          changed++;
+        }
+        return changed;
+      },
+      listTurnLifecycles: (address, limit = 10) => [...turns.values()]
+        .filter((turn) => JSON.stringify(turn.address) === JSON.stringify(address))
+        .sort((left, right) => right.createdAt - left.createdAt)
+        .slice(0, limit),
+    };
+    let now = 100;
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), turnStore, now: () => now++ });
+    await runtime.start();
+    expect(turns.get("stale")).toMatchObject({ state: "interrupted", finishedAt: 100 });
+
+    await runtime.handleInbound(message("lifecycle", "Deploy carefully"));
+    const rpc = FakeOmpRpcClient.instances[0];
+    rpc.emit({ type: "agent_start" });
+    rpc.emit({ type: "tool_execution_start", toolName: "bash" });
+    rpc.emit({ type: "tool_execution_end", toolName: "bash" });
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }],
+    });
+    await settle();
+    await Bun.sleep(0);
+    await settle();
+
+    expect(turns.get("lifecycle-Deploy carefully")).toMatchObject({
+      state: "completed",
+      prompt: "Deploy carefully",
+      finishedAt: expect.any(Number),
+    });
+    const taskCards = deliveries
+      .filter((call) => call.method === "presentUi" && call.request?.type === "status" && call.request.key === "Task")
+      .map((call) => call.request && "text" in call.request ? call.request.text : undefined);
+    expect(taskCards).toEqual(expect.arrayContaining([
+      "Queued\nDeploy carefully",
+      "Running\nDeploy carefully\nTool: bash",
+      "Completed\nDeploy carefully",
+    ]));
+
+    await runtime.handleInbound(message("lifecycle", "/tasks"));
+    expect(deliveries.some((call) => textFromContent(call.content)?.includes("COMPLETED | Deploy carefully"))).toBe(true);
+    await runtime.stop();
   });
 
   test("streams and finalizes only to the exact active delivery context while another origin receives busy", async () => {

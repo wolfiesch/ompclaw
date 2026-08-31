@@ -24,8 +24,9 @@ function outbound(
   call: TelegramCall,
   upload?: TelegramUpload,
   authorizeAddress = (target: ConversationAddress, context: DeliveryContext) => target.channel === context.origin.channel,
+  nextDraftId?: () => number,
 ): Outbound {
-  return new Outbound({ token: "test-token", authorizeAddress, callTelegram: call, uploadTelegram: upload });
+  return new Outbound({ token: "test-token", authorizeAddress, callTelegram: call, uploadTelegram: upload, nextDraftId });
 }
 
 test("uses MarkdownV2 but retries unformatted text if Telegram rejects parsing", async () => {
@@ -160,6 +161,75 @@ test("treats an unchanged final streamed message as successful", async () => {
   const preview = { transport: "telegram" as const, messageId: "15" };
 
   await expect(send.finalize(address, preview, { text: "same" }, delivery())).resolves.toEqual([preview]);
+});
+
+test("uses native Telegram drafts for transient streaming and persists only the final message", async () => {
+  const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+  const send = outbound(
+    async (method, payload) => {
+      calls.push({ method, payload: payload ?? {} });
+      return method === "sendMessageDraft" ? true : { message_id: 21 };
+    },
+    undefined,
+    undefined,
+    () => 7,
+  );
+
+  const preview = await send.send(address, { text: "", transient: true }, delivery());
+  await expect(send.update(address, preview, { text: "partial", transient: true }, delivery())).resolves.toEqual(preview);
+  await expect(send.finalize(address, preview, { text: "complete" }, delivery())).resolves.toEqual([
+    { transport: "telegram", messageId: "21" },
+  ]);
+
+  expect(preview).toEqual({ transport: "telegram", messageId: "draft:7" });
+  expect(calls).toEqual([
+    {
+      method: "sendMessageDraft",
+      payload: {
+        chat_id: "42",
+        draft_id: 7,
+        text: "",
+        can_stop: true,
+        keep_on_stop: true,
+      },
+    },
+    {
+      method: "sendMessageDraft",
+      payload: {
+        chat_id: "42",
+        draft_id: 7,
+        text: "partial",
+        can_stop: true,
+        keep_on_stop: true,
+      },
+    },
+    expect.objectContaining({
+      method: "sendMessage",
+      payload: expect.objectContaining({ chat_id: "42", text: "complete" }),
+    }),
+  ]);
+});
+
+test("falls back to Telegram typing when native drafts are unavailable", async () => {
+  const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+  const send = outbound(
+    async (method, payload) => {
+      calls.push({ method, payload: payload ?? {} });
+      if (method === "sendMessageDraft") throw new TgError("Bad Request: method not found", 400);
+      return method === "sendChatAction" ? true : { message_id: 22 };
+    },
+    undefined,
+    undefined,
+    () => 8,
+  );
+
+  const preview = await send.send(address, { text: "", transient: true }, delivery());
+  await expect(send.finalize(address, preview, { text: "complete" }, delivery())).resolves.toEqual([
+    { transport: "telegram", messageId: "22" },
+  ]);
+
+  expect(preview).toEqual({ transport: "telegram", messageId: "typing:8" });
+  expect(calls.map(({ method }) => method)).toEqual(["sendMessageDraft", "sendChatAction", "sendMessage"]);
 });
 
 test("does not let an outbound caller override the authorized delivery address", async () => {

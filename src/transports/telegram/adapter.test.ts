@@ -111,6 +111,7 @@ async function fixture(options: {
         const callIndex = calls.push(call) - 1;
         for (const waiter of callWaiters) waiter(call, callIndex);
         if (method === "getFile") return { file_path: `private/${payload?.file_id}.ogg` };
+        if (method === "sendMessageDraft") return true;
         const responseMessageId = nextMessageId++;
         call.responseMessageId = responseMessageId;
         return { message_id: responseMessageId };
@@ -185,6 +186,96 @@ describe("TelegramTransportAdapter outbound delivery", () => {
     expect(calls.map(({ method }) => method)).toEqual(["sendMessage", "editMessageText"]);
     expect(calls[1]?.payload).toMatchObject({ chat_id: "42", message_id: 100, text: "GATEWAY_E2E_0830" });
   });
+
+  test("turns a private native draft stop into an authenticated same-origin stop command", async () => {
+    const { adapter, calls, received } = await fixture();
+    const preview = await adapter.send(
+      privateAddress,
+      { text: "", format: "text", transient: true },
+      delivery(privateAddress),
+    );
+    const draftCall = calls.find(({ method }) => method === "sendMessageDraft");
+    const draftId = Number(draftCall?.payload.draft_id);
+
+    await adapter.handleUpdate({
+      update_id: 9,
+      stopped_message_generation: {
+        chat: { id: 42, type: "private" },
+        draft_id: draftId,
+      },
+    });
+
+    expect(preview.messageId).toBe(`draft:${draftId}`);
+    expect(received).toEqual([
+      expect.objectContaining({
+        id: `telegram:default:draft-stop:${draftId}:9`,
+        identity: { transport: "telegram", account: "default", subject: "42" },
+        address: privateAddress,
+        content: { text: "/stop" },
+      }),
+    ]);
+    await adapter.stop();
+  });
+
+  test("exposes an authenticated inline stop fallback on running task cards", async () => {
+    const { adapter, calls, received } = await fixture();
+    await adapter.presentUi(
+      privateAddress,
+      { type: "status", key: "Task", text: "Running\nDeploy carefully" },
+      delivery(privateAddress),
+    );
+    const taskMessage = calls.find(({ method }) => method === "sendMessage");
+    expect(inlineKeyboard(taskMessage?.payload ?? {})).toEqual([
+      [{ text: "Stop", callback_data: "ompctl:stop" }],
+    ]);
+
+    await adapter.handleUpdate({
+      update_id: 10,
+      callback_query: {
+        id: "task-stop",
+        from: { id: 42 },
+        data: "ompctl:stop",
+        message: { message_id: taskMessage?.responseMessageId ?? 0, chat: { id: 42, type: "private" } },
+      },
+    });
+    expect(received).toEqual([
+      expect.objectContaining({
+        id: "telegram:default:task-stop:task-stop",
+        identity: { transport: "telegram", account: "default", subject: "42" },
+        address: privateAddress,
+        content: { text: "/stop" },
+      }),
+    ]);
+
+    await adapter.presentUi(
+      privateAddress,
+      { type: "status", key: "Task", text: "Stopped\nDeploy carefully" },
+      delivery(privateAddress),
+    );
+    expect(calls.findLast(({ method }) => method === "editMessageReplyMarkup")?.payload).toMatchObject({
+      chat_id: "42",
+      reply_markup: { inline_keyboard: [] },
+    });
+    await adapter.stop();
+  });
+
+  test("ignores native draft stop events outside the mapped private conversation", async () => {
+    const { adapter, calls, received } = await fixture();
+    await adapter.send(privateAddress, { text: "", transient: true }, delivery(privateAddress));
+    const draftId = Number(calls.find(({ method }) => method === "sendMessageDraft")?.payload.draft_id);
+
+    await adapter.handleUpdate({
+      update_id: 10,
+      stopped_message_generation: {
+        chat: { id: -1001, type: "supergroup" },
+        message_thread_id: 9,
+        draft_id: draftId,
+      },
+    });
+
+    expect(received).toEqual([]);
+    await adapter.stop();
+  });
 });
 
 describe("TelegramTransportAdapter inbound conversion", () => {
@@ -203,10 +294,12 @@ describe("TelegramTransportAdapter inbound conversion", () => {
         identity: { transport: "telegram", account: "default", subject: "42" },
         address: privateAddress,
         replyTo: { transport: "telegram", messageId: "4" },
+        sourceReceipt: { transport: "telegram", messageId: "7" },
       }),
       expect.objectContaining({
         address: topicAddress,
         id: "telegram:default:-1001:8",
+        sourceReceipt: { transport: "telegram", messageId: "8" },
       }),
     ]);
     await adapter.stop();

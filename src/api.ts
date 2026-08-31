@@ -167,11 +167,17 @@ export interface TgCallbackQuery {
   message?: Pick<TgMessage, "message_id" | "chat" | "is_topic_message" | "message_thread_id">;
   data?: string;
 }
+export interface TgMessageGenerationStopped {
+  chat: TgChat;
+  message_thread_id?: number;
+  draft_id: number;
+}
 export interface TgUpdate {
   update_id: number;
   message?: TgMessage;
   edited_message?: TgMessage;
   callback_query?: TgCallbackQuery;
+  stopped_message_generation?: TgMessageGenerationStopped;
 }
 export interface TgFile {
   file_id: string;

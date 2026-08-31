@@ -43,6 +43,8 @@ export interface InboundEnvelope {
   readonly address: ConversationAddress;
   readonly content: InboundContent;
   readonly replyTo?: OutboundReceipt;
+  /** Receipt for the inbound message itself, used only for same-origin reactions and replies. */
+  readonly sourceReceipt?: OutboundReceipt;
   readonly edited?: boolean;
 }
 
@@ -55,6 +57,8 @@ export interface OutboundContent {
   readonly attachments?: readonly MessageAttachment[];
   readonly replyTo?: OutboundReceipt;
   readonly format?: "text" | "markdown";
+  /** Ephemeral streaming preview; transports must persist finalized content separately. */
+  readonly transient?: boolean;
 }
 
 /** A transport-native message identifier paired with its issuing transport. */

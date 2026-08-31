@@ -15,7 +15,13 @@ import {
   type GatewayScheduledJobStore,
   type GatewaySchedulerOptions,
 } from "./gateway-scheduler";
-import { GatewayStore, type ConversationBinding, type JsonValue, type ScheduledJob } from "./gateway-store";
+import {
+  GatewayStore,
+  type ConversationBinding,
+  type GatewayTurnLifecycleStore,
+  type JsonValue,
+  type ScheduledJob,
+} from "./gateway-store";
 import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
 import { RpcGatewayRuntime, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import type { RpcSessionState } from "./rpc-protocol";
@@ -23,7 +29,7 @@ import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
 import { TelegramTransportAdapter, type TelegramTransportAdapterOptions } from "./transports/telegram/adapter";
 import { WebSocketTransportAdapter, type WebSocketTransportOptions } from "./transports/websocket/adapter";
 
-export interface GatewayApplicationStore extends Partial<GatewayScheduledJobStore> {
+export interface GatewayApplicationStore extends Partial<GatewayScheduledJobStore>, Partial<GatewayTurnLifecycleStore> {
   close(): void;
   resolvePrincipal(identity: TransportIdentity): Principal | undefined;
   getCheckpoint(adapter: string, key: string): JsonValue | undefined;
@@ -171,6 +177,7 @@ export class GatewayApplication {
         sessionFile: this.#sessionFile,
         onSessionState: (session) => this.#recordSessionState(session),
         ...(scheduler === undefined ? {} : { automation: scheduler }),
+        ...(isTurnLifecycleStore(store) ? { turnStore: store } : {}),
       });
       this.#runtime = runtime;
 
@@ -390,4 +397,12 @@ function requireScheduledStore(store: GatewayApplicationStore): GatewayScheduled
     if (typeof store[method] !== "function") throw new Error(`OmpClaw store does not support automation method ${method}`);
   }
   return store as GatewayScheduledJobStore;
+}
+
+function isTurnLifecycleStore(store: GatewayApplicationStore): store is GatewayApplicationStore & GatewayTurnLifecycleStore {
+  return (
+    typeof store.putTurnLifecycle === "function" &&
+    typeof store.interruptActiveTurns === "function" &&
+    typeof store.listTurnLifecycles === "function"
+  );
 }

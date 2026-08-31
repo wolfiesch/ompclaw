@@ -16,6 +16,11 @@ import {
   type GatewayDelivery,
 } from "./gateway-tools";
 import { formatScheduledJob, ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
+import type {
+  GatewayTurnLifecycleStore,
+  TurnLifecycle,
+  TurnLifecycleState,
+} from "./gateway-store";
 import { OmpRpcClient, RpcCommandError, type RpcCommandInput } from "./rpc-client";
 import { type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-config";
 import {
@@ -47,6 +52,8 @@ export interface RpcGatewayRuntimeOptions {
   readonly sessionFile?: string;
   readonly onSessionState?: (state: RpcSessionState) => void;
   readonly automation?: GatewayAutomationControl;
+  readonly turnStore?: GatewayTurnLifecycleStore;
+  readonly now?: () => number;
 }
 
 interface RuntimeStatus {
@@ -63,12 +70,14 @@ interface HostToolExecution {
 
 interface GatewayTurnTarget extends RpcGatewayUiTarget {
   readonly identity: TransportIdentity;
+  readonly sourceReceipt?: OutboundReceipt;
 }
 
 interface ActiveTurn extends GatewayTurnTarget {
   receipt?: OutboundReceipt;
   previewText?: string;
   finalText?: string;
+  lifecycle?: TurnLifecycle;
   scheduledCompletion?: {
     readonly resolve: () => void;
     readonly reject: (error: Error) => void;
@@ -93,6 +102,7 @@ const RUNTIME_COMMANDS = [
   ["queue", "Inspect or tune queue behavior"],
   ["stats", "Show session statistics"],
   ["todos", "Show the current todo phases"],
+  ["tasks", "Show recent persisted task lifecycle"],
   ["subagents", "Show active and recent subagents"],
   ["jobs", "List durable scheduled jobs"],
   ["job_pause", "Pause a scheduled job by ID"],
@@ -192,6 +202,7 @@ export class RpcGatewayRuntime {
   #restartTimer: NodeJS.Timeout | undefined;
   #promptQueue: Promise<void> = Promise.resolve();
   #frameQueue: Promise<void> = Promise.resolve();
+  #turnCardQueue: Promise<void> = Promise.resolve();
 
   constructor(options: RpcGatewayRuntimeOptions, logger: RpcRuntimeLogger = console) {
     this.#options = options;
@@ -202,6 +213,7 @@ export class RpcGatewayRuntime {
   async start(): Promise<void> {
     if (this.#rpc) throw new Error("RPC gateway runtime is already started");
     this.#stopping = false;
+    this.#options.turnStore?.interruptActiveTurns(this.#now());
     try {
       await this.#startRpc();
       this.#log.info(`[ompclaw rpc] OMP ${this.#status.state?.sessionId ?? "session"} started`);
@@ -218,6 +230,7 @@ export class RpcGatewayRuntime {
     this.#ui?.shutdown();
     this.#ui = undefined;
     for (const execution of this.#hostTools.values()) execution.controller.abort();
+    await this.#setTurnLifecycle("interrupted", { error: "OMP runtime stopped" });
     this.#hostTools.clear();
     const active = this.#activeTurn;
     this.#activeTurn = undefined;
@@ -238,7 +251,7 @@ export class RpcGatewayRuntime {
     const parsed = parseSlashCommand(message.content.text);
     if (parsed && (await this.#handleCommand(delivery, parsed.name, parsed.args))) return;
 
-    this.#activate(delivery);
+    await this.#startTurn(delivery, message);
     const prompt = this.#promptQueue.then(() => this.#deliverPrompt(message, delivery));
     this.#promptQueue = prompt.catch(() => {});
     return prompt;
@@ -255,12 +268,9 @@ export class RpcGatewayRuntime {
     const completion = Promise.withResolvers<void>();
     void completion.promise.catch(() => undefined);
     const delivery = this.#deliveryFor(message);
-    this.#activate({
-      ...delivery,
-      scheduledCompletion: {
-        resolve: () => completion.resolve(),
-        reject: (error) => completion.reject(error),
-      },
+    await this.#startTurn(delivery, message, {
+      resolve: () => completion.resolve(),
+      reject: (error) => completion.reject(error),
     });
     const prompt = this.#promptQueue.then(() => this.#deliverPrompt(message, delivery));
     this.#promptQueue = prompt.catch(() => {});
@@ -329,6 +339,7 @@ export class RpcGatewayRuntime {
     this.#status.lastError = error.message;
     this.#ui?.shutdown();
     this.#ui = undefined;
+    await this.#setTurnLifecycle("interrupted", { error: error.message });
     const active = this.#activeTurn;
     this.#activeTurn = undefined;
     if (active) {
@@ -384,15 +395,19 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "agent_start") {
+      await this.#setTurnLifecycle("running");
       if (this.#status.state) this.#status.state.isStreaming = true;
+      await this.#beginAssistantPreview();
       return;
     }
     if (frame.type === "tool_execution_start") {
       this.#status.currentTool = typeof frame.toolName === "string" ? frame.toolName : "tool";
+      await this.#setTurnLifecycle("running", { currentTool: this.#status.currentTool });
       return;
     }
     if (frame.type === "tool_execution_end") {
       this.#status.currentTool = undefined;
+      await this.#setTurnLifecycle("running", { clearCurrentTool: true });
       return;
     }
     if (frame.type === "message_update" || frame.type === "turn_end") {
@@ -404,6 +419,7 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "prompt_result" && frame.agentInvoked === false) {
+      await this.#setTurnLifecycle("completed");
       const active = this.#activeTurn;
       this.#activeTurn = undefined;
       active?.scheduledCompletion?.resolve();
@@ -413,15 +429,19 @@ export class RpcGatewayRuntime {
     if (frame.type === "agent_end" && frame.isTerminal !== false) {
       if (this.#status.state) this.#status.state.isStreaming = false;
       const active = this.#activeTurn;
+      const terminalState = this.#terminalState(frame.messages);
       try {
         await this.#finalizeAssistantText(finalAssistantText(frame.messages));
+        await this.#setTurnLifecycle(terminalState);
         active?.scheduledCompletion?.resolve();
       } catch (error) {
+        await this.#setTurnLifecycle("failed", { error: error instanceof Error ? error.message : String(error) });
         active?.scheduledCompletion?.reject(error instanceof Error ? error : new Error(String(error)));
         throw error;
       } finally {
         this.#activeTurn = undefined;
         await this.#refreshState();
+        await this.#reactToSource(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
       }
       return;
     }
@@ -433,6 +453,7 @@ export class RpcGatewayRuntime {
   async #deliverPrompt(message: InboundMessage, delivery: RpcGatewayUiTarget): Promise<void> {
     const rpc = this.#rpc;
     if (!rpc?.running) {
+      await this.#setTurnLifecycle("interrupted", { error: "OMP RPC is restarting" });
       await this.#send(delivery, "OMP is restarting. Try again in a moment.");
       this.#clearActiveDelivery(delivery);
       return;
@@ -446,10 +467,12 @@ export class RpcGatewayRuntime {
     try {
       const response = await rpc.send(command);
       if (isRecord(response.data) && response.data.agentInvoked === false) {
+        await this.#setTurnLifecycle("completed");
         this.#clearActiveDelivery(delivery);
         await this.#refreshState();
       }
     } catch (error) {
+      await this.#setTurnLifecycle("failed", { error: error instanceof Error ? error.message : String(error) });
       this.#clearActiveDelivery(delivery);
       await this.#send(delivery, `Prompt failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => {});
       throw error;
@@ -545,6 +568,7 @@ export class RpcGatewayRuntime {
       else if (name === "autocompact") await this.#booleanCommand("set_auto_compaction", args, this.#status.state?.autoCompactionEnabled, reply);
       else if (name === "retry") await this.#retryCommand(args, reply);
       else if (name === "queue") await this.#queueCommand(args, reply);
+      else if (name === "tasks") await reply(this.#tasksText(delivery.address));
       else if (name === "stats") await reply(valueText(await this.#requestData({ type: "get_session_stats" })));
       else if (name === "todos") await reply(this.#todosText());
       else if (name === "subagents") await this.#subagentsCommand(reply);
@@ -802,6 +826,7 @@ export class RpcGatewayRuntime {
       address: message.address,
       deliveryContext: { principal: message.principal, origin: message.address },
       identity: message.identity,
+      ...(message.sourceReceipt === undefined ? {} : { sourceReceipt: message.sourceReceipt }),
     };
   }
 
@@ -818,7 +843,153 @@ export class RpcGatewayRuntime {
   }
 
   #sameAddress(left: ConversationAddress, right: ConversationAddress): boolean {
+
     return left.transport === right.transport && left.account === right.account && left.channel === right.channel && left.thread === right.thread;
+  }
+  #now(): number {
+    return this.#options.now?.() ?? Date.now();
+  }
+
+  async #startTurn(
+    delivery: GatewayTurnTarget,
+    message: InboundMessage,
+    scheduledCompletion?: ActiveTurn["scheduledCompletion"],
+  ): Promise<void> {
+    if (this.#activeTurn) return;
+    if (!this.#options.turnStore) {
+      this.#activeTurn = {
+        ...delivery,
+        ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
+      };
+      return;
+    }
+    const now = this.#now();
+    const prompt = (message.content.text ?? message.content.attachments?.[0]?.name ?? "Attachment")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 240) || "Message";
+    const lifecycle: TurnLifecycle = {
+      id: message.id,
+      principalId: message.principal.id,
+      address: message.address,
+      prompt,
+      state: "queued",
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.#options.turnStore.putTurnLifecycle(lifecycle);
+    this.#activeTurn = {
+      ...delivery,
+      lifecycle,
+      ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
+    };
+    this.#queueTurnCard(this.#activeTurn);
+  }
+
+  async #setTurnLifecycle(
+    state: TurnLifecycleState,
+    change: {
+      readonly currentTool?: string;
+      readonly clearCurrentTool?: boolean;
+      readonly error?: string;
+    } = {},
+  ): Promise<void> {
+    const active = this.#activeTurn;
+    const current = active?.lifecycle;
+    if (!active || !current) return;
+    const now = this.#now();
+    const terminal = state === "completed" || state === "stopped" || state === "failed" || state === "interrupted";
+    const updated: TurnLifecycle = {
+      ...current,
+      state,
+      updatedAt: now,
+      ...(change.currentTool === undefined ? {} : { currentTool: change.currentTool }),
+      ...(change.clearCurrentTool === true || terminal ? { currentTool: undefined } : {}),
+      ...(terminal ? { finishedAt: now } : {}),
+      ...(change.error === undefined ? {} : { error: change.error.slice(0, 1_000) }),
+    };
+    active.lifecycle = updated;
+    this.#options.turnStore?.putTurnLifecycle(updated);
+    this.#queueTurnCard(active);
+  }
+
+  #queueTurnCard(active: ActiveTurn): void {
+    const lifecycle = active.lifecycle;
+    if (!lifecycle) return;
+    this.#turnCardQueue = this.#turnCardQueue.then(() => this.#renderTurnCard(active, lifecycle));
+  }
+
+  async #renderTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle): Promise<void> {
+    const labels: Record<TurnLifecycleState, string> = {
+      queued: "Queued",
+      running: "Running",
+      completed: "Completed",
+      stopped: "Stopped",
+      failed: "Failed",
+      interrupted: "Interrupted",
+    };
+    const text = [
+      labels[lifecycle.state],
+      lifecycle.prompt,
+      lifecycle.currentTool ? `Tool: ${lifecycle.currentTool}` : "",
+      lifecycle.error ? `Error: ${lifecycle.error}` : "",
+    ].filter(Boolean).join("\n");
+    try {
+      await this.#options.delivery.presentUi(
+        active.address,
+        { type: "status", key: "Task", text },
+        active.deliveryContext,
+      );
+    } catch (error) {
+      this.#log.warn(`[ompclaw rpc] Unable to render task lifecycle: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  #tasksText(address: ConversationAddress): string {
+    const turns = this.#options.turnStore?.listTurnLifecycles(address, 10) ?? [];
+    if (turns.length === 0) return "No persisted tasks for this conversation.";
+    return turns.map((turn) => {
+      const tool = turn.currentTool ? ` | tool ${turn.currentTool}` : "";
+      const error = turn.error ? ` | ${turn.error}` : "";
+      return `${turn.state.toUpperCase()} | ${turn.prompt}${tool}${error}`;
+    }).join("\n");
+  }
+
+  async #beginAssistantPreview(): Promise<void> {
+    const active = this.#activeTurn;
+    if (!active || active.receipt !== undefined) return;
+    active.receipt = await this.#options.delivery.send(
+      active.address,
+      { text: "", format: "text", transient: true },
+      active.deliveryContext,
+    );
+    active.previewText = "";
+    await this.#reactToSource(active, "👀");
+  }
+
+  #terminalState(messages: unknown): "completed" | "stopped" | "failed" {
+    if (!Array.isArray(messages)) return "completed";
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (!isRecord(message) || message.role !== "assistant") continue;
+      if (message.stopReason === "aborted") return "stopped";
+      if (message.stopReason === "error") return "failed";
+    }
+    return "completed";
+  }
+
+  async #reactToSource(delivery: GatewayTurnTarget | undefined, emoji: string): Promise<void> {
+    if (!delivery?.sourceReceipt) return;
+    try {
+      await this.#options.delivery.react(
+        delivery.address,
+        delivery.sourceReceipt,
+        { emoji },
+        delivery.deliveryContext,
+      );
+    } catch (error) {
+      this.#log.warn(`[ompclaw rpc] Unable to update source reaction: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async #send(delivery: RpcGatewayUiTarget, text: string): Promise<void> {
@@ -833,7 +1004,7 @@ export class RpcGatewayRuntime {
   async #deliverAssistantPreview(text: string): Promise<void> {
     const active = this.#activeTurn;
     if (!active || text.trim().length === 0 || active.previewText === text) return;
-    const content = { text, format: "text" as const };
+    const content = { text, format: "text" as const, transient: true };
     if (active.receipt) {
       active.receipt = await this.#options.delivery.update(active.address, active.receipt, content, active.deliveryContext);
     } else {
