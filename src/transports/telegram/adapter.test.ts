@@ -144,15 +144,15 @@ describe("Telegram transport lifecycle", () => {
       stateDir,
       store: {
         getCheckpoint: () => undefined,
-        setCheckpoint: () => { },
-        putPendingInteraction: () => { },
-        deletePendingInteraction: () => { },
+        setCheckpoint: () => {},
+        putPendingInteraction: () => {},
+        deletePendingInteraction: () => {},
         listPendingInboundMessages: () => [],
         listPendingIngressCompositions: () => [],
       },
       api: { acquireLock: () => ({ ok: false, holder: 912 }) },
     });
-    await expect(adapter.start({ receive: async () => { }, resolveIdentity: () => owner })).rejects.toThrow(
+    await expect(adapter.start({ receive: async () => {}, resolveIdentity: () => owner })).rejects.toThrow(
       "process 912",
     );
   });
@@ -349,7 +349,7 @@ describe("Telegram inbound conversion", () => {
   });
 
   test("adds voice transcription beside the saved attachment", async () => {
-    const { adapter, received } = await fixture({ transcribe: true });
+    const { adapter, calls, received } = await fixture({ transcribe: true });
     await adapter.handleUpdate({
       update_id: 9,
       message: message({
@@ -359,8 +359,33 @@ describe("Telegram inbound conversion", () => {
     });
     expect(received[0]?.content.text).toBe("[Voice transcript: voice transcript]");
     expect(received[0]?.content.attachments?.length).toBe(1);
+    expect(calls.find((call) => call.method === "setMessageReaction")?.payload).toEqual({
+      chat_id: 42,
+      message_id: 10,
+      reaction: [{ type: "emoji", emoji: "👀" }],
+    });
   });
 
+  test("acknowledges a video note with a message when reactions are unavailable", async () => {
+    const { adapter, calls, received } = await fixture({
+      transcribe: true,
+      reactionError: new Error("reactions disabled"),
+    });
+    await adapter.handleUpdate({
+      update_id: 12,
+      message: message({
+        text: undefined,
+        video_note: { file_id: "video-note", file_unique_id: "video-stable", file_size: 3 },
+      }),
+    });
+
+    expect(calls.find((call) => call.method === "sendMessage")?.payload).toMatchObject({
+      chat_id: 42,
+      text: "Received. Transcribing your voice note now.",
+    });
+    expect(received[0]?.content.text).toBe("[Voice transcript: voice transcript]");
+    expect(received[0]?.content.attachments?.[0]?.mediaType).toBe("video/mp4");
+  });
   test("reuses one forum topic when an authorized root message is retried", async () => {
     const { adapter, calls, received } = await fixture({ createTopicsFromRoot: true, failFirstReceive: true });
     const update = {

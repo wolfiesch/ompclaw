@@ -273,11 +273,11 @@ OmpClaw presents routine Telegram turns as a conversation rather than a command 
 
 - A received request gets an immediate `👀` reaction when Telegram provides a source message receipt.
 - Native Telegram drafts stream the assistant response when available. Typing status is the fallback.
-- The completed response is rendered as Telegram Markdown and replies to the message that started the turn.
+- The completed response uses parsed Telegram MarkdownV2 with block-aware splitting for headings, lists, quotes, tables, links, code, and fenced code blocks. Plain-text fallback remains available when Telegram rejects formatting.
+- Consecutive photos are sent as one Telegram album when the Bot API supports media groups. The first item carries the caption and source-message reply.
 - The source reaction changes to `👍` after success, `👌` after a user stop, or `👎` after failure.
-- The task card shows queued and active work, then clears after successful completion. `/tasks` retains the durable history.
-- Voice notes are transcribed as ordinary user speech when `transcribeCommand` is configured. Replies remain text.
-
+- The task card exposes every active task and recent activity without tool arguments or raw tool output. Terminal turns become durable result cards, and `/tasks` retains history across restart.
+- Voice notes and video notes are transcribed as ordinary user speech when `transcribeCommand` is configured. The bot acknowledges receipt with a reaction, or a short message when reactions are unavailable. Replies remain text.
 These behaviors need no additional configuration. OMP still controls the response content, reasoning mode, tools, approvals, memory, and session history.
 
 Pairing is an explicit local authorization operation. With the gateway stopped,
@@ -296,9 +296,11 @@ non-Telegram identities.
 
 Existing forum topics get separate sessions when `topicSessions.enabled` is true. Non-topic Telegram chats and WebSocket credentials continue to share the gateway's root OMP session. Set `createFromRoot` to true to turn an authorized root message into a newly named topic and route that same turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Telegram requires the bot to be a supergroup administrator with permission to manage topics. Topic creation is idempotent across update retries.
 
-The native Telegram command menu exposes the everyday controls: `/start`, `/home`, `/status`, `/stop`, `/new`, `/tasks`, and `/help`. `/start` explains the assistant without invoking the model. `/home` opens model, reasoning, and fast-mode controls. `/help` groups the rest of the OMP RPC command surface for advanced use.
+The native Telegram command menu exposes the everyday controls: `/start`, `/home`, `/status`, `/stop`, `/new`, `/tasks`, `/jobs`, and `/help`. `/start` explains the assistant without invoking the model. `/home` is a single-message control center: its inline actions edit that same Telegram message while navigating status, model, reasoning, fast mode, auto-compaction, autonomy guidance, tasks, and scheduled jobs. Scheduled-job cards expose pause, resume, run-now, and delete actions. `/help` groups the complete supported OMP RPC command surface into Everyday, Session, Work, and Advanced sections.
 
-Voice notes always arrive as private inbox attachments. To also make them conversational, set `transcribeCommand`. Commands without `{outputDir}` must print the transcript to stdout. The example supports the OpenAI Whisper CLI, which writes a text file into the isolated temporary output directory. Transcription is local to the gateway host; OmpClaw deletes the temporary transcript directory after reading it.
+Every rendered inline control carries a view version. OmpClaw rejects expired, moved, disabled, or cross-principal callbacks, refreshes stale cards from current durable state, and serializes edits per control surface.
+
+Voice notes and video notes always arrive as private inbox attachments. To also make them conversational, set `transcribeCommand`. Commands without `{outputDir}` must print the transcript to stdout. The example supports the OpenAI Whisper CLI, which writes a text file into the isolated temporary output directory. Transcription is local to the gateway host; OmpClaw deletes the temporary transcript directory after reading it.
 
 ### WebSocket transport
 

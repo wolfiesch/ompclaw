@@ -10,6 +10,12 @@ All notable changes to this project will be documented in this file.
 - Add a reusable credential-free Telegram scenario harness, a guarded live Bot API canary for dedicated test bots, and an ephemeral SSH dispatcher for running the complete check on a macOS worker without transferring credentials or state.
 - Add guided first-use Telegram setup with private credential files, stale-update-safe discovery, expiring local pairing codes, explicit identity confirmation, and optional service installation after `doctor` succeeds.
 
+### Changed
+
+- Replace regex-based Telegram formatting with parsed MarkdownV2 rendering, block-aware message splitting, stable fenced-code chunks, plain-text fallback, and grouped photo albums.
+- Turn Telegram Home into a durable single-message control center with compact keyboards, state-backed task and result views, scheduled-job actions, stale-control refresh, and principal ownership checks.
+- Acknowledge both voice and video-note transcription with a reaction or a message fallback, and expose the supported RPC command surface through one grouped registry.
+
 ## 0.9.2 (2026-09-01)
 
 ### Changed

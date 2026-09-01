@@ -10,7 +10,7 @@ import type {
   TransportIdentity,
 } from "./gateway-types";
 import { executeGatewayHostTool, gatewayHostToolDefinitions, type GatewayDelivery } from "./gateway-tools";
-import { formatScheduledJob, ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
+import { ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
 import type { GatewayUpdateControl } from "./gateway-update";
 import type {
   GatewaySemanticViewStore,
@@ -48,7 +48,14 @@ import {
   isRpcResponse,
 } from "./rpc-protocol";
 import { RpcGatewayUiBroker, type RpcGatewayUiTarget } from "./rpc-ui";
-import { homeSemanticView, taskSemanticView } from "./rpc-semantic-views";
+import {
+  homeSemanticView,
+  informationSemanticView,
+  scheduledJobsSemanticView,
+  sessionChoiceSemanticView,
+  taskSemanticView,
+  type TaskSemanticTodoPhase,
+} from "./rpc-semantic-views";
 import { isRecord } from "./type-guards";
 
 export interface RpcRuntimeLogger {
@@ -113,42 +120,48 @@ interface ParsedCommand {
   readonly args: string;
 }
 
+type RuntimeCommandGroup = "Everyday" | "Session" | "Work" | "Advanced";
+
+interface RuntimeCommandDefinition extends RuntimeCommandMenuItem {
+  readonly group?: RuntimeCommandGroup;
+  readonly native?: boolean;
+}
+
 const RUNTIME_COMMANDS = [
-  ["start", "What this assistant can do"],
-  ["home", "Open the control center"],
-  ["status", "Show session and runtime details"],
-  ["stop", "Stop the current response"],
-  ["new", "Start a fresh conversation"],
-  ["steer", "Correct the current response"],
-  ["followup", "Add work after the current response"],
-  ["compact", "Compact context with optional focus"],
-  ["model", "List or select provider/model"],
-  ["autonomy", "Show configured autonomy policy"],
-  ["thinking", "Show or set reasoning level"],
-  ["fast", "Show or toggle fast mode"],
-  ["queue", "Inspect or tune queue behavior"],
-  ["stats", "Show session statistics"],
-  ["todos", "Show the current todo phases"],
-  ["tasks", "Show recent persisted task lifecycle"],
-  ["subagents", "Show active and recent subagents"],
-  ["jobs", "List durable scheduled jobs"],
-  ["job_pause", "Pause a scheduled job by ID"],
-  ["job_resume", "Resume a scheduled job by ID"],
-  ["job_run", "Run a scheduled job now by ID"],
-  ["job_delete", "Delete a scheduled job by ID"],
-  ["commands", "List OMP slash commands"],
-  ["history", "Show recent conversation messages"],
-  ["branch", "List branch points or branch by entry ID"],
-  ["name", "Set the session name"],
-  ["handoff", "Hand context to a fresh session"],
-  ["switch", "Switch to an exact session path"],
-  ["export", "Export and send the session HTML"],
-  ["retry", "Show, toggle, or stop automatic retry"],
-  ["autocompact", "Toggle automatic compaction"],
-  ["login", "Show or start provider login"],
-  ["help", "Show all gateway commands"],
-] as const;
-const NATIVE_COMMANDS = new Set(["start", "home", "status", "stop", "new", "tasks", "help"]);
+  { command: "start", description: "What this assistant can do", group: "Everyday", native: true },
+  { command: "home", description: "Open the control center", group: "Everyday", native: true },
+  { command: "status", description: "Show session and runtime details", group: "Everyday", native: true },
+  { command: "stop", description: "Stop the current response", group: "Everyday", native: true },
+  { command: "new", description: "Start a fresh conversation", group: "Everyday", native: true },
+  { command: "steer", description: "Correct the current response", group: "Everyday" },
+  { command: "followup", description: "Add work after the current response", group: "Everyday" },
+  { command: "compact", description: "Compact context with optional focus", group: "Session" },
+  { command: "model", description: "List or select provider/model", group: "Session" },
+  { command: "autonomy", description: "Show configured autonomy policy", group: "Session" },
+  { command: "thinking", description: "Show or set reasoning level", group: "Session" },
+  { command: "fast", description: "Show or toggle fast mode", group: "Session" },
+  { command: "queue", description: "Inspect or tune queue behavior", group: "Session" },
+  { command: "stats", description: "Show session statistics", group: "Session" },
+  { command: "todos", description: "Show the current todo phases", group: "Work" },
+  { command: "tasks", description: "Show recent persisted task lifecycle", group: "Work", native: true },
+  { command: "subagents", description: "Show active and recent subagents", group: "Work" },
+  { command: "jobs", description: "List durable scheduled jobs", group: "Work" },
+  { command: "job_pause", description: "Pause a scheduled job by ID", group: "Work" },
+  { command: "job_resume", description: "Resume a scheduled job by ID", group: "Work" },
+  { command: "job_run", description: "Run a scheduled job now by ID", group: "Work" },
+  { command: "job_delete", description: "Delete a scheduled job by ID", group: "Work" },
+  { command: "commands", description: "List OMP slash commands", group: "Advanced" },
+  { command: "history", description: "Show recent conversation messages", group: "Session" },
+  { command: "branch", description: "List branch points or branch by entry ID", group: "Advanced" },
+  { command: "name", description: "Set the session name", group: "Session" },
+  { command: "handoff", description: "Hand context to a fresh session", group: "Advanced" },
+  { command: "switch", description: "Switch to an exact session path", group: "Advanced" },
+  { command: "export", description: "Export and send the session HTML", group: "Advanced" },
+  { command: "retry", description: "Show, toggle, or stop automatic retry", group: "Session" },
+  { command: "autocompact", description: "Toggle automatic compaction", group: "Session" },
+  { command: "login", description: "Show or start provider login", group: "Advanced" },
+  { command: "help", description: "Show all gateway commands", native: true },
+] as readonly RuntimeCommandDefinition[];
 
 export interface RuntimeCommandMenuItem {
   readonly command: string;
@@ -157,8 +170,8 @@ export interface RuntimeCommandMenuItem {
 
 /** Commands worth publishing through a transport's compact native command menu. */
 export function runtimeCommandMenu(allowRpcBash = false): RuntimeCommandMenuItem[] {
-  const commands: RuntimeCommandMenuItem[] = RUNTIME_COMMANDS.filter(([command]) => NATIVE_COMMANDS.has(command)).map(
-    ([command, description]) => ({ command, description }),
+  const commands: RuntimeCommandMenuItem[] = RUNTIME_COMMANDS.filter(({ native }) => native === true).map(
+    ({ command, description }) => ({ command, description }),
   );
   if (allowRpcBash) {
     commands.push(
@@ -244,23 +257,17 @@ function parseSlashCommand(text: string | undefined): ParsedCommand | undefined 
   return { name: match[1].toLowerCase(), args: match[2]?.trim() ?? "" };
 }
 
-function commandDescription(command: string): string {
-  return RUNTIME_COMMANDS.find(([name]) => name === command)?.[1] ?? command;
-}
-
 function runtimeHelp(allowRpcBash: boolean): string {
-  const groups: ReadonlyArray<readonly [string, readonly string[]]> = [
-    ["Everyday", ["start", "home", "status", "stop", "new", "steer", "followup"]],
-    [
-      "Session",
-      ["model", "autonomy", "thinking", "fast", "compact", "autocompact", "retry", "queue", "name", "history"],
-    ],
-    ["Work", ["todos", "tasks", "subagents", "jobs", "job_pause", "job_resume", "job_run", "job_delete"]],
-    ["Advanced", ["branch", "handoff", "switch", "export", "login", "commands"]],
-  ];
+  const groups: readonly RuntimeCommandGroup[] = ["Everyday", "Session", "Work", "Advanced"];
   const lines = ["Send a message, voice note, photo, or file whenever you like."];
-  for (const [title, commands] of groups) {
-    lines.push("", title, ...commands.map((command) => `/${command} - ${commandDescription(command)}`));
+  for (const group of groups) {
+    lines.push(
+      "",
+      group,
+      ...RUNTIME_COMMANDS.filter((entry) => entry.group === group).map(
+        ({ command, description }) => `/${command} - ${description}`,
+      ),
+    );
   }
   if (allowRpcBash) {
     lines.push(
@@ -317,6 +324,30 @@ function activityForFrame(frame: RpcRecord): string {
   const described = conciseActivity(args?.i);
   if (described !== undefined) return described;
   return activityForTool(typeof frame.toolName === "string" ? frame.toolName : "tool");
+}
+
+function taskTodoPhases(value: unknown): readonly TaskSemanticTodoPhase[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate, phaseIndex) => {
+    if (!isRecord(candidate) || !Array.isArray(candidate.tasks)) return [];
+    const name =
+      typeof candidate.name === "string" && candidate.name.trim().length > 0
+        ? candidate.name.trim()
+        : `Phase ${phaseIndex + 1}`;
+    const tasks = candidate.tasks.flatMap((task) => {
+      if (!isRecord(task) || typeof task.content !== "string" || task.content.trim().length === 0) return [];
+      return [
+        {
+          content: task.content
+            .replace(/[\u0000-\u001f\u007f]+/g, " ")
+            .replace(/\s+/g, " ")
+            .trim(),
+          status: typeof task.status === "string" ? task.status : "pending",
+        },
+      ];
+    });
+    return tasks.length === 0 ? [] : [{ name, tasks }];
+  });
 }
 
 function lifecycleLabel(state: TurnLifecycleState): string {
@@ -745,6 +776,15 @@ export class RpcGatewayRuntime {
     }
     if (frame.type === "tool_execution_end") {
       this.#status.currentTool = undefined;
+      if (frame.toolName === "todo") {
+        try {
+          await this.#refreshStateRequired();
+        } catch (error) {
+          this.#log.warn(
+            `[ompclaw rpc] Unable to refresh todo state: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
       await this.#setTurnLifecycle("running", { clearCurrentTool: true });
       return;
     }
@@ -953,8 +993,13 @@ export class RpcGatewayRuntime {
       if (name === "start") await reply(assistantWelcome());
       else if (name === "help") await reply(runtimeHelp(this.#options.config.allowRpcBash));
       else if (name === "home") await this.#homeCommand(delivery);
-      else if (name === "status") await reply(await this.statusText());
-      else if (name === "stop") {
+      else if (name === "status") {
+        const now = this.#now();
+        await this.#presentSemanticView(
+          delivery,
+          informationSemanticView("Session status", await this.statusText(), now, now),
+        );
+      } else if (name === "stop") {
         await this.#sendRpc({ type: "abort" });
         await reply("Stop requested.");
       } else if (name === "new") {
@@ -971,8 +1016,13 @@ export class RpcGatewayRuntime {
         await this.#refreshState();
         await reply("Compaction complete.");
       } else if (name === "model") await this.#modelCommand(delivery, args, reply);
-      else if (name === "autonomy") await reply(autonomyText(this.#options.config.autonomyMode));
-      else if (name === "thinking") await this.#thinkingCommand(delivery, args, reply);
+      else if (name === "autonomy") {
+        const now = this.#now();
+        await this.#presentSemanticView(
+          delivery,
+          informationSemanticView("Autonomy", autonomyText(this.#options.config.autonomyMode), now, now),
+        );
+      } else if (name === "thinking") await this.#thinkingCommand(delivery, args, reply);
       else if (name === "fast")
         await this.#booleanCommand(delivery, "set_fast_mode", args, this.#status.state?.fastModeEnabled, reply);
       else if (name === "autocompact")
@@ -990,32 +1040,21 @@ export class RpcGatewayRuntime {
       else if (name === "todos") await reply(this.#todosText());
       else if (name === "subagents") await this.#subagentsCommand(reply);
       else if (name === "commands") await this.#commandsCommand(reply);
-      else if (name === "jobs") {
-        const automation = this.#options.automation;
-        if (automation === undefined) await reply("OmpClaw automation is disabled.");
-        else {
-          const jobs = automation.list(delivery.deliveryContext.principal.id);
-          await reply(jobs.length === 0 ? "No scheduled jobs." : jobs.map(formatScheduledJob).join("\n"));
-        }
-      } else if (name === "job_pause" || name === "job_resume" || name === "job_run" || name === "job_delete") {
+      else if (name === "jobs") await this.#jobsCommand(delivery, reply);
+      else if (name === "job_pause" || name === "job_resume" || name === "job_run" || name === "job_delete") {
         const automation = this.#options.automation;
         if (automation === undefined) await reply("OmpClaw automation is disabled.");
         else if (!args) await reply(`Usage: /${name} <job id>`);
         else {
           const principalId = delivery.deliveryContext.principal.id;
           if (name === "job_delete") {
-            await reply(
-              automation.remove(args, principalId)
-                ? `Deleted scheduled job ${args}.`
-                : `Scheduled job ${args} was not found.`,
-            );
-          } else {
-            const job =
-              name === "job_run"
-                ? automation.runNow(args, principalId)
-                : automation.setEnabled(args, principalId, name === "job_resume");
-            await reply(formatScheduledJob(job));
-          }
+            if (!automation.remove(args, principalId)) {
+              await reply(`Scheduled job ${args} was not found.`);
+              return true;
+            }
+          } else if (name === "job_run") automation.runNow(args, principalId);
+          else automation.setEnabled(args, principalId, name === "job_resume");
+          await this.#jobsCommand(delivery, reply);
         }
       } else if (name === "history") await this.#historyCommand(args, reply);
       else if (name === "branch") await this.#branchCommand(args, reply);
@@ -1082,12 +1121,25 @@ export class RpcGatewayRuntime {
     );
   }
 
+  async #jobsCommand(delivery: GatewayTurnTarget, reply: (text: string) => Promise<void>): Promise<void> {
+    const automation = this.#options.automation;
+    if (automation === undefined) {
+      await reply("OmpClaw automation is disabled.");
+      return;
+    }
+    const now = this.#now();
+    await this.#presentSemanticView(
+      delivery,
+      scheduledJobsSemanticView(automation.list(delivery.deliveryContext.principal.id), now, now),
+    );
+  }
+
   async #modelCommand(
     delivery: GatewayTurnTarget,
     args: string,
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
-    let selection = args;
+    const selection = args;
     if (!selection) {
       const data = await this.#requestData<{ models: Array<{ provider?: string; id?: string }> }>({
         type: "get_available_models",
@@ -1096,21 +1148,28 @@ export class RpcGatewayRuntime {
         (model): model is { provider: string; id: string } =>
           typeof model.provider === "string" && typeof model.id === "string",
       );
-      const response = await this.#options.delivery.presentUi(
-        delivery.address,
-        {
-          type: "select",
-          title: `Select model · current ${this.#status.state?.model?.provider ?? "?"}/${this.#status.state?.model?.id ?? "?"}`,
-          options: models.map((model) => ({
-            value: `${model.provider}/${model.id}`,
-            label: model.id,
-            description: model.provider,
-          })),
-        },
-        delivery.deliveryContext,
+      const current = `${this.#status.state?.model?.provider ?? "?"}/${this.#status.state?.model?.id ?? "?"}`;
+      const now = this.#now();
+      await this.#presentSemanticView(
+        delivery,
+        sessionChoiceSemanticView({
+          title: "Choose a model",
+          summary: "The selection applies to this OMP session.",
+          choices: models.map((model, index) => {
+            const value = `${model.provider}/${model.id}`;
+            return {
+              id: `model${index}`,
+              label: model.id,
+              description: model.provider,
+              command: `/model ${value}`,
+              selected: value === current,
+            };
+          }),
+          version: now,
+          updatedAt: now,
+        }),
       );
-      selection = response.selected[0] ?? "";
-      if (!selection) return;
+      return;
     }
     const split = selection.indexOf("/");
     if (split <= 0 || split === selection.length - 1) {
@@ -1123,7 +1182,7 @@ export class RpcGatewayRuntime {
       modelId: selection.slice(split + 1),
     });
     await this.#refreshState();
-    await reply(`Model: ${selection}`);
+    await this.#homeCommand(delivery);
   }
 
   async #thinkingCommand(
@@ -1131,19 +1190,26 @@ export class RpcGatewayRuntime {
     args: string,
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
-    let selection = args;
+    const selection = args;
     if (!selection) {
-      const response = await this.#options.delivery.presentUi(
-        delivery.address,
-        {
-          type: "select",
-          title: `Select reasoning · current ${this.#status.state?.thinkingLevel ?? "inherit"}`,
-          options: Object.keys(THINKING_LEVELS).map((level) => ({ value: level, label: level })),
-        },
-        delivery.deliveryContext,
+      const current = this.#status.state?.thinkingLevel ?? "inherit";
+      const now = this.#now();
+      await this.#presentSemanticView(
+        delivery,
+        sessionChoiceSemanticView({
+          title: "Choose reasoning depth",
+          summary: "Higher levels spend more time on difficult decisions and code.",
+          choices: Object.keys(THINKING_LEVELS).map((level) => ({
+            id: level,
+            label: level === "xhigh" ? "Extra high" : `${level[0]?.toUpperCase()}${level.slice(1)}`,
+            command: `/thinking ${level}`,
+            selected: level === current,
+          })),
+          version: now,
+          updatedAt: now,
+        }),
       );
-      selection = response.selected[0] ?? "";
-      if (!selection) return;
+      return;
     }
     if (!THINKING_LEVELS[selection]) {
       await reply(`Unknown level. Use: ${Object.keys(THINKING_LEVELS).join(", ")}`);
@@ -1151,7 +1217,7 @@ export class RpcGatewayRuntime {
     }
     await this.#sendRpc({ type: "set_thinking_level", level: selection });
     await this.#refreshState();
-    await reply(`Thinking: ${selection}`);
+    await this.#homeCommand(delivery);
   }
 
   async #booleanCommand(
@@ -1161,31 +1227,36 @@ export class RpcGatewayRuntime {
     current: boolean | undefined,
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
-    let selection = args;
+    const selection = args;
     const label = command === "set_fast_mode" ? "Fast mode" : "Auto-compaction";
     if (!selection) {
-      const response = await this.#options.delivery.presentUi(
-        delivery.address,
-        {
-          type: "select",
-          title: `${label} · current ${current ? "on" : "off"}`,
-          options: [
-            { value: "on", label: "On" },
-            { value: "off", label: "Off" },
+      const commandName = command === "set_fast_mode" ? "fast" : "autocompact";
+      const now = this.#now();
+      await this.#presentSemanticView(
+        delivery,
+        sessionChoiceSemanticView({
+          title: label,
+          summary:
+            command === "set_fast_mode"
+              ? "Fast mode favors lower-latency responses."
+              : "Auto-compaction keeps long sessions within their context window.",
+          choices: [
+            { id: "on", label: "On", command: `/${commandName} on`, selected: current === true },
+            { id: "off", label: "Off", command: `/${commandName} off`, selected: current !== true },
           ],
-        },
-        delivery.deliveryContext,
+          version: now,
+          updatedAt: now,
+        }),
       );
-      selection = response.selected[0] ?? "";
-      if (!selection) return;
+      return;
     }
     if (selection !== "on" && selection !== "off") {
       await reply(`Usage: /${command === "set_fast_mode" ? "fast" : "autocompact"} <on|off>`);
       return;
     }
-    const response = await this.#sendRpc({ type: command, enabled: selection === "on" });
+    await this.#sendRpc({ type: command, enabled: selection === "on" });
     await this.#refreshState();
-    await reply(response.data ? valueText(response.data) : `${label}: ${selection}.`);
+    await this.#homeCommand(delivery);
   }
 
   async #retryCommand(args: string, reply: (text: string) => Promise<void>): Promise<void> {
@@ -1312,7 +1383,7 @@ export class RpcGatewayRuntime {
     const activatesDelivery = !this.#activeTurn;
     if (activatesDelivery) this.#activate(delivery);
     try {
-      await reply(`Starting ${args} login. Follow the secure URL prompt.`);
+      await reply(`Starting ${args} login.Follow the secure URL prompt.`);
       await this.#requestData({ type: "login", providerId: args }, 10 * 60_000);
       await reply(`${args} login complete.`);
     } finally {
@@ -1350,7 +1421,7 @@ export class RpcGatewayRuntime {
       this.#options.onSessionState?.(state);
     } catch (error) {
       this.#log.warn(
-        `[ompclaw rpc] Session state callback failed: ${error instanceof Error ? error.message : String(error)}`,
+        `[ompclaw rpc] Session state callback failed: ${error instanceof Error ? error.message : String(error)} `,
       );
     }
   }
@@ -1531,12 +1602,20 @@ export class RpcGatewayRuntime {
 
   async #renderTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle): Promise<void> {
     try {
-      await this.#presentSemanticView(active, taskSemanticView(lifecycle, active.activities, lifecycle.updatedAt));
+      await this.#presentSemanticView(
+        active,
+        taskSemanticView(
+          lifecycle,
+          active.activities,
+          lifecycle.updatedAt,
+          taskTodoPhases(this.#status.state?.todoPhases),
+        ),
+      );
       active.statusVisible = true;
       active.statusUpdatedAt = this.#now();
     } catch (error) {
       this.#log.warn(
-        `[ompclaw rpc] Unable to render task lifecycle: ${error instanceof Error ? error.message : String(error)}`,
+        `[ompclaw rpc] Unable to render task lifecycle: ${error instanceof Error ? error.message : String(error)} `,
       );
     }
   }
@@ -1565,9 +1644,9 @@ export class RpcGatewayRuntime {
     if (turns.length === 0) return "No persisted tasks for this conversation.";
     return turns
       .map((turn) => {
-        const activity = turn.currentTool ? ` | ${turn.currentTool}` : "";
+        const activity = turn.currentTool ? ` | ${turn.currentTool} ` : "";
         const error = turn.error ? " | Use /status for details." : "";
-        return `${lifecycleLabel(turn.state)} | ${turn.prompt}${activity}${error}`;
+        return `${lifecycleLabel(turn.state)} | ${turn.prompt}${activity}${error} `;
       })
       .join("\n");
   }
@@ -1610,7 +1689,7 @@ export class RpcGatewayRuntime {
       await this.#options.delivery.react(delivery.address, delivery.sourceReceipt, { emoji }, delivery.deliveryContext);
     } catch (error) {
       this.#log.warn(
-        `[ompclaw rpc] Unable to update source reaction: ${error instanceof Error ? error.message : String(error)}`,
+        `[ompclaw rpc] Unable to update source reaction: ${error instanceof Error ? error.message : String(error)} `,
       );
     }
   }
@@ -1661,7 +1740,7 @@ export class RpcGatewayRuntime {
       if (this.#activeTurn !== active) return;
       void this.#options.delivery.typing?.(active.address, active.deliveryContext).catch((error: unknown) => {
         this.#log.warn(
-          `[ompclaw rpc] Unable to refresh typing status: ${error instanceof Error ? error.message : String(error)}`,
+          `[ompclaw rpc] Unable to refresh typing status: ${error instanceof Error ? error.message : String(error)} `,
         );
       });
     };

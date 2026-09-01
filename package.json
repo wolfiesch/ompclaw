@@ -80,6 +80,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:harness": "bun test src/gateway-telegram.test.ts src/transports/telegram/adapter.test.ts src/dev/telegram-canary.test.ts",
+    "test:telegram:ui": "bun ./src/dev/telegram-ui-scenario.ts",
     "test:telegram:live": "bun ./src/dev/telegram-canary.ts",
     "test:remote": "bun ./src/dev/remote-check.ts",
     "lint": "biome lint . --no-errors-on-unmatched",
@@ -100,6 +101,7 @@
     "@opentelemetry/core": "2.8.0"
   },
   "dependencies": {
-    "croner": "10.0.1"
+    "croner": "10.0.1",
+    "marked": "18.0.11"
   }
 }

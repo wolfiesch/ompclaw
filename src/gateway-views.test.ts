@@ -6,6 +6,7 @@ import {
   type SemanticView,
   type StoredSemanticView,
 } from "./gateway-views";
+import { scheduledJobsSemanticView, sessionChoiceSemanticView } from "./rpc-semantic-views";
 
 function semanticView(overrides: Partial<SemanticView> = {}): SemanticView {
   return {
@@ -94,5 +95,70 @@ describe("semantic views", () => {
     expect(() => normalizeStoredSemanticView(storedSemanticView({ createdAt: 101, updatedAt: 100 }))).toThrow(
       "updatedAt must not precede createdAt",
     );
+  });
+});
+
+describe("runtime semantic projections", () => {
+  test("builds a single-message setting page with current selection and navigation", () => {
+    const view = sessionChoiceSemanticView({
+      title: "Choose reasoning depth",
+      summary: "Applies to this session.",
+      choices: [
+        { id: "low", label: "Low", command: "/thinking low" },
+        { id: "high", label: "High", command: "/thinking high", selected: true },
+      ],
+      version: 7,
+      updatedAt: 100,
+    });
+
+    validateSemanticView(view);
+    expect(view).toMatchObject({
+      id: "home",
+      kind: "decision",
+      state: "waiting",
+      sections: [{ id: "current", text: "High" }],
+    });
+    expect(view.actions).toEqual([
+      { id: "choose0", label: "Low", command: "/thinking low", style: "default" },
+      { id: "choose1", label: "✓ High", command: "/thinking high", style: "primary" },
+      { id: "back", label: "Back to Home", command: "/home" },
+    ]);
+  });
+
+  test("projects scheduled jobs into actionable cards", () => {
+    const view = scheduledJobsSemanticView(
+      [
+        {
+          id: "job-1",
+          principalId: "operator-42",
+          identity: { transport: "telegram", account: "default", subject: "42" },
+          address: { transport: "telegram", account: "default", channel: "42" },
+          name: "Morning brief",
+          prompt: "Summarize updates",
+          schedule: { kind: "cron", expression: "0 9 * * *", timezone: "America/Los_Angeles" },
+          enabled: true,
+          nextRunAt: 200,
+          attemptCount: 0,
+          successCount: 2,
+          failureCount: 0,
+          createdAt: 10,
+          updatedAt: 100,
+        },
+      ],
+      7,
+      100,
+    );
+
+    validateSemanticView(view);
+    expect(view.sections[0]).toMatchObject({
+      label: "Morning brief",
+      text: expect.stringContaining("Cron · 0 9 * * * · America/Los_Angeles"),
+    });
+    expect(view.actions.map(({ command }) => command)).toEqual([
+      "/job_pause job-1",
+      "/job_run job-1",
+      "/job_delete job-1",
+      "/home",
+    ]);
   });
 });

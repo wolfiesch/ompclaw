@@ -197,7 +197,8 @@ Transactional self-update is available as an opt-in service mode. It stages one 
 
 - One authenticated OMP RPC process with serialized session switching, streamed assistant commentary, and a final response routed only to the active authenticated conversation.
 - OMP commands for steering, follow-up, abort, models, thinking, session controls, queue policy, compaction, retries, subagents, history, branching, exports, and login. While a turn is active, an ordinary message in that same conversation naturally corrects it by default.
-- Telegram long polling with durable update checkpoints and an SQLite-backed inbound work queue, receipt reactions, a renewed typing indicator, one coalesced plain-language activity card, voice transcription, message editing, buttons, file intake, topics, and interactive OMP UI.
+- Telegram long polling with durable update checkpoints and an SQLite-backed inbound work queue, receipt reactions, renewed typing, durable task and result cards, voice and video-note transcription acknowledgement, parsed MarkdownV2 output, media albums, compact inline controls, file intake, topics, and interactive OMP UI.
+- A single-message Telegram Home control center for session status, model and reasoning selection, fast mode, auto-compaction, autonomy guidance, task history, and scheduled-job actions. Advanced commands remain available through grouped `/help` output.
 - Optional per-topic OMP sessions with persistent conversation bindings and authorized root-message topic creation.
 - An authenticated versioned WebSocket protocol with client identity and conversation address derived from configured credential metadata, not client-supplied fields.
 - SQLite-backed principals, transport identities, conversation bindings, OMP session checkpointing, inbound deduplication, UI state, durable scheduled jobs, and legacy Telegram migration markers.

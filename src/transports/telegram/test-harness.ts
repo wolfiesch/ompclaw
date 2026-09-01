@@ -54,6 +54,7 @@ export class TelegramTestPoller implements TelegramPoller {
 
 export interface FakeTelegramApiOptions {
   readonly setCommandsError?: Error;
+  readonly reactionError?: Error;
   readonly transcribe?: boolean;
 }
 
@@ -74,6 +75,7 @@ export class FakeTelegramApi {
       callTelegram: async (method, payload = {}) => {
         this.calls.push({ method, payload });
         if (method === "setMyCommands" && options.setCommandsError) throw options.setCommandsError;
+        if (method === "setMessageReaction" && options.reactionError) throw options.reactionError;
         if (method === "sendMessageDraft") return true;
         if (method === "getFile") return { file_path: "uploads/file.bin" };
         if (method === "createForumTopic") return { message_thread_id: 77 };

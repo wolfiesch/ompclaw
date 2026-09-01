@@ -609,6 +609,43 @@ export class TelegramTransportAdapter implements TransportAdapter {
     return this.#openInteraction(address, request, context, signal);
   }
 
+  async #acknowledgeTranscription(
+    message: TgMessage,
+    address: ConversationAddress,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (message.voice === undefined && message.video_note === undefined) return;
+    try {
+      await this.#telegram(
+        "setMessageReaction",
+        {
+          chat_id: message.chat.id,
+          message_id: message.message_id,
+          reaction: [{ type: "emoji", emoji: "👀" }],
+        },
+        signal,
+      );
+    } catch (reactionError) {
+      try {
+        await this.#telegram(
+          "sendMessage",
+          {
+            chat_id: message.chat.id,
+            message_thread_id: address.thread === undefined ? undefined : Number(address.thread),
+            text: "Received. Transcribing your voice note now.",
+          },
+          signal,
+        );
+      } catch (messageError) {
+        this.#log?.warn(
+          `[telegram] voice acknowledgement failed for message ${message.message_id}: ${
+            messageError instanceof Error ? messageError.message : String(messageError)
+          } (reaction: ${reactionError instanceof Error ? reactionError.message : String(reactionError)})`,
+        );
+      }
+    }
+  }
+
   async #handleMessage(message: TgMessage, update: TgUpdate, context: TransportStartContext): Promise<void> {
     if (!message.from || message.from.is_bot) return;
     const identity = telegramIdentity(message.from.id, this.#account);
@@ -643,6 +680,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       }
       if (threadId !== undefined) address = telegramAddress(message, this.#account, threadId);
     }
+    await this.#acknowledgeTranscription(message, address, context.signal);
     const attachment = await this.#saveIncomingMedia(message, context.signal).catch((error) => {
       if (context.signal?.aborted) throw error;
       this.#log?.warn(

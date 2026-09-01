@@ -32,6 +32,14 @@ bun run test:harness
 
 This exercises synthetic Telegram updates through the real adapter, authenticated gateway core, SQLite state, application dispatch, and captured Bot API delivery.
 
+Render the deterministic mobile control surfaces as credential-free JSON:
+
+```sh
+bun run test:telegram:ui
+```
+
+`src/dev/telegram-ui-scenario.test.ts` is the golden contract for Home, reasoning, scheduled-job, and active-task rendering. It catches copy, status, and keyboard-layout drift without contacting Telegram.
+
 Offload the complete check to an SSH-accessible macOS worker with Bun installed:
 
 ```sh
