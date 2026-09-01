@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { GatewayStore } from "./gateway-store";
+import { GatewayStore, type AppendIngressFragmentInput } from "./gateway-store";
 import type { InboundMessage } from "./gateway-types";
 
 const directories: string[] = [];
@@ -32,13 +32,57 @@ function claimedInbound(id: string, transport = "telegram", account = "default")
   };
 }
 
+interface StagedIngressOptions {
+  readonly text?: string;
+  readonly attachments?: InboundMessage["content"]["attachments"];
+  readonly order?: number;
+  readonly edited?: boolean;
+  readonly replyContext?: InboundMessage["replyContext"];
+}
+
+function stagedIngress(id: string, options: StagedIngressOptions = {}): InboundMessage {
+  const { text = id, attachments, order = 1, edited, replyContext } = options;
+  return {
+    ...claimedInbound(id),
+    sentAt: order,
+    content: {
+      text,
+      ...(attachments === undefined ? {} : { attachments }),
+    },
+    composition: { kind: "text", order },
+    ...(edited === true ? { edited: true } : {}),
+    ...(replyContext === undefined ? {} : { replyContext }),
+  };
+}
+
+function appendIngressFragment(
+  store: GatewayStore,
+  message: InboundMessage,
+  overrides: Partial<Omit<AppendIngressFragmentInput, "message">> = {},
+) {
+  return store.appendIngressFragment({
+    compositionId: "composition-1",
+    groupKey: "telegram:default:operator-42:42:text",
+    receivedAt: 100,
+    flushAt: 500,
+    deadlineAt: 1_000,
+    sortOrder: message.composition?.order ?? 0,
+    ...overrides,
+    message,
+  });
+}
+
 describe("GatewayStore", () => {
   test("persists principals, identity mappings, conversation bindings, checkpoints, and pending interactions across restart", () => {
     const path = temporaryDatabase();
     const first = new GatewayStore(path);
     first.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
     first.bindIdentity(telegramOwner, "operator-42");
-    first.bindConversation({ address: ownerAddress, ompSessionPath: "/sessions/42.jsonl", workspace: { root: "/work/project" } });
+    first.bindConversation({
+      address: ownerAddress,
+      ompSessionPath: "/sessions/42.jsonl",
+      workspace: { root: "/work/project" },
+    });
     first.setCheckpoint("telegram", "update_id", "100");
     first.putPendingInteraction({
       id: "approve-42",
@@ -94,7 +138,11 @@ describe("GatewayStore", () => {
     const store = new GatewayStore(temporaryDatabase());
     const threadedAddress = { ...ownerAddress, thread: "topic-9" } as const;
     store.bindConversation({ address: ownerAddress, ompSessionPath: "/sessions/dm.jsonl", workspace: "dm-workspace" });
-    store.bindConversation({ address: threadedAddress, ompSessionPath: "/sessions/topic.jsonl", workspace: "topic-workspace" });
+    store.bindConversation({
+      address: threadedAddress,
+      ompSessionPath: "/sessions/topic.jsonl",
+      workspace: "topic-workspace",
+    });
 
     expect(store.getConversationBinding(ownerAddress)?.ompSessionPath).toBe("/sessions/dm.jsonl");
     expect(store.getConversationBinding(threadedAddress)?.ompSessionPath).toBe("/sessions/topic.jsonl");
@@ -108,7 +156,11 @@ describe("GatewayStore", () => {
     const otherAccountTopic = { ...topic, account: "other" } as const;
     store.bindConversation({ address: ownerAddress, ompSessionPath: "/sessions/shared.jsonl", workspace: "/work" });
     const accidentalRoot = { transport: "websocket", account: "web", channel: "credential" } as const;
-    store.bindConversation({ address: accidentalRoot, ompSessionPath: "/sessions/accidental.jsonl", workspace: "/work" });
+    store.bindConversation({
+      address: accidentalRoot,
+      ompSessionPath: "/sessions/accidental.jsonl",
+      workspace: "/work",
+    });
     store.bindConversation({ address: topic, ompSessionPath: "/sessions/topic.jsonl", workspace: "/work" });
     store.bindConversation({ address: otherAccountTopic, ompSessionPath: "/sessions/other.jsonl", workspace: "/work" });
     store.setCheckpoint("omp", "session_file", "/sessions/topic.jsonl");
@@ -253,7 +305,13 @@ describe("GatewayStore", () => {
     store.putPendingInteraction({ id: "later", address: ownerAddress, kind: "confirm", payload: null, createdAt: 2 });
     store.putPendingInteraction({ id: "bravo", address: ownerAddress, kind: "confirm", payload: null, createdAt: 1 });
     store.putPendingInteraction({ id: "alpha", address: ownerAddress, kind: "confirm", payload: null, createdAt: 1 });
-    store.putPendingInteraction({ id: "threaded", address: threadedAddress, kind: "confirm", payload: null, createdAt: 0 });
+    store.putPendingInteraction({
+      id: "threaded",
+      address: threadedAddress,
+      kind: "confirm",
+      payload: null,
+      createdAt: 0,
+    });
     store.putPendingInteraction({
       id: "other-account",
       address: otherAccountAddress,
@@ -269,7 +327,11 @@ describe("GatewayStore", () => {
       "bravo",
       "later",
     ]);
-    expect(store.listPendingInteractions(ownerAddress).map((interaction) => interaction.id)).toEqual(["alpha", "bravo", "later"]);
+    expect(store.listPendingInteractions(ownerAddress).map((interaction) => interaction.id)).toEqual([
+      "alpha",
+      "bravo",
+      "later",
+    ]);
     expect(store.listPendingInteractions(threadedAddress).map((interaction) => interaction.id)).toEqual(["threaded"]);
     expect(store.listPendingInteractions({ ...ownerAddress, account: "missing" })).toEqual([]);
     store.close();
@@ -319,23 +381,37 @@ describe("GatewayStore", () => {
     const store = new GatewayStore(temporaryDatabase());
 
     expect(() => store.claimInboundMessage(null as never, 1)).toThrow("inbound message must be an object");
-    expect(() => store.claimInboundMessage({
-      ...claimedInbound("update-1"),
-      address: { transport: "", account: "default", channel: "42" },
-    }, 1)).toThrow("address transport");
-    expect(() => store.claimInboundMessage({
-      ...claimedInbound("update-1"),
-      identity: { transport: "telegram", account: "", subject: "42" },
-      address: { transport: "telegram", account: "", channel: "42" },
-    }, 1)).toThrow("identity account");
+    expect(() =>
+      store.claimInboundMessage(
+        {
+          ...claimedInbound("update-1"),
+          address: { transport: "", account: "default", channel: "42" },
+        },
+        1,
+      ),
+    ).toThrow("address transport");
+    expect(() =>
+      store.claimInboundMessage(
+        {
+          ...claimedInbound("update-1"),
+          identity: { transport: "telegram", account: "", subject: "42" },
+          address: { transport: "telegram", account: "", channel: "42" },
+        },
+        1,
+      ),
+    ).toThrow("identity account");
     expect(() => store.claimInboundMessage({ ...claimedInbound("update-1"), id: "" }, 1)).toThrow("inbound message id");
     expect(() => store.claimInboundMessage(claimedInbound("update-1"), 1.5)).toThrow("receivedAt");
     expect(() => store.pruneInboundMessages(Number.MAX_SAFE_INTEGER + 1)).toThrow("prune before");
     expect(() => store.releaseInboundMessage("", "default", "update-1")).toThrow("inbound message transport");
-    expect(() => store.releaseInboundMessage(null as never, "default", "update-1")).toThrow("inbound message transport");
+    expect(() => store.releaseInboundMessage(null as never, "default", "update-1")).toThrow(
+      "inbound message transport",
+    );
     expect(() => store.releaseInboundMessage("telegram", "", "update-1")).toThrow("inbound message account");
     expect(() => store.releaseInboundMessage("telegram", "default", "")).toThrow("inbound message id");
-    expect(() => store.listPendingInteractions({ ...ownerAddress, channel: "" })).toThrow("conversation address channel");
+    expect(() => store.listPendingInteractions({ ...ownerAddress, channel: "" })).toThrow(
+      "conversation address channel",
+    );
     expect(() => store.deleteExpiredPendingInteractions(Number.NaN)).toThrow("expiry now");
     store.close();
   });
@@ -400,13 +476,15 @@ describe("GatewayStore", () => {
     ]);
     expect(restarted.listDueScheduledJobs(1_800_000_000_000).map((job) => job.id)).toEqual(["job-42"]);
     const job = restarted.getScheduledJob("job-42", "operator-42")!;
-    expect(restarted.updateScheduledJob({
-      ...job,
-      enabled: false,
-      successCount: 1,
-      lastRunAt: 1_800_000_000_000,
-      updatedAt: 1_800_000_000_001,
-    })).toBe(true);
+    expect(
+      restarted.updateScheduledJob({
+        ...job,
+        enabled: false,
+        successCount: 1,
+        lastRunAt: 1_800_000_000_000,
+        updatedAt: 1_800_000_000_001,
+      }),
+    ).toBe(true);
     expect(restarted.listDueScheduledJobs(1_900_000_000_000)).toEqual([]);
     expect(restarted.deleteScheduledJob("job-42", "operator-7")).toBe(false);
     expect(restarted.deleteScheduledJob("job-42", "operator-42")).toBe(true);
@@ -501,8 +579,159 @@ describe("GatewayStore", () => {
     store.close();
 
     const database = new Database(databasePath);
-    const storedRows = database.query("SELECT roles_json, workspace_json, value_json FROM principals LEFT JOIN conversation_bindings ON 1 = 1 LEFT JOIN adapter_checkpoints ON 1 = 1").all();
+    const storedRows = database
+      .query(
+        "SELECT roles_json, workspace_json, value_json FROM principals LEFT JOIN conversation_bindings ON 1 = 1 LEFT JOIN adapter_checkpoints ON 1 = 1",
+      )
+      .all();
     expect(JSON.stringify(storedRows)).not.toContain(sourceToken);
     database.close();
+  });
+
+  test("persists pending ingress compositions with complete messages across restart", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    const fragment = stagedIngress("fragment-restart", {
+      text: "Photo caption",
+      order: 7,
+      attachments: [{ url: "file:///private/photo.jpg", name: "photo.jpg", mediaType: "image/jpeg" }],
+      replyContext: { messageId: "reply-7", author: "@alice", text: "Please inspect this", isBot: false },
+    });
+    const saved = appendIngressFragment(first, fragment, {
+      compositionId: "composition-restart",
+      groupKey: "telegram:default:operator-42:42:text:reply-7",
+      receivedAt: 100,
+      flushAt: 900,
+      deadlineAt: 5_000,
+      sortOrder: 7,
+    });
+    expect(saved.fragments).toEqual([fragment]);
+    first.close();
+
+    const restarted = new GatewayStore(path);
+    expect(restarted.listPendingIngressCompositions()).toEqual([saved]);
+    restarted.close();
+  });
+
+  test("leaves non-edit ingress duplicates unchanged", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const fragment = stagedIngress("fragment-duplicate", { text: "original", order: 2 });
+    const saved = appendIngressFragment(store, fragment, {
+      compositionId: "composition-original",
+      groupKey: "telegram:default:operator-42:42:text",
+      receivedAt: 100,
+      flushAt: 500,
+      deadlineAt: 1_000,
+      sortOrder: 2,
+    });
+
+    expect(
+      appendIngressFragment(store, fragment, {
+        compositionId: "composition-ignored",
+        receivedAt: 300,
+        flushAt: 900,
+        deadlineAt: 2_000,
+        sortOrder: 99,
+      }),
+    ).toEqual(saved);
+    expect(store.listPendingIngressCompositions()).toEqual([saved]);
+    store.close();
+  });
+
+  test("upserts only the matching staged ingress fragment when it is edited", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const firstFragment = stagedIngress("fragment-one", { text: "before edit", order: 2 });
+    const secondFragment = stagedIngress("fragment-two", { text: "unchanged", order: 3 });
+    appendIngressFragment(store, firstFragment, { receivedAt: 100, flushAt: 500, deadlineAt: 1_000, sortOrder: 2 });
+    appendIngressFragment(store, secondFragment, { receivedAt: 200, flushAt: 600, deadlineAt: 1_000, sortOrder: 3 });
+
+    const editedFragment = stagedIngress("fragment-one", { text: "after edit", order: 1, edited: true });
+    const updated = appendIngressFragment(store, editedFragment, {
+      receivedAt: 300,
+      flushAt: 700,
+      deadlineAt: 2_000,
+      sortOrder: 1,
+    });
+
+    expect(updated).toMatchObject({
+      id: "composition-1",
+      createdAt: 100,
+      updatedAt: 300,
+      flushAt: 700,
+      deadlineAt: 1_000,
+    });
+    expect(updated.fragments).toEqual([editedFragment, secondFragment]);
+    store.close();
+  });
+
+  test("orders ingress fragments by sort order and stable fragment id", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    appendIngressFragment(store, stagedIngress("fragment-b", { order: 20 }), { sortOrder: 20 });
+    appendIngressFragment(store, stagedIngress("fragment-c", { order: 10 }), { sortOrder: 10 });
+    const record = appendIngressFragment(store, stagedIngress("fragment-a", { order: 10 }), { sortOrder: 10 });
+
+    expect(record.fragments.map((fragment) => fragment.id)).toEqual(["fragment-a", "fragment-c", "fragment-b"]);
+    store.close();
+  });
+
+  test("preserves the first ingress deadline and clamps every flush to it", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const first = appendIngressFragment(store, stagedIngress("fragment-first", { order: 1 }), {
+      receivedAt: 100,
+      flushAt: 900,
+      deadlineAt: 500,
+      sortOrder: 1,
+    });
+    const second = appendIngressFragment(store, stagedIngress("fragment-second", { order: 2 }), {
+      receivedAt: 200,
+      flushAt: 800,
+      deadlineAt: 2_000,
+      sortOrder: 2,
+    });
+
+    expect(first).toMatchObject({ flushAt: 500, deadlineAt: 500 });
+    expect(second).toMatchObject({ flushAt: 500, deadlineAt: 500 });
+    store.close();
+  });
+
+  test("cascades ingress fragments when deleting a composition", () => {
+    const path = temporaryDatabase();
+    const store = new GatewayStore(path);
+    appendIngressFragment(store, stagedIngress("fragment-cascade"));
+
+    expect(store.deleteIngressComposition("composition-1")).toBe(true);
+    expect(store.deleteIngressComposition("composition-1")).toBe(false);
+    store.close();
+
+    const database = new Database(path);
+    const row = database.query("SELECT COUNT(*) AS count FROM ingress_fragments").get() as { count: number };
+    expect(row.count).toBe(0);
+    database.close();
+  });
+
+  test("rejects corrupt persisted ingress fragments", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    const fragment = stagedIngress("fragment-corrupt", {
+      replyContext: { messageId: "reply-1", author: "@alice", text: "trusted only as content", isBot: false },
+    });
+    appendIngressFragment(first, fragment);
+    first.close();
+
+    const database = new Database(path);
+    database
+      .query("UPDATE ingress_fragments SET payload_json = ? WHERE composition_id = ? AND fragment_id = ?")
+      .run(
+        JSON.stringify({ ...fragment, composition: { kind: "text", order: "not-an-integer" } }),
+        "composition-1",
+        "fragment-corrupt",
+      );
+    database.close();
+
+    const restarted = new GatewayStore(path);
+    expect(() => restarted.listPendingIngressCompositions()).toThrow(
+      "inbound message composition order must be an integer",
+    );
+    restarted.close();
   });
 });

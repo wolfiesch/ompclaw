@@ -2,7 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { JsonValue, PendingInboundMessage, PendingInteraction } from "../../gateway-store";
+import type {
+  IngressCompositionRecord,
+  JsonValue,
+  PendingInboundMessage,
+  PendingInteraction,
+} from "../../gateway-store";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -43,7 +48,7 @@ export class TelegramTestPoller implements TelegramPoller {
     this.stopped = true;
   }
 
-  async done(): Promise<void> { }
+  async done(): Promise<void> {}
 }
 
 export interface FakeTelegramApiOptions {
@@ -61,8 +66,8 @@ export class FakeTelegramApi {
     this.seams = {
       poller: this.poller,
       acquireLock: () => ({ ok: true }),
-      releaseLock: () => { },
-      startLockHeartbeat: () => () => { },
+      releaseLock: () => {},
+      startLockHeartbeat: () => () => {},
       now: () => 1_800_000_000_000,
       randomId: () => "interaction-id",
       callTelegram: async (method, payload = {}) => {
@@ -92,6 +97,7 @@ export interface TelegramAdapterHarnessOptions extends FakeTelegramApiOptions {
   readonly transcribe?: boolean;
   readonly createTopicsFromRoot?: boolean;
   readonly failFirstReceive?: boolean;
+  readonly pendingIngressAttachmentName?: string;
   readonly pendingAttachmentName?: string;
   readonly receive?: (message: InboundEnvelope) => Promise<void>;
 }
@@ -114,26 +120,68 @@ const activeHarnesses = new Set<TelegramAdapterHarness>();
 export async function createTelegramAdapterHarness(
   options: TelegramAdapterHarnessOptions = {},
 ): Promise<TelegramAdapterHarness> {
-  const stateDir = await mkdtemp(join(tmpdir(), options.pendingAttachmentName ? "ompclaw adapter " : "ompclaw-adapter-"));
+  const retainsPendingAttachment =
+    options.pendingAttachmentName !== undefined || options.pendingIngressAttachmentName !== undefined;
+  const stateDir = await mkdtemp(join(tmpdir(), retainsPendingAttachment ? "ompclaw adapter " : "ompclaw-adapter-"));
+  const inboxDir = join(stateDir, "inbox", "telegram", "primary");
   const received: InboundEnvelope[] = [];
   const checkpoints = new Map<string, JsonValue>();
   const pending = new Map<string, PendingInteraction>();
-  const pendingInbound: PendingInboundMessage[] = options.pendingAttachmentName === undefined ? [] : [{
-    message: {
-      id: "pending-message",
-      sentAt: 1_800_000_000_000,
-      identity: { transport: "telegram", account: "primary", subject: "42" },
-      address: TELEGRAM_TEST_ADDRESS,
-      content: {
-        attachments: [{
-          url: pathToFileURL(join(stateDir, "inbox", options.pendingAttachmentName)).href,
-        }],
-      },
-      principal: TELEGRAM_TEST_OWNER,
-    },
-    receivedAt: 1_800_000_000_000,
-    scheduled: false,
-  }];
+  const pendingInbound: PendingInboundMessage[] =
+    options.pendingAttachmentName === undefined
+      ? []
+      : [
+          {
+            message: {
+              id: "pending-message",
+              sentAt: 1_800_000_000_000,
+              identity: { transport: "telegram", account: "primary", subject: "42" },
+              address: TELEGRAM_TEST_ADDRESS,
+              content: {
+                attachments: [
+                  {
+                    url: pathToFileURL(join(inboxDir, options.pendingAttachmentName)).href,
+                  },
+                ],
+              },
+              principal: TELEGRAM_TEST_OWNER,
+            },
+            receivedAt: 1_800_000_000_000,
+            scheduled: false,
+          },
+        ];
+  const pendingIngress: IngressCompositionRecord[] =
+    options.pendingIngressAttachmentName === undefined
+      ? []
+      : [
+          {
+            id: "pending-composition",
+            groupKey: "telegram:42:pending-album",
+            address: TELEGRAM_TEST_ADDRESS,
+            principalId: TELEGRAM_TEST_OWNER.id,
+            createdAt: 1_800_000_000_000,
+            updatedAt: 1_800_000_000_000,
+            flushAt: 1_800_000_000_800,
+            deadlineAt: 1_800_000_005_000,
+            fragments: [
+              {
+                id: "pending-fragment",
+                sentAt: 1_800_000_000_000,
+                identity: { transport: "telegram", account: "primary", subject: "42" },
+                address: TELEGRAM_TEST_ADDRESS,
+                content: {
+                  attachments: [
+                    {
+                      url: pathToFileURL(join(inboxDir, options.pendingIngressAttachmentName)).href,
+                    },
+                  ],
+                },
+                principal: TELEGRAM_TEST_OWNER,
+                composition: { kind: "media", groupId: "pending-album", order: 9 },
+              },
+            ],
+          },
+        ];
   const warnings: string[] = [];
   const api = new FakeTelegramApi(options);
   const key = (adapter: string, checkpoint: string): string => `${adapter}\0${checkpoint}`;
@@ -145,16 +193,23 @@ export async function createTelegramAdapterHarness(
     createTopicsFromRoot: options.createTopicsFromRoot,
     store: {
       getCheckpoint: (adapterId, checkpoint) => checkpoints.get(key(adapterId, checkpoint)),
-      setCheckpoint: (adapterId, checkpoint, value) => { checkpoints.set(key(adapterId, checkpoint), value); },
-      putPendingInteraction: (interaction) => { pending.set(interaction.id, interaction); },
+      setCheckpoint: (adapterId, checkpoint, value) => {
+        checkpoints.set(key(adapterId, checkpoint), value);
+      },
+      putPendingInteraction: (interaction) => {
+        pending.set(interaction.id, interaction);
+      },
       deletePendingInteraction: (id) => pending.delete(id),
       listPendingInboundMessages: () => pendingInbound,
+      listPendingIngressCompositions: () => pendingIngress,
     },
     logger: {
-      debug: () => { },
-      info: () => { },
-      warn: (message) => { warnings.push(message); },
-      error: () => { },
+      debug: () => {},
+      info: () => {},
+      warn: (message) => {
+        warnings.push(message);
+      },
+      error: () => {},
     },
     api: api.seams,
     ...(options.transcribe ? { transcribeCommand: ["speech-to-text"] } : {}),
@@ -168,8 +223,8 @@ export async function createTelegramAdapterHarness(
       await options.receive?.(message);
       received.push(message);
     },
-    resolveIdentity: (identity) => options.resolve?.(identity.subject)
-      ?? (identity.subject === "42" ? TELEGRAM_TEST_OWNER : undefined),
+    resolveIdentity: (identity) =>
+      options.resolve?.(identity.subject) ?? (identity.subject === "42" ? TELEGRAM_TEST_OWNER : undefined),
   };
   try {
     await adapter.start(context);
@@ -237,14 +292,26 @@ export function lastTelegramCall(calls: readonly TelegramApiCall[], method = "se
 
 export function telegramCallbackData(call: TelegramApiCall, label: string): string {
   const markup = call.payload.reply_markup;
-  if (markup === null || typeof markup !== "object" || !("inline_keyboard" in markup) || !Array.isArray(markup.inline_keyboard)) {
+  if (
+    markup === null ||
+    typeof markup !== "object" ||
+    !("inline_keyboard" in markup) ||
+    !Array.isArray(markup.inline_keyboard)
+  ) {
     throw new Error("expected inline keyboard");
   }
   for (const row of markup.inline_keyboard) {
     if (!Array.isArray(row)) continue;
     for (const button of row) {
-      if (button !== null && typeof button === "object" && "text" in button && button.text === label
-        && "callback_data" in button && typeof button.callback_data === "string") return button.callback_data;
+      if (
+        button !== null &&
+        typeof button === "object" &&
+        "text" in button &&
+        button.text === label &&
+        "callback_data" in button &&
+        typeof button.callback_data === "string"
+      )
+        return button.callback_data;
     }
   }
   throw new Error(`missing button ${label}`);

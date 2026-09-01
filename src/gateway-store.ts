@@ -28,6 +28,28 @@ export interface PendingInboundMessage {
   readonly scheduled: boolean;
 }
 
+export interface AppendIngressFragmentInput {
+  readonly compositionId: string;
+  readonly groupKey: string;
+  readonly message: InboundMessage;
+  readonly receivedAt: number;
+  readonly flushAt: number;
+  readonly deadlineAt: number;
+  readonly sortOrder: number;
+}
+
+export interface IngressCompositionRecord {
+  readonly id: string;
+  readonly groupKey: string;
+  readonly address: ConversationAddress;
+  readonly principalId: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly flushAt: number;
+  readonly deadlineAt: number;
+  readonly fragments: readonly InboundMessage[];
+}
+
 export type TurnLifecycleState = "queued" | "running" | "completed" | "stopped" | "failed" | "interrupted";
 
 export interface TurnLifecycle {
@@ -91,7 +113,6 @@ export const LEGACY_TELEGRAM_STATE_MIGRATION = "legacy-telegram-state-v1";
 export const TELEGRAM_TOPIC_SESSION_MIGRATION = "telegram-topic-session-isolation-v1";
 
 type SqlRow = Record<string, unknown>;
-
 
 function isJsonValue(value: unknown): value is JsonValue {
   if (value === null || typeof value === "boolean" || typeof value === "string") return true;
@@ -210,10 +231,108 @@ function validateInboundMessage(value: unknown): asserts value is InboundMessage
     throw new Error("inbound message principal roles must be an array of strings");
   }
   if (value.replyTo !== undefined) validateReceipt(value.replyTo, "inbound message replyTo");
+  if (value.replyContext !== undefined) {
+    if (!isRecord(value.replyContext)) throw new Error("inbound message replyContext must be an object");
+    requiredText(value.replyContext.messageId, "inbound message replyContext messageId");
+    if (value.replyContext.author !== undefined && typeof value.replyContext.author !== "string") {
+      throw new Error("inbound message replyContext author must be a string");
+    }
+    if (value.replyContext.text !== undefined && typeof value.replyContext.text !== "string") {
+      throw new Error("inbound message replyContext text must be a string");
+    }
+    if (value.replyContext.isBot !== undefined && typeof value.replyContext.isBot !== "boolean") {
+      throw new Error("inbound message replyContext isBot must be boolean");
+    }
+  }
+  if (value.composition !== undefined) {
+    if (!isRecord(value.composition)) throw new Error("inbound message composition must be an object");
+    if (value.composition.kind !== "text" && value.composition.kind !== "media") {
+      throw new Error("inbound message composition kind is invalid");
+    }
+    if (value.composition.groupId !== undefined) {
+      requiredText(value.composition.groupId, "inbound message composition groupId");
+    }
+    if (typeof value.composition.order !== "number" || !Number.isSafeInteger(value.composition.order)) {
+      throw new Error("inbound message composition order must be an integer");
+    }
+  }
   if (value.sourceReceipt !== undefined) validateReceipt(value.sourceReceipt, "inbound message sourceReceipt");
   if (value.edited !== undefined && typeof value.edited !== "boolean") {
     throw new Error("inbound message edited must be boolean");
   }
+}
+
+function validateIngressFragmentInput(input: AppendIngressFragmentInput): void {
+  requiredText(input.compositionId, "ingress composition id");
+  requiredText(input.groupKey, "ingress composition group key");
+  validateInboundMessage(input.message);
+  for (const [label, value] of [
+    ["received", input.receivedAt],
+    ["flush", input.flushAt],
+    ["deadline", input.deadlineAt],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`ingress composition ${label} timestamp must be a safe nonnegative integer`);
+    }
+  }
+  if (input.deadlineAt < input.receivedAt) {
+    throw new Error("ingress composition deadline must not precede receipt");
+  }
+  if (!Number.isSafeInteger(input.sortOrder)) {
+    throw new Error("ingress fragment sort order must be an integer");
+  }
+}
+
+function decodeIngressComposition(row: SqlRow, fragments: readonly InboundMessage[]): IngressCompositionRecord {
+  const context = "ingress composition";
+  const thread = storedString(row, "thread", context);
+  const address: ConversationAddress = {
+    transport: storedString(row, "transport", context),
+    account: storedString(row, "account", context),
+    channel: storedString(row, "channel", context),
+    ...(thread === "" ? {} : { thread }),
+  };
+  validateAddress(address);
+
+  const record: IngressCompositionRecord = {
+    id: storedString(row, "id", context),
+    groupKey: storedString(row, "group_key", context),
+    address,
+    principalId: storedString(row, "principal_id", context),
+    createdAt: storedTimestamp(row, "created_at", context),
+    updatedAt: storedTimestamp(row, "updated_at", context),
+    flushAt: storedTimestamp(row, "flush_at", context),
+    deadlineAt: storedTimestamp(row, "deadline_at", context),
+    fragments,
+  };
+  requiredText(record.id, "stored ingress composition id");
+  requiredText(record.groupKey, "stored ingress composition group key");
+  requiredText(record.principalId, "stored ingress composition principal");
+  if (record.createdAt < 0 || record.updatedAt < 0 || record.flushAt < 0 || record.deadlineAt < 0) {
+    throw new Error("corrupt stored ingress composition: timestamps must be nonnegative");
+  }
+  if (record.updatedAt < record.createdAt) {
+    throw new Error("corrupt stored ingress composition: updated timestamp precedes creation");
+  }
+  if (record.flushAt > record.deadlineAt) {
+    throw new Error("corrupt stored ingress composition: flush timestamp exceeds deadline");
+  }
+  if (record.fragments.length === 0) throw new Error("corrupt stored ingress composition: no fragments");
+
+  for (const fragment of record.fragments) {
+    validateInboundMessage(fragment);
+    const fragmentAddress = fragment.address;
+    if (
+      fragment.principal.id !== record.principalId ||
+      fragmentAddress.transport !== record.address.transport ||
+      fragmentAddress.account !== record.address.account ||
+      fragmentAddress.channel !== record.address.channel ||
+      fragmentAddress.thread !== record.address.thread
+    ) {
+      throw new Error("corrupt stored ingress composition: fragment does not belong to composition");
+    }
+  }
+  return record;
 }
 
 function databasePath(path: string): string {
@@ -486,7 +605,8 @@ function validateScheduledJob(job: ScheduledJob): void {
     ["success count", job.successCount],
     ["failure count", job.failureCount],
   ] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`scheduled job ${label} must be a non-negative integer`);
+    if (!Number.isSafeInteger(value) || value < 0)
+      throw new Error(`scheduled job ${label} must be a non-negative integer`);
   }
   if (job.lastError !== undefined) requiredText(job.lastError, "scheduled job last error");
 }
@@ -514,7 +634,9 @@ function legacyTelegramOperator(access: Record<string, unknown>): string {
   const allowed = access.allowFrom;
   if (!Array.isArray(allowed)) throw new Error("legacy access state does not contain an allowFrom array");
 
-  const numericOperators = [...new Set(allowed.filter((value): value is string => typeof value === "string" && /^\d+$/.test(value)))];
+  const numericOperators = [
+    ...new Set(allowed.filter((value): value is string => typeof value === "string" && /^\d+$/.test(value))),
+  ];
   if (numericOperators.length !== 1) {
     throw new Error("legacy access state must contain exactly one numeric Telegram operator");
   }
@@ -625,6 +747,34 @@ export class GatewayStore {
           ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS ingress_compositions (
+        id TEXT PRIMARY KEY NOT NULL,
+        group_key TEXT NOT NULL UNIQUE,
+        principal_id TEXT NOT NULL,
+        transport TEXT NOT NULL,
+        account TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        flush_at INTEGER NOT NULL,
+        deadline_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS ingress_compositions_flush_at
+        ON ingress_compositions (flush_at, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS ingress_fragments (
+        composition_id TEXT NOT NULL REFERENCES ingress_compositions(id) ON DELETE CASCADE,
+        fragment_id TEXT NOT NULL,
+        sort_order INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        PRIMARY KEY (composition_id, fragment_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS ingress_fragments_composition_order
+        ON ingress_fragments (composition_id, sort_order, fragment_id);
+
       CREATE TABLE IF NOT EXISTS scheduled_jobs (
         id TEXT PRIMARY KEY NOT NULL,
         principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
@@ -676,9 +826,7 @@ export class GatewayStore {
         completed_at INTEGER NOT NULL
       );
     `);
-    const pendingInboundColumns = this.#database
-      .query("PRAGMA table_info(pending_inbound_messages)")
-      .all() as SqlRow[];
+    const pendingInboundColumns = this.#database.query("PRAGMA table_info(pending_inbound_messages)").all() as SqlRow[];
     if (!pendingInboundColumns.some((row) => row.name === "scheduled")) {
       this.#database.exec(
         "ALTER TABLE pending_inbound_messages ADD COLUMN scheduled INTEGER NOT NULL DEFAULT 0 CHECK (scheduled IN (0, 1))",
@@ -803,7 +951,6 @@ export class GatewayStore {
     return row === null ? undefined : decodeConversationBinding(row);
   }
 
-
   getSharedConversationSessionPath(): string | undefined {
     const row = this.#database
       .query(
@@ -858,21 +1005,26 @@ export class GatewayStore {
           throw new Error(`Telegram checkpoint ${scopedKey} must be a non-negative integer`);
         }
         if (legacy !== undefined) {
-          this.#database.query("DELETE FROM adapter_checkpoints WHERE adapter = 'telegram' AND checkpoint_key = 'update_id'").run();
+          this.#database
+            .query("DELETE FROM adapter_checkpoints WHERE adapter = 'telegram' AND checkpoint_key = 'update_id'")
+            .run();
         }
         return false;
       }
       if (legacy === undefined) return false;
-      const migrated = typeof legacy === "number"
-        ? legacy
-        : typeof legacy === "string" && /^\d+$/.test(legacy)
-          ? Number(legacy)
-          : Number.NaN;
+      const migrated =
+        typeof legacy === "number"
+          ? legacy
+          : typeof legacy === "string" && /^\d+$/.test(legacy)
+            ? Number(legacy)
+            : Number.NaN;
       if (!Number.isSafeInteger(migrated) || migrated < 0) {
         throw new Error("legacy Telegram update checkpoint must be a non-negative integer");
       }
       this.setCheckpoint("telegram", scopedKey, migrated);
-      this.#database.query("DELETE FROM adapter_checkpoints WHERE adapter = 'telegram' AND checkpoint_key = 'update_id'").run();
+      this.#database
+        .query("DELETE FROM adapter_checkpoints WHERE adapter = 'telegram' AND checkpoint_key = 'update_id'")
+        .run();
       return true;
     });
   }
@@ -916,12 +1068,14 @@ export class GatewayStore {
     requiredText(transport, "inbound message transport");
     requiredText(account, "inbound message account");
     requiredText(messageId, "inbound message id");
-    return this.#database
-      .query(
-        `DELETE FROM pending_inbound_messages
+    return (
+      this.#database
+        .query(
+          `DELETE FROM pending_inbound_messages
          WHERE transport = ? AND account = ? AND message_id = ?`,
-      )
-      .run(transport, account, messageId).changes > 0;
+        )
+        .run(transport, account, messageId).changes > 0
+    );
   }
 
   listPendingInboundMessages(): PendingInboundMessage[] {
@@ -946,17 +1100,122 @@ export class GatewayStore {
     });
   }
 
+  appendIngressFragment(input: AppendIngressFragmentInput): IngressCompositionRecord {
+    validateIngressFragmentInput(input);
+    const message = input.message;
+
+    return this.#transaction(() => {
+      const existingRow = this.#database
+        .query("SELECT id FROM ingress_compositions WHERE group_key = ?")
+        .get(input.groupKey) as SqlRow | null;
+      let composition: IngressCompositionRecord | undefined;
+      let compositionId = input.compositionId;
+      let deadlineAt = input.deadlineAt;
+
+      if (existingRow === null) {
+        const { address } = message;
+        this.#database
+          .query(
+            `INSERT INTO ingress_compositions (
+               id, group_key, principal_id, transport, account, channel, thread,
+               created_at, updated_at, flush_at, deadline_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            compositionId,
+            input.groupKey,
+            message.principal.id,
+            address.transport,
+            address.account,
+            address.channel,
+            address.thread ?? "",
+            input.receivedAt,
+            input.receivedAt,
+            Math.min(input.flushAt, input.deadlineAt),
+            deadlineAt,
+          );
+      } else {
+        compositionId = storedString(existingRow, "id", "ingress composition");
+        composition = this.#readIngressComposition(compositionId);
+        deadlineAt = composition.deadlineAt;
+        const compositionAddress = composition.address;
+        if (
+          composition.principalId !== message.principal.id ||
+          compositionAddress.transport !== message.address.transport ||
+          compositionAddress.account !== message.address.account ||
+          compositionAddress.channel !== message.address.channel ||
+          compositionAddress.thread !== message.address.thread
+        ) {
+          throw new Error("ingress fragment does not match its existing composition");
+        }
+      }
+
+      const existingFragment = this.#database
+        .query("SELECT 1 FROM ingress_fragments WHERE composition_id = ? AND fragment_id = ?")
+        .get(compositionId, message.id);
+      if (existingFragment !== null && message.edited !== true) {
+        return composition ?? this.#readIngressComposition(compositionId);
+      }
+
+      const payload = encodeJson(message as unknown as JsonValue, "ingress fragment");
+      if (existingFragment === null) {
+        this.#database
+          .query(
+            `INSERT INTO ingress_fragments (composition_id, fragment_id, sort_order, payload_json)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(compositionId, message.id, input.sortOrder, payload);
+      } else {
+        this.#database
+          .query(
+            `UPDATE ingress_fragments
+             SET sort_order = ?, payload_json = ?
+             WHERE composition_id = ? AND fragment_id = ?`,
+          )
+          .run(input.sortOrder, payload, compositionId, message.id);
+      }
+
+      this.#database
+        .query(
+          `UPDATE ingress_compositions
+           SET updated_at = MAX(updated_at, ?), flush_at = ?
+           WHERE id = ?`,
+        )
+        .run(input.receivedAt, Math.min(input.flushAt, deadlineAt), compositionId);
+
+      return this.#readIngressComposition(compositionId);
+    });
+  }
+
+  listPendingIngressCompositions(): IngressCompositionRecord[] {
+    const rows = this.#database
+      .query(
+        `SELECT id
+         FROM ingress_compositions
+         ORDER BY flush_at ASC, created_at ASC, id ASC`,
+      )
+      .all() as SqlRow[];
+    return rows.map((row) => this.#readIngressComposition(storedString(row, "id", "ingress composition")));
+  }
+
+  deleteIngressComposition(id: string): boolean {
+    requiredText(id, "ingress composition id");
+    return this.#database.query("DELETE FROM ingress_compositions WHERE id = ?").run(id).changes > 0;
+  }
+
   releaseInboundMessage(transport: string, account: string, messageId: string): boolean {
     requiredText(transport, "inbound message transport");
     requiredText(account, "inbound message account");
     requiredText(messageId, "inbound message id");
 
-    return this.#database
-      .query(
-        `DELETE FROM inbound_messages
+    return (
+      this.#database
+        .query(
+          `DELETE FROM inbound_messages
          WHERE transport = ? AND account = ? AND message_id = ?`,
-      )
-      .run(transport, account, messageId).changes > 0;
+        )
+        .run(transport, account, messageId).changes > 0
+    );
   }
 
   pruneInboundMessages(before: number): number {
@@ -980,10 +1239,12 @@ export class GatewayStore {
         `)
         .get(before) as SqlRow;
       const count = storedCount(row, "message_count", "inbound message prune count");
-      this.#database.query(`
+      this.#database
+        .query(`
         DELETE FROM inbound_messages AS inbound
         WHERE inbound.received_at < ? AND ${pendingGuard}
-      `).run(before);
+      `)
+        .run(before);
       return count;
     });
   }
@@ -1221,21 +1482,27 @@ export class GatewayStore {
   getScheduledJob(id: string, principalId?: string): ScheduledJob | undefined {
     requiredText(id, "scheduled job id");
     if (principalId !== undefined) requiredText(principalId, "scheduled job principal");
-    const row = principalId === undefined
-      ? this.#database.query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE id = ?`).get(id)
-      : this.#database
-        .query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE id = ? AND principal_id = ?`)
-        .get(id, principalId);
+    const row =
+      principalId === undefined
+        ? this.#database.query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE id = ?`).get(id)
+        : this.#database
+            .query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE id = ? AND principal_id = ?`)
+            .get(id, principalId);
     return row === null ? undefined : decodeScheduledJob(row as SqlRow);
   }
 
   listScheduledJobs(principalId?: string): ScheduledJob[] {
     if (principalId !== undefined) requiredText(principalId, "scheduled job principal");
-    const rows = principalId === undefined
-      ? this.#database.query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs ORDER BY created_at ASC, id ASC`).all()
-      : this.#database
-        .query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE principal_id = ? ORDER BY created_at ASC, id ASC`)
-        .all(principalId);
+    const rows =
+      principalId === undefined
+        ? this.#database
+            .query(`SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs ORDER BY created_at ASC, id ASC`)
+            .all()
+        : this.#database
+            .query(
+              `SELECT ${SCHEDULED_JOB_FIELDS} FROM scheduled_jobs WHERE principal_id = ? ORDER BY created_at ASC, id ASC`,
+            )
+            .all(principalId);
     return (rows as SqlRow[]).map(decodeScheduledJob);
   }
 
@@ -1261,9 +1528,10 @@ export class GatewayStore {
   deleteScheduledJob(id: string, principalId: string): boolean {
     requiredText(id, "scheduled job id");
     requiredText(principalId, "scheduled job principal");
-    return this.#database
-      .query("DELETE FROM scheduled_jobs WHERE id = ? AND principal_id = ?")
-      .run(id, principalId).changes > 0;
+    return (
+      this.#database.query("DELETE FROM scheduled_jobs WHERE id = ? AND principal_id = ?").run(id, principalId)
+        .changes > 0
+    );
   }
 
   importLegacyTelegramState(options: LegacyTelegramStateImportOptions): LegacyTelegramStateImportResult {
@@ -1319,17 +1587,21 @@ export class GatewayStore {
       if (this.#hasMigration(marker)) return 0;
 
       const current = this.getCheckpoint("omp", "session_file");
-      const currentWasTopic = typeof current === "string" && this.#database
-        .query(
-          `SELECT 1
+      const currentWasTopic =
+        typeof current === "string" &&
+        this.#database
+          .query(
+            `SELECT 1
            FROM conversation_bindings
            WHERE transport = 'telegram' AND account = ? AND thread <> '' AND omp_session_path = ?
            LIMIT 1`,
-        )
-        .get(account, current) !== null;
-      const currentWasShared = typeof current === "string" && this.#database
-        .query("SELECT 1 FROM conversation_bindings WHERE thread = '' AND omp_session_path = ? LIMIT 1")
-        .get(current) !== null;
+          )
+          .get(account, current) !== null;
+      const currentWasShared =
+        typeof current === "string" &&
+        this.#database
+          .query("SELECT 1 FROM conversation_bindings WHERE thread = '' AND omp_session_path = ? LIMIT 1")
+          .get(current) !== null;
       const sharedRow = this.#database
         .query(
           `SELECT omp_session_path
@@ -1339,25 +1611,24 @@ export class GatewayStore {
            LIMIT 1`,
         )
         .get() as SqlRow | null;
-      const shared = sharedRow === null ? undefined : storedString(sharedRow, "omp_session_path", "conversation binding");
+      const shared =
+        sharedRow === null ? undefined : storedString(sharedRow, "omp_session_path", "conversation binding");
       const removed = this.#database
         .query("DELETE FROM conversation_bindings WHERE transport = 'telegram' AND account = ? AND thread <> ''")
         .run(account).changes;
 
       if (shared !== undefined) {
-        this.#database
-          .query("UPDATE conversation_bindings SET omp_session_path = ? WHERE thread = ''")
-          .run(shared);
+        this.#database.query("UPDATE conversation_bindings SET omp_session_path = ? WHERE thread = ''").run(shared);
         this.setCheckpoint("omp", "shared_session_file", shared);
         if (currentWasTopic || currentWasShared) this.setCheckpoint("omp", "session_file", shared);
-      } else if (currentWasTopic && this.#database
-        .query("SELECT 1 FROM conversation_bindings WHERE omp_session_path = ? LIMIT 1")
-        .get(current) === null) {
+      } else if (
+        currentWasTopic &&
+        this.#database.query("SELECT 1 FROM conversation_bindings WHERE omp_session_path = ? LIMIT 1").get(current) ===
+          null
+      ) {
         for (const key of ["session_file", "shared_session_file"]) {
           if (this.getCheckpoint("omp", key) !== current) continue;
-          this.#database
-            .query("DELETE FROM adapter_checkpoints WHERE adapter = 'omp' AND checkpoint_key = ?")
-            .run(key);
+          this.#database.query("DELETE FROM adapter_checkpoints WHERE adapter = 'omp' AND checkpoint_key = ?").run(key);
         }
       }
 
@@ -1366,6 +1637,34 @@ export class GatewayStore {
         .run(marker, Date.now());
       return removed;
     });
+  }
+
+  #readIngressComposition(id: string): IngressCompositionRecord {
+    const row = this.#database
+      .query(
+        `SELECT id, group_key, principal_id, transport, account, channel, thread,
+                created_at, updated_at, flush_at, deadline_at
+         FROM ingress_compositions
+         WHERE id = ?`,
+      )
+      .get(id) as SqlRow | null;
+    if (row === null) throw new Error(`missing ingress composition ${id}`);
+
+    const fragments = (
+      this.#database
+        .query(
+          `SELECT payload_json
+         FROM ingress_fragments
+         WHERE composition_id = ?
+         ORDER BY sort_order ASC, fragment_id ASC`,
+        )
+        .all(id) as SqlRow[]
+    ).map((fragment) => {
+      const message = decodeJson(fragment.payload_json, "ingress fragment");
+      validateInboundMessage(message);
+      return message;
+    });
+    return decodeIngressComposition(row, fragments);
   }
 
   #hasMigration(marker: string): boolean {

@@ -79,6 +79,7 @@ export interface TelegramTransportAdapterOptions {
     | "setCheckpoint"
     | "putPendingInteraction"
     | "deletePendingInteraction"
+    | "listPendingIngressCompositions"
     | "listPendingInboundMessages"
   >;
   readonly transcribeCommand?: readonly string[];
@@ -161,6 +162,25 @@ function telegramIdentity(userId: number, account: string): InboundEnvelope["ide
 
 function updateMessage(update: TgUpdate): TgMessage | undefined {
   return update.message ?? update.edited_message;
+}
+
+const REPLY_CONTEXT_TEXT_LIMIT = 1_000;
+
+function truncateReplyText(text: string): string {
+  return text.length <= REPLY_CONTEXT_TEXT_LIMIT ? text : Array.from(text).slice(0, REPLY_CONTEXT_TEXT_LIMIT).join("");
+}
+
+function replyContextFrom(message: TgMessage): InboundEnvelope["replyContext"] | undefined {
+  const reply = message.reply_to_message;
+  if (!reply) return undefined;
+  const author = reply.from?.first_name || (reply.from?.username === undefined ? undefined : `@${reply.from.username}`);
+  const text = reply.text ?? reply.caption;
+  return {
+    messageId: String(reply.message_id),
+    ...(author === undefined ? {} : { author }),
+    ...(text === undefined ? {} : { text: truncateReplyText(text) }),
+    ...(reply.from?.is_bot === undefined ? {} : { isBot: reply.from.is_bot }),
+  };
 }
 
 function safeFilename(candidate: string): string {
@@ -640,6 +660,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
             name: attachment.displayName,
             mediaType: attachment.mediaType,
           };
+    const replyContext = replyContextFrom(message);
     const envelope: InboundEnvelope = {
       id: `telegram:${this.#account}:${message.chat.id}:${message.message_id}`,
       sentAt: message.date * 1_000,
@@ -653,7 +674,13 @@ export class TelegramTransportAdapter implements TransportAdapter {
         ? {}
         : {
             replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) },
+            ...(replyContext === undefined ? {} : { replyContext }),
           }),
+      composition: {
+        kind: message.media_group_id === undefined ? "text" : "media",
+        ...(message.media_group_id === undefined ? {} : { groupId: message.media_group_id }),
+        order: message.message_id,
+      },
       sourceReceipt: { transport: "telegram", messageId: String(message.message_id) },
       edited: update.edited_message !== undefined,
     };
@@ -798,8 +825,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
 
   #protectedInboxPaths(): ReadonlySet<string> {
     const paths = new Set<string>();
-    for (const pending of this.#store.listPendingInboundMessages()) {
-      for (const attachment of pending.message.content.attachments ?? []) {
+    const protect = (attachments: readonly MessageAttachment[] | undefined): void => {
+      for (const attachment of attachments ?? []) {
         try {
           const url = new URL(attachment.url);
           if (url.protocol === "file:") paths.add(resolve(fileURLToPath(url)));
@@ -807,6 +834,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
           // Ignore malformed attachment URLs while preserving valid inbox paths.
         }
       }
+    };
+    for (const pending of this.#store.listPendingInboundMessages()) {
+      protect(pending.message.content.attachments);
+    }
+    for (const composition of this.#store.listPendingIngressCompositions()) {
+      for (const fragment of composition.fragments) protect(fragment.content.attachments);
     }
     return paths;
   }

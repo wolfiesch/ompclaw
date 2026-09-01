@@ -11,12 +11,20 @@ import {
 } from "./gateway-app";
 import { parseGatewayConfig, type GatewayConfig } from "./gateway-config";
 import type { GatewayCoreOptions } from "./gateway-core";
-import { GatewayStore, type ConversationBinding, type JsonValue, type ScheduledJob } from "./gateway-store";
+import {
+  GatewayStore,
+  type AppendIngressFragmentInput,
+  type ConversationBinding,
+  type IngressCompositionRecord,
+  type JsonValue,
+  type ScheduledJob,
+} from "./gateway-store";
 import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
 import type { RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import { identityBind, migrateTelegram, principalAdd, telegramAllow } from "./rpc-cli";
 
 const directories: string[] = [];
+const FAST_INGRESS = { debounceMs: 1, mediaDebounceMs: 1, maxWaitMs: 1 } as const;
 
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { force: true, recursive: true });
@@ -81,13 +89,29 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   throw new Error("condition was not met");
 }
 
+interface MemoryIngressComposition {
+  readonly id: string;
+  readonly groupKey: string;
+  readonly address: InboundMessage["address"];
+  readonly principalId: string;
+  readonly createdAt: number;
+  updatedAt: number;
+  flushAt: number;
+  readonly deadlineAt: number;
+  readonly fragments: Array<{ readonly message: InboundMessage; readonly sortOrder: number }>;
+}
+
 class MemoryStore implements GatewayApplicationStore {
   readonly claims = new Set<string>();
-  readonly pending = new Map<string, { readonly message: InboundMessage; readonly receivedAt: number; readonly scheduled: boolean }>();
+  readonly pending = new Map<
+    string,
+    { readonly message: InboundMessage; readonly receivedAt: number; readonly scheduled: boolean }
+  >();
   readonly checkpoint = new Map<string, JsonValue>();
   readonly bindings: ConversationBinding[] = [];
   readonly releases: string[] = [];
   readonly migrations = new Set<string>();
+  readonly ingressCompositions = new Map<string, MemoryIngressComposition>();
   readonly updateCheckpointMigrations: string[] = [];
   closed = false;
   failBindings = 0;
@@ -131,6 +155,55 @@ class MemoryStore implements GatewayApplicationStore {
     return this.claims.delete(key);
   }
 
+  appendIngressFragment(input: AppendIngressFragmentInput): IngressCompositionRecord {
+    let composition = [...this.ingressCompositions.values()].find(({ groupKey }) => groupKey === input.groupKey);
+    if (composition === undefined) {
+      composition = {
+        id: input.compositionId,
+        groupKey: input.groupKey,
+        address: input.message.address,
+        principalId: input.message.principal.id,
+        createdAt: input.receivedAt,
+        updatedAt: input.receivedAt,
+        flushAt: Math.min(input.flushAt, input.deadlineAt),
+        deadlineAt: input.deadlineAt,
+        fragments: [],
+      };
+      this.ingressCompositions.set(composition.id, composition);
+    }
+    const index = composition.fragments.findIndex(({ message }) => message.id === input.message.id);
+    if (index < 0) composition.fragments.push({ message: input.message, sortOrder: input.sortOrder });
+    else if (input.message.edited)
+      composition.fragments[index] = { message: input.message, sortOrder: input.sortOrder };
+    composition.updatedAt = input.receivedAt;
+    composition.flushAt = Math.min(input.flushAt, composition.deadlineAt);
+    return this.#ingressRecord(composition);
+  }
+
+  listPendingIngressCompositions(): IngressCompositionRecord[] {
+    return [...this.ingressCompositions.values()].map((composition) => this.#ingressRecord(composition));
+  }
+
+  deleteIngressComposition(id: string): boolean {
+    return this.ingressCompositions.delete(id);
+  }
+
+  #ingressRecord(composition: MemoryIngressComposition): IngressCompositionRecord {
+    return {
+      id: composition.id,
+      groupKey: composition.groupKey,
+      address: composition.address,
+      principalId: composition.principalId,
+      createdAt: composition.createdAt,
+      updatedAt: composition.updatedAt,
+      flushAt: composition.flushAt,
+      deadlineAt: composition.deadlineAt,
+      fragments: [...composition.fragments]
+        .sort((left, right) => left.sortOrder - right.sortOrder || left.message.id.localeCompare(right.message.id))
+        .map(({ message }) => message),
+    };
+  }
+
   bindConversation(binding: ConversationBinding) {
     if (this.failBindings > 0) {
       this.failBindings -= 1;
@@ -140,14 +213,14 @@ class MemoryStore implements GatewayApplicationStore {
   }
 
   getConversationBinding(address: InboundMessage["address"]) {
-    return this.bindings.findLast((binding) =>
-      binding.address.transport === address.transport &&
-      binding.address.account === address.account &&
-      binding.address.channel === address.channel &&
-      binding.address.thread === address.thread
+    return this.bindings.findLast(
+      (binding) =>
+        binding.address.transport === address.transport &&
+        binding.address.account === address.account &&
+        binding.address.channel === address.channel &&
+        binding.address.thread === address.thread,
     );
   }
-
 
   getSharedConversationSessionPath() {
     return this.bindings.findLast((binding) => binding.address.thread === undefined)?.ompSessionPath;
@@ -232,8 +305,12 @@ describe("GatewayApplication", () => {
     };
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: () => runtime,
@@ -258,7 +335,16 @@ describe("GatewayApplication", () => {
 
     await app.stop();
     await app.stop();
-    expect(events).toEqual(["lock", "heartbeat", "runtime-start", "core-start", "core-stop", "runtime-stop", "heartbeat-stop", "unlock"]);
+    expect(events).toEqual([
+      "lock",
+      "heartbeat",
+      "runtime-start",
+      "core-start",
+      "core-stop",
+      "runtime-stop",
+      "heartbeat-stop",
+      "unlock",
+    ]);
     expect(store.closed).toBe(true);
   });
 
@@ -266,8 +352,12 @@ describe("GatewayApplication", () => {
     let createdStore = false;
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => {
           createdStore = true;
           return new MemoryStore();
@@ -288,15 +378,24 @@ describe("GatewayApplication", () => {
     let runtimeOptions: RpcGatewayRuntimeOptions | undefined;
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => {
           runtimeOptions = options;
           return {
             async start() {
-              options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+              options.onSessionState?.({
+                isStreaming: false,
+                isCompacting: false,
+                sessionId: "one",
+                sessionFile: "/sessions/one",
+              });
             },
             async stop() {},
             async handleInbound() {},
@@ -307,23 +406,28 @@ describe("GatewayApplication", () => {
         acquireLock: () => ({ ok: true }),
         startLockHeartbeat: () => () => {},
         releaseLock: () => {},
-        now: () => 42,
+        now: Date.now,
       },
     });
 
     await app.start();
     expect(store.updateCheckpointMigrations).toEqual(["bot"]);
-    expect(await core.options().identityResolver({ transport: "telegram", account: "bot", subject: "42" })).toEqual({ id: "operator", roles: ["operator"] });
+    expect(await core.options().identityResolver({ transport: "telegram", account: "bot", subject: "42" })).toEqual({
+      id: "operator",
+      roles: ["operator"],
+    });
     await core.options().onInbound(inbound("message-1"));
     await waitFor(() => store.bindings.length === 1);
 
     expect(runtimeOptions?.sessionFile).toBeUndefined();
     expect(store.checkpoint.get("omp/session_file")).toBe("/sessions/one");
-    expect(store.bindings).toEqual([{
-      address: { transport: "telegram", account: "bot", channel: "42" },
-      ompSessionPath: "/sessions/one",
-      workspace: "/workspace/gateway",
-    }]);
+    expect(store.bindings).toEqual([
+      {
+        address: { transport: "telegram", account: "bot", channel: "42" },
+        ompSessionPath: "/sessions/one",
+        workspace: "/workspace/gateway",
+      },
+    ]);
     await app.stop();
   });
 
@@ -355,11 +459,17 @@ describe("GatewayApplication", () => {
       config,
       secrets: { telegramToken: "telegram", webSocketCredentials: [] },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "root", sessionFile: currentSession });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "root",
+              sessionFile: currentSession,
+            });
           },
           async stop() {},
           async handleInbound(message) {
@@ -437,12 +547,16 @@ describe("GatewayApplication", () => {
       { id: "topic-9-first", session: "/sessions/topic-1" },
       { id: "topic-10-first", session: "/sessions/topic-2" },
       { id: "topic-9-again", session: "/sessions/topic-1" },
-      { id: "root-other", session: "/sessions/root" },
       { id: "web-root", session: "/sessions/root" },
+      { id: "root-other", session: "/sessions/root" },
       { id: "root-again", session: "/sessions/root" },
     ]);
-    expect(store.getConversationBinding(topicMessage("ignored", "9", "ignored").address)?.ompSessionPath).toBe("/sessions/topic-1");
-    expect(store.getConversationBinding(topicMessage("ignored", "10", "ignored").address)?.ompSessionPath).toBe("/sessions/topic-2");
+    expect(store.getConversationBinding(topicMessage("ignored", "9", "ignored").address)?.ompSessionPath).toBe(
+      "/sessions/topic-1",
+    );
+    expect(store.getConversationBinding(topicMessage("ignored", "10", "ignored").address)?.ompSessionPath).toBe(
+      "/sessions/topic-2",
+    );
     await app.stop();
   });
 
@@ -466,6 +580,7 @@ describe("GatewayApplication", () => {
       config,
       secrets: { telegramToken: "telegram", webSocketCredentials: [] },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
@@ -522,13 +637,22 @@ describe("GatewayApplication", () => {
     const errors: unknown[] = [];
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "one",
+              sessionFile: "/sessions/one",
+            });
           },
           async stop() {},
           async handleInbound() {
@@ -568,13 +692,22 @@ describe("GatewayApplication", () => {
     const errors: unknown[] = [];
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "one",
+              sessionFile: "/sessions/one",
+            });
           },
           async stop() {},
           async handleInbound() {
@@ -593,7 +726,7 @@ describe("GatewayApplication", () => {
 
     await app.start();
     await core.options().onInbound(inbound("completion-retry"));
-    await waitFor(() => store.pending.size === 0);
+    await waitFor(() => dispatches === 1 && store.pending.size === 0);
     expect(dispatches).toBe(1);
     expect(errors).toHaveLength(1);
     expect(store.bindings).toHaveLength(1);
@@ -607,13 +740,22 @@ describe("GatewayApplication", () => {
     const errors: unknown[] = [];
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "one",
+              sessionFile: "/sessions/one",
+            });
           },
           async stop() {},
           async handleInbound(message) {
@@ -632,8 +774,8 @@ describe("GatewayApplication", () => {
     });
 
     await app.start();
-    await core.options().onInbound(inbound("poison"));
-    await core.options().onInbound(inbound("healthy"));
+    await core.options().onInbound({ ...inbound("poison"), content: { text: "/poison" } });
+    await core.options().onInbound({ ...inbound("healthy"), content: { text: "/healthy" } });
     await waitFor(() => handled.includes("healthy"));
     expect(errors).toHaveLength(1);
     expect(store.pending.has("telegram/bot/poison")).toBe(true);
@@ -651,13 +793,22 @@ describe("GatewayApplication", () => {
     let busy = false;
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "one",
+              sessionFile: "/sessions/one",
+            });
           },
           async stop() {},
           async handleInbound(message) {
@@ -686,9 +837,9 @@ describe("GatewayApplication", () => {
     });
 
     await app.start();
-    await core.options().onInbound(inbound("first"));
+    await core.options().onInbound({ ...inbound("first"), content: { text: "/first" } });
     await firstStarted.promise;
-    await core.options().onInbound(inbound("second"));
+    await core.options().onInbound({ ...inbound("second"), content: { text: "/second" } });
     expect(handled).toEqual(["first"]);
     expect(queued).toEqual(["second"]);
     expect(store.pending.size).toBe(2);
@@ -710,13 +861,22 @@ describe("GatewayApplication", () => {
     const handled: Array<{ readonly id: string; readonly roles: readonly string[] }> = [];
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "one",
+              sessionFile: "/sessions/one",
+            });
           },
           async stop() {},
           async handleInbound(message) {
@@ -751,13 +911,22 @@ describe("GatewayApplication", () => {
     let busy = false;
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "one",
+              sessionFile: "/sessions/one",
+            });
           },
           async stop() {},
           async handleInbound(message) {
@@ -797,13 +966,22 @@ describe("GatewayApplication", () => {
     let dispatches = 0;
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "one",
+              sessionFile: "/sessions/one",
+            });
           },
           async stop() {},
           async handleInbound() {
@@ -844,13 +1022,22 @@ describe("GatewayApplication", () => {
     let dispatches = 0;
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
           async start() {
-            options.onSessionState?.({ isStreaming: false, isCompacting: false, sessionId: "one", sessionFile: "/sessions/one" });
+            options.onSessionState?.({
+              isStreaming: false,
+              isCompacting: false,
+              sessionId: "one",
+              sessionFile: "/sessions/one",
+            });
           },
           async stop() {},
           async handleInbound() {
@@ -900,17 +1087,27 @@ describe("GatewayApplication", () => {
       updatedAt: 1,
     };
     store.createScheduledJob(job);
-    expect(store.claimInboundMessage({
-      ...inbound(`scheduled:${job.id}:${scheduledFor}`),
-      sentAt: scheduledFor,
-    }, 1, true)).toBe(true);
+    expect(
+      store.claimInboundMessage(
+        {
+          ...inbound(`scheduled:${job.id}:${scheduledFor}`),
+          sentAt: scheduledFor,
+        },
+        1,
+        true,
+      ),
+    ).toBe(true);
     const core = coreHarness([]);
     const scheduled: string[] = [];
     const interactive: string[] = [];
     const app = new GatewayApplication({
       config,
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: (options) => ({
@@ -960,14 +1157,24 @@ describe("GatewayApplication", () => {
     };
     const app = new GatewayApplication({
       config: gatewayConfig(),
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createStore: () => store,
         createCore: core.create,
         createRuntime: () => ({
-          async start() { events.push("runtime-start"); },
-          async stop() { events.push("runtime-stop"); },
-          async handleInbound() { dispatches += 1; },
+          async start() {
+            events.push("runtime-start");
+          },
+          async stop() {
+            events.push("runtime-stop");
+          },
+          async handleInbound() {
+            dispatches += 1;
+          },
         }),
         createTelegramAdapter: () => adapter("telegram"),
         createWebSocketAdapter: () => adapter("websocket"),
@@ -984,7 +1191,16 @@ describe("GatewayApplication", () => {
     });
 
     await expect(app.start()).rejects.toThrow("adapter failed");
-    expect(events).toEqual(["lock", "heartbeat", "runtime-start", "core-start", "core-stop", "runtime-stop", "heartbeat-stop", "unlock"]);
+    expect(events).toEqual([
+      "lock",
+      "heartbeat",
+      "runtime-start",
+      "core-start",
+      "core-stop",
+      "runtime-stop",
+      "heartbeat-stop",
+      "unlock",
+    ]);
     expect(store.closed).toBe(true);
     expect(dispatches).toBe(0);
     expect(store.pending.has("telegram/bot/recovered-during-start")).toBe(true);
@@ -1027,15 +1243,23 @@ describe("GatewayApplication", () => {
     let runtimeOptions: RpcGatewayRuntimeOptions | undefined;
     const app = new GatewayApplication({
       config,
-      secrets: { telegramToken: "telegram", webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }] },
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
       seams: {
+        ingressComposer: FAST_INGRESS,
         createCore: core.create,
         createScheduler: () => scheduler,
         createRuntime: (options) => {
           runtimeOptions = options;
           return {
-            async start() { events.push("runtime-start"); },
-            async stop() { events.push("runtime-stop"); },
+            async start() {
+              events.push("runtime-start");
+            },
+            async stop() {
+              events.push("runtime-stop");
+            },
             async handleInbound() {},
           };
         },
@@ -1051,7 +1275,14 @@ describe("GatewayApplication", () => {
     expect(runtimeOptions?.automation).toBe(scheduler);
     expect(events).toEqual(["runtime-start", "core-start", "scheduler-start"]);
     await app.stop();
-    expect(events).toEqual(["runtime-start", "core-start", "scheduler-start", "scheduler-stop", "core-stop", "runtime-stop"]);
+    expect(events).toEqual([
+      "runtime-start",
+      "core-start",
+      "scheduler-start",
+      "scheduler-stop",
+      "core-stop",
+      "runtime-stop",
+    ]);
   });
 
   test("exposes strictly validated SQLite management helpers", () => {
@@ -1068,8 +1299,12 @@ describe("GatewayApplication", () => {
 
     const store = new GatewayStore(join(config.stateDir, "ompclaw.sqlite"));
     try {
-      expect(store.resolvePrincipal({ transport: "websocket", account: "web", subject: "subject-a" })?.id).toBe("principal-a");
-      expect(store.resolvePrincipal({ transport: "telegram", account: "bot", subject: "12345" })?.id).toBe("telegram:bot:12345");
+      expect(store.resolvePrincipal({ transport: "websocket", account: "web", subject: "subject-a" })?.id).toBe(
+        "principal-a",
+      );
+      expect(store.resolvePrincipal({ transport: "telegram", account: "bot", subject: "12345" })?.id).toBe(
+        "telegram:bot:12345",
+      );
       expect(store.getCheckpoint("telegram", "update_id:default")).toBe(7);
     } finally {
       store.close();

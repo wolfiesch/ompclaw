@@ -5,8 +5,10 @@ import {
   GatewayCore,
   InboundIdentityAddressMismatchError,
   InboundReplyReceiptTransportMismatchError,
+  InvalidInboundCompositionError,
   InvalidInboundEnvelopeIdError,
   InvalidInboundEnvelopeSentAtError,
+  InvalidInboundReplyContextError,
   ReceiptTransportMismatchError,
   UnknownTransportIdentityError,
 } from "./gateway-core";
@@ -61,10 +63,7 @@ function envelope(transport: string): InboundEnvelope {
   };
 }
 
-function adapter(
-  id: string,
-  capabilities: TransportCapabilities = FULL_CAPABILITIES,
-): TransportAdapter {
+function adapter(id: string, capabilities: TransportCapabilities = FULL_CAPABILITIES): TransportAdapter {
   return {
     id,
     capabilities,
@@ -88,7 +87,9 @@ function adapter(
   };
 }
 
-function core(onInbound: (message: InboundMessage, signal?: AbortSignal) => void | Promise<void> = async () => {}): GatewayCore {
+function core(
+  onInbound: (message: InboundMessage, signal?: AbortSignal) => void | Promise<void> = async () => {},
+): GatewayCore {
   return new GatewayCore({
     identityResolver: () => SERVER_PRINCIPAL,
     onInbound,
@@ -119,15 +120,21 @@ describe("GatewayCore", () => {
 
     await expect(gateway.receive({ ...valid, id: "" })).rejects.toThrow(InvalidInboundEnvelopeIdError);
     await expect(gateway.receive({ ...valid, sentAt: -1 })).rejects.toThrow(InvalidInboundEnvelopeSentAtError);
-    await expect(
-      gateway.receive({ ...valid, identity: { ...valid.identity, transport: "slack" } }),
-    ).rejects.toThrow(InboundIdentityAddressMismatchError);
+    await expect(gateway.receive({ ...valid, identity: { ...valid.identity, transport: "slack" } })).rejects.toThrow(
+      InboundIdentityAddressMismatchError,
+    );
     await expect(
       gateway.receive({ ...valid, identity: { ...valid.identity, account: "other-account" } }),
     ).rejects.toThrow(InboundIdentityAddressMismatchError);
+    await expect(gateway.receive({ ...valid, replyTo: { transport: "slack", messageId: "parent" } })).rejects.toThrow(
+      InboundReplyReceiptTransportMismatchError,
+    );
     await expect(
-      gateway.receive({ ...valid, replyTo: { transport: "slack", messageId: "parent" } }),
-    ).rejects.toThrow(InboundReplyReceiptTransportMismatchError);
+      gateway.receive({ ...valid, replyContext: { messageId: 42 } } as unknown as InboundEnvelope),
+    ).rejects.toThrow(InvalidInboundReplyContextError);
+    await expect(
+      gateway.receive({ ...valid, composition: { kind: "media", order: -1 } } as unknown as InboundEnvelope),
+    ).rejects.toThrow(InvalidInboundCompositionError);
 
     expect(resolveCalls).toBe(0);
     expect(handled).toBe(false);
@@ -161,9 +168,15 @@ describe("GatewayCore", () => {
 
     await gateway.start();
     const replyTo = { transport: "telegram", messageId: "parent" };
+    const replyContext = { messageId: "parent", author: "@owner", text: "quoted", isBot: false };
+    const composition = { kind: "text" as const, order: 10 };
+    const sourceReceipt = { transport: "telegram", messageId: "source" };
     const untrustedEnvelope = {
       ...envelope("telegram"),
       replyTo,
+      replyContext,
+      composition,
+      sourceReceipt,
       edited: true,
       principal: { id: "forged", roles: ["admin"] },
     } as InboundEnvelope & { principal: Principal };
@@ -177,11 +190,15 @@ describe("GatewayCore", () => {
     expect(received?.content).toBe(untrustedEnvelope.content);
     expect(received?.replyTo).toBe(replyTo);
     expect(received?.edited).toBe(true);
+    expect(received?.replyContext).toEqual(replyContext);
+    expect(received?.composition).toEqual(composition);
+    expect(received?.sourceReceipt).toEqual(sourceReceipt);
     await gateway.stop();
   });
 
   test("provides adapters the configured server-side identity resolver for asynchronous replies", async () => {
-    const calls: Array<{ identity: { transport: string; account: string; subject: string }; signal?: AbortSignal }> = [];
+    const calls: Array<{ identity: { transport: string; account: string; subject: string }; signal?: AbortSignal }> =
+      [];
     const resolver: ResolveTransportIdentity = async (identity, signal) => {
       calls.push({ identity, signal });
       return SERVER_PRINCIPAL;
@@ -381,8 +398,12 @@ describe("GatewayCore", () => {
     ];
     for (const target of crossOriginAddresses) {
       await expect(gateway.send(target, { text: "send" }, context)).rejects.toThrow(CrossOriginDeliveryError);
-      await expect(gateway.update(target, receipt, { text: "update" }, context)).rejects.toThrow(CrossOriginDeliveryError);
-      await expect(gateway.finalize(target, receipt, { text: "final" }, context)).rejects.toThrow(CrossOriginDeliveryError);
+      await expect(gateway.update(target, receipt, { text: "update" }, context)).rejects.toThrow(
+        CrossOriginDeliveryError,
+      );
+      await expect(gateway.finalize(target, receipt, { text: "final" }, context)).rejects.toThrow(
+        CrossOriginDeliveryError,
+      );
       await expect(gateway.react(target, receipt, { emoji: "👍" }, context)).rejects.toThrow(CrossOriginDeliveryError);
       await expect(gateway.presentUi(target, { type: "status", key: "state" }, context)).rejects.toThrow(
         CrossOriginDeliveryError,
@@ -428,10 +449,14 @@ describe("GatewayCore", () => {
     const context = deliveryContext(target);
     const receipt = { transport: "plain", messageId: "message" };
 
-    await expect(gateway.update(target, receipt, { text: "update" }, context)).rejects.toMatchObject<UnsupportedTransportCapabilityError>({
+    await expect(
+      gateway.update(target, receipt, { text: "update" }, context),
+    ).rejects.toMatchObject<UnsupportedTransportCapabilityError>({
       capability: "streamingUpdates",
     });
-    await expect(gateway.react(target, receipt, { emoji: "👍" }, context)).rejects.toMatchObject<UnsupportedTransportCapabilityError>({
+    await expect(
+      gateway.react(target, receipt, { emoji: "👍" }, context),
+    ).rejects.toMatchObject<UnsupportedTransportCapabilityError>({
       capability: "reactions",
     });
     await expect(
@@ -456,7 +481,11 @@ describe("GatewayCore", () => {
     });
     const target = address("plain");
 
-    const response = await gateway.presentUi(target, { type: "status", key: "session", text: "ready" }, deliveryContext(target));
+    const response = await gateway.presentUi(
+      target,
+      { type: "status", key: "session", text: "ready" },
+      deliveryContext(target),
+    );
 
     expect(receivedRequest).toEqual({ type: "status", key: "session", text: "ready" });
     expect(response).toEqual({ type: "status", acknowledged: true });

@@ -8,6 +8,11 @@ import {
   type GatewaySecrets,
 } from "./gateway-config";
 import { GatewayCore, type GatewayCoreOptions } from "./gateway-core";
+import {
+  GatewayIngressComposer,
+  type GatewayIngressComposerOptions,
+  type GatewayIngressCompositionStore,
+} from "./gateway-ingress-composer";
 import type { GatewayDelivery } from "./gateway-tools";
 import {
   GatewayScheduler,
@@ -31,7 +36,10 @@ import { GatewayUpdateCoordinator, currentGatewayRelease, gatewayUpdatePaths } f
 import { TelegramTransportAdapter, type TelegramTransportAdapterOptions } from "./transports/telegram/adapter";
 import { WebSocketTransportAdapter, type WebSocketTransportOptions } from "./transports/websocket/adapter";
 
-export interface GatewayApplicationStore extends Partial<GatewayScheduledJobStore>, Partial<GatewayTurnLifecycleStore> {
+export interface GatewayApplicationStore
+  extends GatewayIngressCompositionStore,
+    Partial<GatewayScheduledJobStore>,
+    Partial<GatewayTurnLifecycleStore> {
   close(): void;
   resolvePrincipal(identity: TransportIdentity): Principal | undefined;
   getCheckpoint(adapter: string, key: string): JsonValue | undefined;
@@ -76,6 +84,11 @@ export interface GatewayApplicationSeams {
   readonly createTelegramAdapter?: (options: TelegramTransportAdapterOptions) => TransportAdapter;
   readonly createWebSocketAdapter?: (options: WebSocketTransportOptions) => TransportAdapter;
   readonly createScheduler?: (options: GatewaySchedulerOptions) => GatewaySchedulerRuntime;
+  /**
+   * Test seam for deterministic ingress composition timing. Production uses
+   * the composer's defaults.
+   */
+  readonly ingressComposer?: Omit<GatewayIngressComposerOptions, "store" | "deliver" | "now">;
   readonly acquireLock?: (path: string) => { readonly ok: true } | { readonly ok: false; readonly holder: number };
   readonly releaseLock?: (path: string) => void;
   readonly startLockHeartbeat?: (path: string) => () => void;
@@ -121,6 +134,7 @@ export class GatewayApplication {
   #core: GatewayCoreRuntime | undefined;
   #runtime: GatewayRuntime | undefined;
   #scheduler: GatewaySchedulerRuntime | undefined;
+  #ingressComposer: GatewayIngressComposer | undefined;
   #updates: GatewayUpdateCoordinator | undefined;
   #releaseHeartbeat: (() => void) | undefined;
   #adapters: TransportAdapter[] = [];
@@ -185,11 +199,12 @@ export class GatewayApplication {
       if (sharedCheckpoint !== undefined && (typeof sharedCheckpoint !== "string" || sharedCheckpoint.length === 0)) {
         throw new Error("OMP shared session checkpoint must be a non-empty string");
       }
-      this.#sharedSessionFile = sharedCheckpoint ?? (topicSessions ? store.getSharedConversationSessionPath?.() : undefined);
+      this.#sharedSessionFile =
+        sharedCheckpoint ?? (topicSessions ? store.getSharedConversationSessionPath?.() : undefined);
       this.#sessionFile = checkpoint ?? this.#sharedSessionFile;
       const core = (this.#seams.createCore ?? ((options: GatewayCoreOptions) => new GatewayCore(options)))({
         identityResolver: (identity) => store.resolvePrincipal(identity),
-        onInbound: (message) => this.#handleInbound(message),
+        onInbound: (message) => this.#acceptInbound(message),
       });
       this.#core = core;
 
@@ -200,7 +215,9 @@ export class GatewayApplication {
       let scheduler: GatewaySchedulerRuntime | undefined;
       if (this.#config.automation.enabled) {
         const scheduledStore = requireScheduledStore(store);
-        scheduler = (this.#seams.createScheduler ?? ((options: GatewaySchedulerOptions) => new GatewayScheduler(options)))({
+        scheduler = (
+          this.#seams.createScheduler ?? ((options: GatewaySchedulerOptions) => new GatewayScheduler(options))
+        )({
           store: scheduledStore,
           dispatch: (job, scheduledFor) => this.#dispatchScheduledJob(job, scheduledFor),
           enabled: true,
@@ -216,7 +233,8 @@ export class GatewayApplication {
       let rpcConfig = gatewayRpcRuntimeConfig(this.#config);
       prepareInheritedHarness(rpcConfig);
       const learningOverlay = prepareLearningOverlay(this.#config);
-      if (learningOverlay !== undefined) rpcConfig = { ...rpcConfig, configFiles: [...rpcConfig.configFiles, learningOverlay] };
+      if (learningOverlay !== undefined)
+        rpcConfig = { ...rpcConfig, configFiles: [...rpcConfig.configFiles, learningOverlay] };
 
       const updates = this.#config.updates.enabled
         ? new GatewayUpdateCoordinator({
@@ -227,7 +245,9 @@ export class GatewayApplication {
         : undefined;
       await updates?.discardArmed();
       this.#updates = updates;
-      const runtime = (this.#seams.createRuntime ?? ((options: RpcGatewayRuntimeOptions) => new RpcGatewayRuntime(options)))({
+      const runtime = (
+        this.#seams.createRuntime ?? ((options: RpcGatewayRuntimeOptions) => new RpcGatewayRuntime(options))
+      )({
         config: rpcConfig,
         delivery: core,
         sessionFile: this.#sessionFile,
@@ -237,12 +257,19 @@ export class GatewayApplication {
         ...(isTurnLifecycleStore(store) ? { turnStore: store } : {}),
       });
       this.#runtime = runtime;
+      this.#ingressComposer = new GatewayIngressComposer({
+        ...(this.#seams.ingressComposer ?? {}),
+        ...(this.#seams.now === undefined ? {} : { now: this.#seams.now }),
+        store,
+        deliver: (message) => this.#handleInbound(message),
+      });
 
       // OMP starts before the core makes a transport reachable.
       await runtime.start();
       if (topicSessions && this.#sharedSessionFile === undefined) this.#sharedSessionFile = this.#sessionFile;
       this.#checkpointSession();
       this.#checkpointSharedSession();
+      this.#ingressComposer.start();
       for (const pending of store.listPendingInboundMessages()) {
         if (!pending.scheduled) this.#schedulePendingInbound(pending.message, false);
       }
@@ -252,7 +279,9 @@ export class GatewayApplication {
       this.#releaseDispatchReady = undefined;
       scheduler?.start();
       void updates?.reconcile(core).catch((error: unknown) => {
-        console.error(`[ompclaw update] reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(
+          `[ompclaw update] reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
       });
     } catch (error) {
       await this.#rollbackStart(lockHeld);
@@ -275,15 +304,20 @@ export class GatewayApplication {
     const telegram = this.#config.transports.telegram;
     if (telegram?.enabled) {
       if (secrets.telegramToken === undefined) throw new Error("Telegram token was not resolved");
-      adapters.push((this.#seams.createTelegramAdapter ?? ((options: TelegramTransportAdapterOptions) => new TelegramTransportAdapter(options)))({
-        token: secrets.telegramToken,
-        account: telegram.account,
-        stateDir: this.#config.stateDir,
-        store,
-        commands: runtimeCommandMenu(this.#config.omp.allowRpcBash),
-        createTopicsFromRoot: telegram.topicSessions.enabled && telegram.topicSessions.createFromRoot,
-        ...(telegram.transcribeCommand === undefined ? {} : { transcribeCommand: telegram.transcribeCommand }),
-      }));
+      adapters.push(
+        (
+          this.#seams.createTelegramAdapter ??
+          ((options: TelegramTransportAdapterOptions) => new TelegramTransportAdapter(options))
+        )({
+          token: secrets.telegramToken,
+          account: telegram.account,
+          stateDir: this.#config.stateDir,
+          store,
+          commands: runtimeCommandMenu(this.#config.omp.allowRpcBash),
+          createTopicsFromRoot: telegram.topicSessions.enabled && telegram.topicSessions.createFromRoot,
+          ...(telegram.transcribeCommand === undefined ? {} : { transcribeCommand: telegram.transcribeCommand }),
+        }),
+      );
     }
 
     const websocket = this.#config.transports.websocket;
@@ -291,14 +325,25 @@ export class GatewayApplication {
       if (secrets.webSocketCredentials.length !== websocket.credentials.length) {
         throw new Error("WebSocket credential resolution does not match configured credentials");
       }
-      adapters.push((this.#seams.createWebSocketAdapter ?? ((options: WebSocketTransportOptions) => new WebSocketTransportAdapter(options)))({
-        hostname: websocket.hostname,
-        port: websocket.port,
-        account: websocket.account,
-        credentials: secrets.webSocketCredentials,
-      }));
+      adapters.push(
+        (
+          this.#seams.createWebSocketAdapter ??
+          ((options: WebSocketTransportOptions) => new WebSocketTransportAdapter(options))
+        )({
+          hostname: websocket.hostname,
+          port: websocket.port,
+          account: websocket.account,
+          credentials: secrets.webSocketCredentials,
+        }),
+      );
     }
     return adapters;
+  }
+
+  async #acceptInbound(message: InboundMessage): Promise<void> {
+    const composer = this.#ingressComposer;
+    if (composer === undefined) throw new Error("Ingress composer is not started");
+    await composer.accept(message);
   }
 
   async #handleInbound(message: InboundMessage): Promise<void> {
@@ -308,20 +353,17 @@ export class GatewayApplication {
 
     const immediate = runtime.canHandleInboundImmediately?.(message) === true;
     const delayed = !immediate && (this.#queuedInboundCount > 0 || runtime.isBusy?.() === true);
-    const ready = delayed && runtime.notifyInboundQueued !== undefined
-      ? runtime.notifyInboundQueued(message).catch((error) => {
-          this.#reportInboundDispatchError(message, error);
-        })
-      : Promise.resolve();
+    const ready =
+      delayed && runtime.notifyInboundQueued !== undefined
+        ? runtime.notifyInboundQueued(message).catch((error) => {
+            this.#reportInboundDispatchError(message, error);
+          })
+        : Promise.resolve();
     this.#schedulePendingInbound(message, immediate, ready);
     await ready;
   }
 
-  #schedulePendingInbound(
-    message: InboundMessage,
-    immediate: boolean,
-    ready: Promise<void> = Promise.resolve(),
-  ): void {
+  #schedulePendingInbound(message: InboundMessage, immediate: boolean, ready: Promise<void> = Promise.resolve()): void {
     const key = this.#inboundKey(message);
     if (this.#pendingDispatches.has(key)) return;
 
@@ -458,7 +500,8 @@ export class GatewayApplication {
     const currentSession = this.#sessionFile;
     if (binding !== undefined) {
       if (binding.ompSessionPath === currentSession) return;
-      if (runtime.switchSession === undefined) throw new Error("OMP runtime does not support conversation session switching");
+      if (runtime.switchSession === undefined)
+        throw new Error("OMP runtime does not support conversation session switching");
       await this.#waitUntilSessionMutable(runtime, "switch conversation sessions");
       const switched = await runtime.switchSession(binding.ompSessionPath);
       if (!switched) throw new Error(`OMP cancelled the session switch for ${binding.ompSessionPath}`);
@@ -468,7 +511,8 @@ export class GatewayApplication {
     if (!this.#isTopicAddress(message.address)) {
       const sharedSession = this.#sharedSessionFile ?? store.getSharedConversationSessionPath?.();
       if (sharedSession === undefined || sharedSession === currentSession) return;
-      if (runtime.switchSession === undefined) throw new Error("OMP runtime does not support conversation session switching");
+      if (runtime.switchSession === undefined)
+        throw new Error("OMP runtime does not support conversation session switching");
       await this.#waitUntilSessionMutable(runtime, "switch to the shared session");
       const switched = await runtime.switchSession(sharedSession);
       if (!switched) throw new Error(`OMP cancelled the session switch for ${sharedSession}`);
@@ -545,7 +589,10 @@ export class GatewayApplication {
     if (principal === undefined || principal.id !== job.principalId || core === undefined) return;
     await core.send(
       job.address,
-      { text: `Scheduled job "${job.name}" failed after ${this.#config.automation.maxAttempts} attempts: ${error.message}`, format: "text" },
+      {
+        text: `Scheduled job "${job.name}" failed after ${this.#config.automation.maxAttempts} attempts: ${error.message}`,
+        format: "text",
+      },
       { principal, origin: job.address },
     );
   }
@@ -571,7 +618,9 @@ export class GatewayApplication {
 
   async #stopResources(lockHeld = true): Promise<unknown> {
     let firstError: unknown;
-    const remember = (error: unknown): void => { firstError ??= error; };
+    const remember = (error: unknown): void => {
+      firstError ??= error;
+    };
     this.#dispatchAbort?.abort();
     this.#dispatchAbort = undefined;
     this.#releaseDispatchReady?.();
@@ -592,6 +641,15 @@ export class GatewayApplication {
     if (core !== undefined) {
       try {
         await core.stop();
+      } catch (error) {
+        remember(error);
+      }
+    }
+    const ingressComposer = this.#ingressComposer;
+    this.#ingressComposer = undefined;
+    if (ingressComposer !== undefined) {
+      try {
+        ingressComposer.stop();
       } catch (error) {
         remember(error);
       }
@@ -683,12 +741,15 @@ function requireScheduledStore(store: GatewayApplicationStore): GatewayScheduled
     "deleteScheduledJob",
   ] as const;
   for (const method of methods) {
-    if (typeof store[method] !== "function") throw new Error(`OmpClaw store does not support automation method ${method}`);
+    if (typeof store[method] !== "function")
+      throw new Error(`OmpClaw store does not support automation method ${method}`);
   }
   return store as GatewayScheduledJobStore;
 }
 
-function isTurnLifecycleStore(store: GatewayApplicationStore): store is GatewayApplicationStore & GatewayTurnLifecycleStore {
+function isTurnLifecycleStore(
+  store: GatewayApplicationStore,
+): store is GatewayApplicationStore & GatewayTurnLifecycleStore {
   return (
     typeof store.putTurnLifecycle === "function" &&
     typeof store.interruptActiveTurns === "function" &&

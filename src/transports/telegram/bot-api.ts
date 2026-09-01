@@ -1,12 +1,5 @@
 import { randomBytes } from "node:crypto";
-import {
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
@@ -20,7 +13,8 @@ const RETRY_CAP_MS = 15_000;
 const OWNER_FILENAME = "owner.json";
 const CLAIM_GRACE_MS = 2_000;
 const PROCESS_NONCE = randomBytes(16).toString("hex");
-const NETWORK_FAILURE = /connection|socket|network|fetch failed|econn|enotfound|eai_again|unable to connect|unexpected eof/i;
+const NETWORK_FAILURE =
+  /connection|socket|network|fetch failed|econn|enotfound|eai_again|unable to connect|unexpected eof/i;
 
 export interface Logger {
   debug(message: string): void;
@@ -105,6 +99,8 @@ export type TgMessage = Readonly<{
   sticker?: TgSticker;
   message_thread_id?: number;
   is_topic_message?: boolean;
+  media_group_id?: string;
+  edit_date?: number;
   edited_flag?: boolean;
 }>;
 
@@ -137,7 +133,7 @@ export type TgFile = Readonly<{
 }>;
 
 function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
+  return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
 function abortValue(signal: AbortSignal): unknown {
@@ -236,7 +232,10 @@ function retryDelay(error: unknown, attempt: number): number | undefined {
     if (error.code === 408 || error.code >= 500) return Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_CAP_MS);
     return undefined;
   }
-  if (error instanceof Error && (error.name === "TimeoutError" || NETWORK_FAILURE.test(`${error.name}: ${error.message}`))) {
+  if (
+    error instanceof Error &&
+    (error.name === "TimeoutError" || NETWORK_FAILURE.test(`${error.name}: ${error.message}`))
+  ) {
     return Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_CAP_MS);
   }
   return undefined;
@@ -247,10 +246,14 @@ async function pause(ms: number, signal?: AbortSignal): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(resolve, ms);
     timer.unref?.();
-    signal?.addEventListener("abort", () => {
-      clearTimeout(timer);
-      reject(abortValue(signal));
-    }, { once: true });
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(abortValue(signal));
+      },
+      { once: true },
+    );
   });
 }
 
@@ -275,9 +278,11 @@ export async function withTelegramRetry<T>(
           options.sleep(wait),
           ...(options.signal === undefined
             ? []
-            : [new Promise<never>((_resolve, reject) => {
-              options.signal!.addEventListener("abort", () => reject(abortValue(options.signal!)), { once: true });
-            })]),
+            : [
+                new Promise<never>((_resolve, reject) => {
+                  options.signal!.addEventListener("abort", () => reject(abortValue(options.signal!)), { once: true });
+                }),
+              ]),
         ]);
       } else {
         await pause(wait, options.signal);
@@ -287,16 +292,22 @@ export async function withTelegramRetry<T>(
 }
 
 export function isMissingThreadError(error: unknown): boolean {
-  return error instanceof TgError
-    && error.code === 400
-    && /message thread not found|topic_id_invalid/i.test(error.message);
+  return (
+    error instanceof TgError && error.code === 400 && /message thread not found|topic_id_invalid/i.test(error.message)
+  );
 }
 
 export async function webhookConflictHint(token: string): Promise<string | undefined> {
   try {
-    const info = await tg<{ url?: unknown; pending_update_count?: unknown }>(token, "getWebhookInfo", {}, { timeoutMs: 10_000 });
+    const info = await tg<{ url?: unknown; pending_update_count?: unknown }>(
+      token,
+      "getWebhookInfo",
+      {},
+      { timeoutMs: 10_000 },
+    );
     if (typeof info.url !== "string" || info.url.length === 0) return undefined;
-    const pending = typeof info.pending_update_count === "number" ? ` (${info.pending_update_count} queued update(s))` : "";
+    const pending =
+      typeof info.pending_update_count === "number" ? ` (${info.pending_update_count} queued update(s))` : "";
     return `Telegram webhook ${info.url} is active${pending}; remove it before using long polling.`;
   } catch {
     return undefined;
@@ -465,11 +476,16 @@ export class Poller {
     let conflicts = 0;
     while (this.#active && !signal.aborted) {
       try {
-        const updates = await tg<readonly TgUpdate[]>(token, "getUpdates", {
-          offset,
-          timeout: 30,
-          allowed_updates: ["message", "edited_message", "callback_query", "stopped_message_generation"],
-        }, { timeoutMs: 35_000, signal });
+        const updates = await tg<readonly TgUpdate[]>(
+          token,
+          "getUpdates",
+          {
+            offset,
+            timeout: 30,
+            allowed_updates: ["message", "edited_message", "callback_query", "stopped_message_generation"],
+          },
+          { timeoutMs: 35_000, signal },
+        );
         failures = 0;
         conflicts = 0;
         for (const update of updates) {
@@ -483,7 +499,9 @@ export class Poller {
           conflicts += 1;
           if (conflicts % 8 === 0) {
             const hint = await webhookConflictHint(token);
-            log?.warn(`[telegram] ${hint ?? "Telegram rejected long polling because another poller or webhook is active; retrying."}`);
+            log?.warn(
+              `[telegram] ${hint ?? "Telegram rejected long polling because another poller or webhook is active; retrying."}`,
+            );
           }
         } else {
           conflicts = 0;
