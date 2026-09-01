@@ -572,8 +572,9 @@ export class RpcGatewayRuntime {
     for (const key of Object.keys(childEnv)) {
       if (key.startsWith("GATEWAY_") || key.startsWith("OMPCLAW_") || key.startsWith("OMP_GATEWAY_") || key.startsWith("OMP_TRANSPORT_") || key.startsWith("OMP_WEBSOCKET_") || key.startsWith("WEBSOCKET_")) delete childEnv[key];
     }
-    const rpc = this.#options.createRpcClient?.({ argv, cwd: config.cwd, env: childEnv })
-      ?? new OmpRpcClient({ argv, cwd: config.cwd, env: childEnv });
+    const rpc = this.#options.createRpcClient
+      ? this.#options.createRpcClient({ argv, cwd: config.cwd, env: childEnv })
+      : new OmpRpcClient({ argv, cwd: config.cwd, env: childEnv });
     rpc.onFrame((frame) => {
       const handled = this.#frameQueue.then(() => this.#handleRpcFrame(frame));
       this.#frameQueue = handled.catch((error: unknown) => {
