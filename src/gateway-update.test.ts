@@ -70,7 +70,7 @@ describe("transactional gateway updates", () => {
       runCommand: async (argv) => {
         commands.push([...argv]);
         if (argv[1] === "rev-parse") return COMMIT_B;
-        if (argv[1] === "show") return JSON.stringify({ version: "0.9.2" });
+        if (argv[1] === "show") return JSON.stringify({ version: "0.10.0" });
         throw new Error(`unexpected command: ${argv.join(" ")}`);
       },
     });
@@ -86,7 +86,7 @@ describe("transactional gateway updates", () => {
     const repository = join(root, "repository");
     const stateDir = join(root, "state");
     mkdirSync(repository, { recursive: true });
-    const existing = createRelease(stateDir, "0.9.2-bbbbbbbbbbbb", COMMIT_B);
+    const existing = createRelease(stateDir, "0.10.0-bbbbbbbbbbbb", COMMIT_B);
     const coordinator = new GatewayUpdateCoordinator({
       config: { enabled: true, repository, healthTimeoutMs: 30_000 },
       stateDir,
@@ -95,7 +95,7 @@ describe("transactional gateway updates", () => {
       },
       runCommand: async (argv) => {
         if (argv[1] === "rev-parse") return COMMIT_B;
-        if (argv[1] === "show") return JSON.stringify({ version: "0.9.2" });
+        if (argv[1] === "show") return JSON.stringify({ version: "0.10.0" });
         throw new Error(`unexpected command: ${argv.join(" ")}`);
       },
     });
@@ -256,7 +256,7 @@ describe("transactional gateway updates", () => {
       async finalize() {
         return [];
       },
-      async react() {},
+      react: async () => undefined,
       async presentUi() {
         throw new Error("not used");
       },
