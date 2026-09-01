@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   GatewayUpdateCoordinator,
+  MIN_GATEWAY_UPDATE_FREE_BYTES,
   currentGatewayRelease,
   gatewayUpdatePaths,
   readUpdateRequest,
@@ -56,6 +57,58 @@ afterEach(() => {
 });
 
 describe("transactional gateway updates", () => {
+  test("rejects a new release before build when staging space is below the minimum", async () => {
+    const root = temporaryDirectory();
+    const repository = join(root, "repository");
+    const stateDir = join(root, "state");
+    mkdirSync(repository, { recursive: true });
+    const commands: string[][] = [];
+    const coordinator = new GatewayUpdateCoordinator({
+      config: { enabled: true, repository, healthTimeoutMs: 30_000 },
+      stateDir,
+      getAvailableBytes: () => MIN_GATEWAY_UPDATE_FREE_BYTES - 1024n * 1024n * 1024n,
+      runCommand: async (argv) => {
+        commands.push([...argv]);
+        if (argv[1] === "rev-parse") return COMMIT_B;
+        if (argv[1] === "show") return JSON.stringify({ version: "0.9.2" });
+        throw new Error(`unexpected command: ${argv.join(" ")}`);
+      },
+    });
+
+    await expect(coordinator.stage(COMMIT_B)).rejects.toThrow(
+      "3.0 GiB available, 4.0 GiB required",
+    );
+    expect(commands).toHaveLength(2);
+  });
+
+  test("reuses an existing release without requiring staging headroom", async () => {
+    const root = temporaryDirectory();
+    const repository = join(root, "repository");
+    const stateDir = join(root, "state");
+    mkdirSync(repository, { recursive: true });
+    const existing = createRelease(stateDir, "0.9.2-bbbbbbbbbbbb", COMMIT_B);
+    const coordinator = new GatewayUpdateCoordinator({
+      config: { enabled: true, repository, healthTimeoutMs: 30_000 },
+      stateDir,
+      getAvailableBytes: () => {
+        throw new Error("disk check must not run for an existing release");
+      },
+      runCommand: async (argv) => {
+        if (argv[1] === "rev-parse") return COMMIT_B;
+        if (argv[1] === "show") return JSON.stringify({ version: "0.9.2" });
+        throw new Error(`unexpected command: ${argv.join(" ")}`);
+      },
+    });
+
+    const result = await coordinator.stage(COMMIT_B);
+    expect(result.reused).toBe(true);
+    expect(result.release).toMatchObject({
+      id: existing.id,
+      commit: existing.commit,
+      version: existing.version,
+    });
+  });
+
   test("arms an inactive release and commits only after the turn", async () => {
     const root = temporaryDirectory();
     const repository = join(root, "repository");

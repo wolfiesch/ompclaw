@@ -13,6 +13,11 @@ import {
 import { GatewayApplication } from "./gateway-app";
 import { GatewayStore, type LegacyTelegramStateImportResult } from "./gateway-store";
 import {
+  availableFilesystemBytes,
+  formatBinaryBytes,
+  MIN_GATEWAY_UPDATE_FREE_BYTES,
+} from "./gateway-update";
+import {
   installRpcService,
   resolveGatewayServicePaths,
   uninstallRpcService,
@@ -60,6 +65,7 @@ export interface GatewayCliSeams {
   readonly createStore?: (path: string) => GatewayStore;
   readonly createDoctorRpc?: (options: OmpRpcClientOptions) => GatewayDoctorRpc;
   readonly callTelegram?: GatewayTelegramCall;
+  readonly getAvailableBytes?: (path: string) => bigint;
   readonly installService?: (config: GatewayConfig, configPath: string, envFile: string) => ServiceInstallResult | Promise<ServiceInstallResult>;
   readonly uninstallService?: () => ServiceInstallResult;
   readonly write?: (line: string) => void;
@@ -230,6 +236,18 @@ export async function doctor(config: GatewayConfig, seams: GatewayCliSeams = {})
   }
 
   const write = seams.write ?? console.log;
+  if (config.updates.enabled) {
+    const availableBytes = (seams.getAvailableBytes ?? availableFilesystemBytes)(config.stateDir);
+    write(
+      `Update storage: ${formatBinaryBytes(availableBytes)} free at ${config.stateDir} (${formatBinaryBytes(MIN_GATEWAY_UPDATE_FREE_BYTES)} staging minimum)`,
+    );
+    if (availableBytes < MIN_GATEWAY_UPDATE_FREE_BYTES) {
+      throw new Error(
+        `Transactional update staging requires ${formatBinaryBytes(MIN_GATEWAY_UPDATE_FREE_BYTES)} free at ${config.stateDir}; ${formatBinaryBytes(availableBytes)} is available. Free disk space or move stateDir, then retry`,
+      );
+    }
+  }
+
   const telegram = config.transports.telegram;
   if (telegram?.enabled) {
     const callTelegram = seams.callTelegram ?? tg;

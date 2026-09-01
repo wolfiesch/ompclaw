@@ -8,6 +8,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statfsSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -24,6 +25,8 @@ const UPDATE_SCHEMA = 1;
 const RELEASE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const COMMIT_ID = /^[0-9a-f]{40,64}$/;
 const POLL_INTERVAL_MS = 250;
+
+export const MIN_GATEWAY_UPDATE_FREE_BYTES = 4n * 1024n * 1024n * 1024n;
 
 export interface GatewayUpdateOrigin {
   readonly address: ConversationAddress;
@@ -88,6 +91,7 @@ export interface GatewayUpdateCoordinatorOptions {
   readonly runCommand?: GatewayUpdateCommandRunner;
   readonly now?: () => Date;
   readonly activationEnabled?: boolean | (() => boolean);
+  readonly getAvailableBytes?: (path: string) => bigint;
 }
 
 export class GatewayUpdateCoordinator implements GatewayUpdateControl {
@@ -96,6 +100,7 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
   readonly #runCommand: GatewayUpdateCommandRunner;
   readonly #now: () => Date;
   readonly #activationEnabled: () => boolean;
+  readonly #getAvailableBytes: (path: string) => bigint;
   #watchAbort: AbortController | undefined;
 
   constructor(options: GatewayUpdateCoordinatorOptions) {
@@ -105,6 +110,7 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
     this.#config = options.config;
     this.#paths = gatewayUpdatePaths(options.stateDir);
     this.#runCommand = options.runCommand ?? runUpdateCommand;
+    this.#getAvailableBytes = options.getAvailableBytes ?? availableFilesystemBytes;
     const activationEnabled = options.activationEnabled;
     this.#activationEnabled = typeof activationEnabled === "function"
       ? activationEnabled
@@ -136,6 +142,13 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
       const existing = readReleaseManifest(releasePath);
       if (existing.commit !== resolvedCommit) throw new Error(`Release directory ${id} does not match commit ${resolvedCommit}`);
       return { release: existing, reused: true };
+    }
+
+    const availableBytes = this.#getAvailableBytes(this.#paths.root);
+    if (availableBytes < MIN_GATEWAY_UPDATE_FREE_BYTES) {
+      throw new Error(
+        `Insufficient free disk space to stage OmpClaw release ${id}: ${formatBinaryBytes(availableBytes)} available, ${formatBinaryBytes(MIN_GATEWAY_UPDATE_FREE_BYTES)} required at ${this.#paths.root}. Free disk space or move stateDir, then retry`,
+      );
     }
 
     const staging = join(this.#paths.root, `.staging-${randomUUID()}`);
@@ -394,6 +407,16 @@ export async function runUpdateCommand(argv: readonly string[], cwd: string, sig
       rejectPromise(new Error(`${argv[0]} exited ${code ?? closeSignal ?? "unknown"}${detail ? `: ${detail}` : ""}`));
     });
   });
+}
+
+export function availableFilesystemBytes(path: string): bigint {
+  const stats = statfsSync(path, { bigint: true });
+  return stats.bavail * stats.bsize;
+}
+
+export function formatBinaryBytes(bytes: bigint): string {
+  const gibibytes = Number(bytes) / (1024 ** 3);
+  return `${(Math.floor(gibibytes * 10) / 10).toFixed(1)} GiB`;
 }
 
 function updateBuildEnvironment(): NodeJS.ProcessEnv {

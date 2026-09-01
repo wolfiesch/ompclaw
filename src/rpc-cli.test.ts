@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { loadGatewayCliConfig, parseGatewayCliArgs } from "./rpc-cli";
+import { doctor, loadGatewayCliConfig, parseGatewayCliArgs } from "./rpc-cli";
 
 const directories: string[] = [];
 
@@ -64,5 +64,39 @@ describe("gateway CLI environment loading", () => {
       "Environment file does not define required gateway credential OMPCLAW_WS_TOKEN",
     );
     expect(env).toEqual({ OMPCLAW_WS_TOKEN: "ambient-secret" });
+  });
+});
+
+describe("gateway doctor", () => {
+  test("reports actionable update storage failure before starting OMP", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-doctor-"));
+    directories.push(directory);
+    const configPath = join(directory, "config.json");
+    const stateDir = join(directory, "state");
+    writeFileSync(configPath, JSON.stringify({
+      workspace: directory,
+      stateDir,
+      transports: {},
+      updates: {
+        enabled: true,
+        repository: directory,
+        healthTimeoutMs: 30_000,
+      },
+    }));
+    const config = loadGatewayCliConfig(parseGatewayCliArgs(["doctor", "--config", configPath]));
+    const lines: string[] = [];
+
+    await expect(doctor(config, {
+      getAvailableBytes: () => 3n * 1024n * 1024n * 1024n,
+      write: (line) => lines.push(line),
+      createDoctorRpc: () => {
+        throw new Error("OMP must not start after a failed storage preflight");
+      },
+    })).rejects.toThrow(
+      `Transactional update staging requires 4.0 GiB free at ${stateDir}; 3.0 GiB is available. Free disk space or move stateDir, then retry`,
+    );
+    expect(lines).toEqual([
+      `Update storage: 3.0 GiB free at ${stateDir} (4.0 GiB staging minimum)`,
+    ]);
   });
 });

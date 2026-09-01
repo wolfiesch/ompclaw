@@ -174,6 +174,8 @@ Run `service-install` again after enabling updates. The installer resolves `HEAD
 
 An authenticated principal with the `operator` role can ask OMP to stage one exact commit. OMP receives `ompclaw_stage_update`, which resolves the commit in the fixed repository, exports only tracked files for that commit, installs dependencies with lifecycle scripts disabled, runs `bun run check`, and compiles isolated gateway and supervisor executables. Staging does not alter the running service.
 
+Staging a new release requires 4 GiB of free space on the filesystem containing `stateDir`. The preflight runs before creating the archive, dependency cache, or compiled artifacts. `doctor`, `service-install`, and `ompclaw_stage_update` report the available and required space with the affected path. Reusing an already staged immutable release does not require another build.
+
 Activation is a separate explicit request through `ompclaw_activate_update` using the staged release ID. The gateway records the candidate, the previous release, and the server-derived conversation route, then finishes and delivers the active Telegram turn. Only after that turn ends does it commit the restart request.
 
 The supervisor switches the `current` symlink atomically, starts the candidate, and waits for the candidate to finish gateway startup. A ready candidate becomes the active release. A candidate that exits or misses `healthTimeoutMs` is stopped, the symlink is restored to the previous release, and the previous release is restarted. Success or rollback is delivered to the same authenticated conversation after restart.
@@ -307,7 +309,7 @@ ompclaw doctor \
   --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
-`doctor` resolves all enabled transport secrets, opens the SQLite store, verifies Telegram's bot identity and the absence of a webhook when Telegram is enabled, starts a short OMP RPC child, requests session state, then stops that child. A successful run ends with `Doctor: ready`.
+`doctor` resolves all enabled transport secrets, opens the SQLite store, checks transactional-update storage when updates are enabled, verifies Telegram's bot identity and the absence of a webhook when Telegram is enabled, starts a short OMP RPC child, requests session state, then stops that child. A successful run ends with `Doctor: ready`. A storage failure names the available space, the 4 GiB staging minimum, the affected `stateDir`, and the recovery choices.
 
 Run in the foreground during setup:
 
