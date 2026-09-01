@@ -1,10 +1,14 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import type { PairingRequestState, StoredPairingRequest } from "./gateway-store";
-import type { GatewayStore } from "./gateway-store";
+import type {
+ PairingRequestState,
+ StoredPairingRequest,
+ GatewayStore,
+} from "./gateway-store";
 import type { ConversationAddress, TransportIdentity } from "./gateway-types";
 
 export const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1_000;
 export const MAX_PAIRING_ATTEMPTS = 5;
+export const MAX_PENDING_PAIRING_REQUESTS_PER_ACCOUNT = 3;
 
 export type { PairingRequestState };
 
@@ -35,6 +39,10 @@ export interface PairingRequestResult {
  /** Present only at request creation; never persisted or returned from list/resolve methods. */
  readonly code: string;
 }
+export type RuntimePairingRequestResult =
+ | { readonly status: "created"; readonly result: PairingRequestResult }
+ | { readonly status: "capacity" };
+
 
 export interface PairingSecrets {
  createCode(): string;
@@ -47,6 +55,17 @@ export interface GatewayPairingServiceOptions {
  readonly secrets?: PairingSecrets;
  readonly principalIdForIdentity?: (identity: TransportIdentity) => string;
 }
+export type GatewayPairingPersistence = Pick<
+ GatewayStore,
+ | "upsertPairingRequest"
+ | "expirePairingRequests"
+ | "listPairingRequests"
+ | "recordPairingFailures"
+ | "approvePairingRequest"
+ | "rejectPairingRequest"
+ | "clearPairingRequests"
+>;
+
 
 function requiredText(value: unknown, context: string): asserts value is string {
  if (typeof value !== "string" || value.length === 0) throw new Error(`${context} must not be empty`);
@@ -124,9 +143,9 @@ const defaultSecrets: PairingSecrets = {
  * boundary so code salts and hashes cannot escape into setup or UI layers.
  */
 export class GatewayPairingStore {
- readonly #store: GatewayStore;
+ readonly #store: GatewayPairingPersistence;
 
- constructor(store: GatewayStore) {
+ constructor(store: GatewayPairingPersistence) {
   this.#store = store;
  }
 
@@ -224,7 +243,7 @@ export class GatewayPairingService {
  readonly #secrets: PairingSecrets;
  readonly #principalIdForIdentity: (identity: TransportIdentity) => string;
 
- constructor(store: GatewayStore | GatewayPairingStore, options: GatewayPairingServiceOptions = {}) {
+ constructor(store: GatewayPairingPersistence | GatewayPairingStore, options: GatewayPairingServiceOptions = {}) {
   this.#store = store instanceof GatewayPairingStore ? store : new GatewayPairingStore(store);
   this.#ttlMs = options.ttlMs ?? DEFAULT_PAIRING_TTL_MS;
   this.#maxAttempts = options.maxAttempts ?? MAX_PAIRING_ATTEMPTS;
@@ -246,6 +265,31 @@ export class GatewayPairingService {
    code,
   };
  }
+ /**
+  * Creates or rotates a private-chat challenge while bounding unresolved
+  * identities per Telegram account. Existing identities may rotate their own
+  * code without consuming another slot.
+  */
+ requestFromTransport(
+  identity: TransportIdentity,
+  address: ConversationAddress,
+  now = Date.now(),
+ ): RuntimePairingRequestResult {
+  const pending = this.list(now).filter(
+   (request) => request.state === "pending" && request.identity.account === identity.account,
+  );
+  const existing = pending.some(
+   (request) =>
+    request.identity.transport === identity.transport &&
+    request.identity.account === identity.account &&
+    request.identity.subject === identity.subject,
+  );
+  if (!existing && pending.length >= MAX_PENDING_PAIRING_REQUESTS_PER_ACCOUNT) {
+   return { status: "capacity" };
+  }
+  return { status: "created", result: this.request(identity, address, now) };
+ }
+
 
  list(now = Date.now()): PairingRequestView[] {
   return this.#store.list(now);

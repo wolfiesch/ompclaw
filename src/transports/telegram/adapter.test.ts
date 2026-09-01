@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PairingRequestView } from "../../gateway-pairing";
 import type { Principal } from "../../gateway-types";
 import type { SemanticView } from "../../gateway-views";
 import { TgError } from "./bot-api";
@@ -144,15 +145,15 @@ describe("Telegram transport lifecycle", () => {
       stateDir,
       store: {
         getCheckpoint: () => undefined,
-        setCheckpoint: () => {},
-        putPendingInteraction: () => {},
-        deletePendingInteraction: () => {},
+        setCheckpoint: () => { },
+        putPendingInteraction: () => { },
+        deletePendingInteraction: () => { },
         listPendingInboundMessages: () => [],
         listPendingIngressCompositions: () => [],
       },
       api: { acquireLock: () => ({ ok: false, holder: 912 }) },
     });
-    await expect(adapter.start({ receive: async () => {}, resolveIdentity: () => owner })).rejects.toThrow(
+    await expect(adapter.start({ receive: async () => { }, resolveIdentity: () => owner })).rejects.toThrow(
       "process 912",
     );
   });
@@ -278,6 +279,85 @@ describe("Telegram inbound conversion", () => {
       text: "Quoted caption",
       isBot: true,
     });
+  });
+
+  test("pairs an unresolved private sender without dispatching the challenge message", async () => {
+    const requests: PairingRequestView[] = [];
+    let pairedPrincipal: Principal | undefined;
+    const pairing = {
+      requestFromTransport: (
+        identity: PairingRequestView["identity"],
+        address: PairingRequestView["address"],
+        createdAt: number,
+      ) => {
+        const request: PairingRequestView = {
+          identity,
+          address,
+          state: "pending",
+          failedAttempts: 0,
+          maxAttempts: 5,
+          createdAt,
+          expiresAt: createdAt + 600_000,
+        };
+        requests.splice(0, requests.length, request);
+        return { status: "created" as const, result: { code: "ABCD2345", request } };
+      },
+      list: () => requests,
+    };
+    const harness = await fixture({
+      pairing,
+      resolve: () => pairedPrincipal,
+    });
+
+    await harness.adapter.handleUpdate({
+      update_id: 7,
+      message: message({ from: { id: 99 }, text: "hello" }),
+    });
+
+    expect(harness.received).toEqual([]);
+    expect(sentMessage(harness.calls).payload.text).toContain("Pairing code: ABCD2345");
+    expect(sentMessage(harness.calls).payload.text).toContain("ompclaw pairing-approve ABCD2345");
+
+    pairedPrincipal = { id: "operator:telegram:primary:99", roles: ["operator"] };
+    requests[0] = {
+      ...requests[0]!,
+      state: "approved",
+      resolvedAt: 1_800_000_000_001,
+      principalId: pairedPrincipal.id,
+    };
+    await harness.flushPairingApprovals();
+    expect(sentMessage(harness.calls).payload.text).toBe("Paired. Send your first task.");
+
+    const confirmationCount = harness.calls.filter(
+      (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
+    ).length;
+    await harness.flushPairingApprovals();
+    expect(
+      harness.calls.filter(
+        (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
+      ),
+    ).toHaveLength(confirmationCount);
+  });
+
+  test("keeps unresolved group senders silent when runtime pairing is enabled", async () => {
+    let pairingRequests = 0;
+    const { adapter, calls, received } = await fixture({
+      resolve: () => undefined,
+      pairing: {
+        requestFromTransport: () => {
+          pairingRequests += 1;
+          return { status: "capacity" as const };
+        },
+        list: () => [],
+      },
+    });
+    await adapter.handleUpdate({
+      update_id: 7,
+      message: message({ from: { id: 99 }, text: "hello", chat: { id: -100, type: "group" } }),
+    });
+    expect(pairingRequests).toBe(0);
+    expect(received).toEqual([]);
+    expect(calls.some((entry) => entry.method === "sendMessage")).toBe(false);
   });
 
   test("answers identity help locally for an unresolved user", async () => {

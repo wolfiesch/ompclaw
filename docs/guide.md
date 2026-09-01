@@ -56,7 +56,10 @@ ompclaw pairing-listen \
   --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
-The command prints a new code and local approval command. Operational commands:
+The command prints a new code and local approval command. A running gateway
+provides the normal path: an unknown private sender receives a pairing code and
+the exact local approval command in Telegram. Approval is still performed only
+on the gateway host:
 
 ```text
 ompclaw pairing-list
@@ -65,10 +68,12 @@ ompclaw pairing-reject <code>
 ompclaw pairing-clear
 ```
 
-`pairing-list` never returns a code or code hash. `pairing-clear` removes all
-pairing request records without changing approved principal bindings.
-Use `telegram-allow` only for deliberate manual binding or legacy recovery when
-the numeric Telegram user ID has been independently verified.
+After approval, the bot confirms the binding in the originating chat. The next
+message enters the normal OMP conversation. `pairing-list` never returns a code
+or code hash. `pairing-clear` removes all pairing request records without
+changing approved principal bindings. Use `telegram-allow` only for deliberate
+manual binding or legacy recovery when the numeric Telegram user ID has been
+independently verified.
 
 ## Architecture and persistence
 
@@ -280,19 +285,22 @@ OmpClaw presents routine Telegram turns as a conversation rather than a command 
 - Voice notes and video notes are transcribed as ordinary user speech when `transcribeCommand` is configured. The bot acknowledges receipt with a reaction, or a short message when reactions are unavailable. Replies remain text.
 These behaviors need no additional configuration. OMP still controls the response content, reasoning mode, tools, approvals, memory, and session history.
 
-Pairing is an explicit local authorization operation. With the gateway stopped,
-listen for one direct message and then run the approval command printed locally:
+Pairing requires local approval but does not require stopping the running
+gateway. An unknown sender messages the bot privately and receives a short-lived
+pairing code plus the local command:
 
 ```bash
-ompclaw pairing-listen \
-  --config ~/.config/ompclaw/config.json \
-  --env-file ~/.config/ompclaw/ompclaw.env
+ompclaw pairing-approve ABC234 \
+  --config ~/.config/ompclaw/config.json
 ```
 
-Approving the code creates or updates an `operator` principal and binds the exact
-Telegram identity for the configured account. To use a custom principal ID, pass
-it after the code. Use `principal-add` and `identity-bind` for custom roles or
-non-Telegram identities.
+The gateway notices the committed approval, confirms it in the originating
+Telegram chat, and accepts the user's next message. With the gateway stopped,
+`pairing-listen` remains available as the bootstrap path and prints the code
+only on the gateway host. Approving the code creates or updates an `operator`
+principal and binds the exact Telegram identity for the configured account. To
+use a custom principal ID, pass it after the code. Use `principal-add` and
+`identity-bind` for custom roles or non-Telegram identities.
 
 Existing forum topics get separate sessions when `topicSessions.enabled` is true. Non-topic Telegram chats and WebSocket credentials continue to share the gateway's root OMP session. Set `createFromRoot` to true to turn an authorized root message into a newly named topic and route that same turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Telegram requires the bot to be a supergroup administrator with permission to manage topics. Topic creation is idempotent across update retries.
 

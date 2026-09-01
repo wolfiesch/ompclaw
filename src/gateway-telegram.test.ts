@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayApplication, type GatewayRuntime } from "./gateway-app";
 import { parseGatewayConfig } from "./gateway-config";
+import { GatewayPairingService } from "./gateway-pairing";
 import { GatewayStore } from "./gateway-store";
 import type { InboundMessage } from "./gateway-types";
 import type { RpcGatewayRuntimeOptions } from "./rpc-runtime";
@@ -87,7 +88,7 @@ async function scenario(authorized = true): Promise<GatewayTelegramScenario> {
             sessionFile: "/sessions/telegram-harness.jsonl",
           });
         },
-        async stop() {},
+        async stop() { },
         canHandleInboundImmediately: () => true,
         async handleInbound(message) {
           handled.push(message);
@@ -102,8 +103,8 @@ async function scenario(authorized = true): Promise<GatewayTelegramScenario> {
         },
       }),
       acquireLock: () => ({ ok: true }),
-      releaseLock: () => {},
-      startLockHeartbeat: () => () => {},
+      releaseLock: () => { },
+      startLockHeartbeat: () => () => { },
       now: Date.now,
     },
   });
@@ -144,13 +145,31 @@ describe("Gateway Telegram scenario harness", () => {
     await harness.app.stop();
   });
 
-  test("drops an unbound sender before the runtime and outbound delivery", async () => {
+  test("pairs an unbound private sender locally before dispatching the next message", async () => {
     const harness = await scenario(false);
-    await harness.adapter.handleUpdate({ update_id: 51, message: telegramTestMessage({ text: "not authorized" }) });
+    await harness.adapter.handleUpdate({ update_id: 51, message: telegramTestMessage({ text: "first task" }) });
 
     expect(harness.handled).toEqual([]);
-    expect(harness.api.calls.some(({ method }) => method === "sendMessage")).toBe(false);
-    expect(harness.store.getCheckpoint("telegram", "update_id:primary")).toBe(51);
+    const challenge = harness.api.calls.findLast(({ method }) => method === "sendMessage");
+    const code = /Pairing code: ([A-Z0-9]+)/.exec(String(challenge?.payload.text))[1];
+    expect(code).toHaveLength(8);
+
+    expect(new GatewayPairingService(harness.store).approve(code, undefined, 1_800_000_000_001)).toEqual(
+      expect.objectContaining({ state: "approved", identity: telegramIdentity }),
+    );
+    await harness.api.flushPairingApprovals();
+    expect(harness.api.last("sendMessage").payload.text).toBe("Paired. Send your first task.");
+
+    await harness.adapter.handleUpdate({ update_id: 52, message: telegramTestMessage({ text: "second task" }) });
+    await harness.handledTurn;
+    expect(harness.handled).toEqual([
+      expect.objectContaining({
+        identity: telegramIdentity,
+        principal: expect.objectContaining({ roles: ["operator"] }),
+        content: { text: "second task" },
+      }),
+    ]);
+    expect(harness.store.getCheckpoint("telegram", "update_id:primary")).toBe(52);
     await harness.app.stop();
   });
 });
