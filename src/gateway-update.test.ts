@@ -256,7 +256,7 @@ describe("transactional gateway updates", () => {
       async finalize() {
         return [];
       },
-      async react() { },
+      react: async () => undefined,
       async presentUi() {
         throw new Error("not used");
       },
