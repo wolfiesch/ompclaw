@@ -76,6 +76,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:harness": "bun test src/gateway-telegram.test.ts src/transports/telegram/adapter.test.ts src/dev/telegram-canary.test.ts",
+    "test:telegram:live": "bun ./src/dev/telegram-canary.ts",
+    "test:remote": "bun ./src/dev/remote-check.ts",
     "check": "bun run typecheck && bun run test",
     "ompclaw": "bun ./src/rpc-cli.ts"
   },

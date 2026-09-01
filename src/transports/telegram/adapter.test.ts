@@ -2,179 +2,30 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import type { PendingInboundMessage, PendingInteraction } from "../../gateway-store";
-import type {
-  ConversationAddress,
-  DeliveryContext,
-  InboundEnvelope,
-  Principal,
-  TransportStartContext,
-} from "../../gateway-types";
-import { TgError, type TgMessage, type TgUpdate } from "./bot-api";
-import { TelegramTransportAdapter, type TelegramPoller } from "./adapter";
+import type { Principal } from "../../gateway-types";
+import { TgError } from "./bot-api";
+import { TelegramTransportAdapter } from "./adapter";
 import { telegramDraftId } from "./delivery";
 import { TELEGRAM_MAX_CHARS } from "./formatting";
+import {
+  TELEGRAM_TEST_ADDRESS as baseAddress,
+  TELEGRAM_TEST_DELIVERY as delivery,
+  TELEGRAM_TEST_OWNER as owner,
+  createTelegramAdapterHarness as fixture,
+  disposeTelegramAdapterHarnesses,
+  flushTelegramTasks as flush,
+  lastTelegramCall as sentMessage,
+  telegramCallbackData as callbackData,
+  telegramTestMessage as message,
+  type TelegramApiCall as ApiCall,
+} from "./test-harness";
 
-interface ApiCall {
-  readonly method: string;
-  readonly payload: Record<string, unknown>;
-}
-
-const owner: Principal = { id: "principal-owner", roles: ["operator"] };
-const baseAddress: ConversationAddress = {
-  transport: "telegram",
-  account: "primary",
-  channel: "42",
-};
-const delivery: DeliveryContext = { principal: owner, origin: baseAddress };
 const scratch: string[] = [];
 
 afterEach(async () => {
+  await disposeTelegramAdapterHarnesses();
   await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-class TestPoller implements TelegramPoller {
-  started = false;
-  stopped = false;
-  handle?: (update: TgUpdate) => void | Promise<void>;
-
-  start(_token: string, handle: (update: TgUpdate) => void | Promise<void>): void {
-    this.started = true;
-    this.handle = handle;
-  }
-  stop(): void {
-    this.stopped = true;
-  }
-  async done(): Promise<void> {}
-}
-
-async function fixture(options: {
-  readonly resolve?: (subject: string) => Principal | undefined;
-  readonly commands?: readonly { readonly command: string; readonly description: string }[];
-  readonly setCommandsError?: Error;
-  readonly transcribe?: boolean;
-  readonly createTopicsFromRoot?: boolean;
-  readonly failFirstReceive?: boolean;
-  readonly pendingAttachmentName?: string;
-  readonly receive?: (message: InboundEnvelope) => Promise<void>;
-} = {}) {
-  const stateDir = await mkdtemp(join(tmpdir(), options.pendingAttachmentName ? "ompclaw adapter " : "ompclaw-adapter-"));
-  scratch.push(stateDir);
-  const calls: ApiCall[] = [];
-  const received: InboundEnvelope[] = [];
-  const checkpoints = new Map<string, unknown>();
-  const pending = new Map<string, PendingInteraction>();
-  const pendingInbound: PendingInboundMessage[] = options.pendingAttachmentName === undefined ? [] : [{
-    message: {
-      id: "pending-message",
-      sentAt: 1_800_000_000_000,
-      identity: { transport: "telegram", account: "primary", subject: "42" },
-      address: baseAddress,
-      content: {
-        attachments: [{
-          url: pathToFileURL(join(stateDir, "inbox", options.pendingAttachmentName)).href,
-        }],
-      },
-      principal: owner,
-    },
-    receivedAt: 1_800_000_000_000,
-    scheduled: false,
-  }];
-  const warnings: string[] = [];
-  const poller = new TestPoller();
-  let messageId = 200;
-  const key = (adapter: string, checkpoint: string): string => `${adapter}\0${checkpoint}`;
-  const adapter = new TelegramTransportAdapter({
-    token: "token",
-    account: "primary",
-    stateDir,
-    commands: options.commands,
-    createTopicsFromRoot: options.createTopicsFromRoot,
-    store: {
-      getCheckpoint: (adapterId, checkpoint) => checkpoints.get(key(adapterId, checkpoint)),
-      setCheckpoint: (adapterId, checkpoint, value) => { checkpoints.set(key(adapterId, checkpoint), value); },
-      putPendingInteraction: (interaction) => { pending.set(interaction.id, interaction); },
-      deletePendingInteraction: (id) => { pending.delete(id); },
-      listPendingInboundMessages: () => pendingInbound,
-    },
-    logger: {
-      debug: () => {},
-      info: () => {},
-      warn: (message) => { warnings.push(message); },
-      error: () => {},
-    },
-    api: {
-      poller,
-      acquireLock: () => ({ ok: true }),
-      releaseLock: () => {},
-      startLockHeartbeat: () => () => {},
-      now: () => 1_800_000_000_000,
-      randomId: () => "interaction-id",
-      callTelegram: async (method, payload = {}) => {
-        calls.push({ method, payload });
-        if (method === "setMyCommands" && options.setCommandsError) throw options.setCommandsError;
-        if (method === "sendMessageDraft") return true;
-        if (method === "getFile") return { file_path: "uploads/file.bin" };
-        if (method === "createForumTopic") return { message_thread_id: 77 };
-        if (method === "sendMessage") return { message_id: ++messageId };
-        return true;
-      },
-      downloadFileBytes: async () => new Uint8Array([4, 5, 6]),
-      ...(options.transcribe ? { transcribe: async () => "voice transcript" } : {}),
-    },
-    ...(options.transcribe ? { transcribeCommand: ["speech-to-text"] } : {}),
-    uiTimeoutMs: 10_000,
-  });
-  let receiveAttempt = 0;
-  const context: TransportStartContext = {
-    receive: async (message) => {
-      receiveAttempt += 1;
-      if (options.failFirstReceive && receiveAttempt === 1) throw new Error("temporary receive failure");
-      await options.receive?.(message);
-      received.push(message);
-    },
-    resolveIdentity: (identity) => options.resolve?.(identity.subject) ?? (identity.subject === "42" ? owner : undefined),
-  };
-  await adapter.start(context);
-  return { adapter, calls, checkpoints, pending, poller, received, stateDir, warnings };
-}
-
-function message(overrides: Partial<TgMessage> = {}): TgMessage {
-  return {
-    message_id: 10,
-    date: 1_800_000_000,
-    chat: { id: 42, type: "private" },
-    from: { id: 42, first_name: "Wolfgang" },
-    text: "hello",
-    ...overrides,
-  };
-}
-
-function sentMessage(calls: readonly ApiCall[]): ApiCall {
-  const call = calls.findLast((entry) => entry.method === "sendMessage");
-  if (!call) throw new Error("expected sendMessage call");
-  return call;
-}
-
-function callbackData(call: ApiCall, label: string): string {
-  const markup = call.payload.reply_markup;
-  if (markup === null || typeof markup !== "object" || !("inline_keyboard" in markup) || !Array.isArray(markup.inline_keyboard)) {
-    throw new Error("expected inline keyboard");
-  }
-  for (const row of markup.inline_keyboard) {
-    if (!Array.isArray(row)) continue;
-    for (const button of row) {
-      if (button !== null && typeof button === "object" && "text" in button && button.text === label
-          && "callback_data" in button && typeof button.callback_data === "string") return button.callback_data;
-    }
-  }
-  throw new Error(`missing button ${label}`);
-}
-
-async function flush(): Promise<void> {
-  await Bun.sleep(0);
-}
 
 describe("Telegram transport lifecycle", () => {
   test("advertises the full gateway surface, registers commands, and stops polling", async () => {
@@ -247,14 +98,14 @@ describe("Telegram transport lifecycle", () => {
       stateDir,
       store: {
         getCheckpoint: () => undefined,
-        setCheckpoint: () => {},
-        putPendingInteraction: () => {},
-        deletePendingInteraction: () => {},
+        setCheckpoint: () => { },
+        putPendingInteraction: () => { },
+        deletePendingInteraction: () => { },
         listPendingInboundMessages: () => [],
       },
       api: { acquireLock: () => ({ ok: false, holder: 912 }) },
     });
-    await expect(adapter.start({ receive: async () => {}, resolveIdentity: () => owner })).rejects.toThrow("process 912");
+    await expect(adapter.start({ receive: async () => { }, resolveIdentity: () => owner })).rejects.toThrow("process 912");
   });
 });
 
