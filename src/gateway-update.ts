@@ -134,6 +134,7 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
     const source = join(staging, "source");
     const artifact = join(staging, "release");
     const archive = join(staging, "source.tar");
+    const cache = join(staging, "cache");
     mkdirSync(source, { recursive: true, mode: 0o700 });
     mkdirSync(artifact, { recursive: true, mode: 0o700 });
     try {
@@ -141,7 +142,7 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
       await this.#runCommand(["tar", "-xf", archive, "-C", source], repository, signal);
       const bun = Bun.which("bun");
       if (bun === null) throw new Error("bun is required to stage an OmpClaw update");
-      await this.#runCommand([bun, "install", "--frozen-lockfile", "--ignore-scripts"], source, signal);
+      await this.#runCommand([bun, "install", "--frozen-lockfile", "--ignore-scripts", "--cache-dir", cache], source, signal);
       await this.#runCommand([bun, "run", "check"], source, signal);
       await this.#runCommand([bun, "build", "--compile", "src/rpc-cli.ts", "--outfile", join(artifact, "ompclaw")], source, signal);
       await this.#runCommand([
