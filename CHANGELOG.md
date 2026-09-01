@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.9.1 (2026-09-01)
+
+### Fixed
+
+- Isolate RPC runtime tests from the concrete client module so test file order cannot leak a mock into Linux release builds.
+
 ## 0.9.0 (2026-09-01)
 
 ### Added
