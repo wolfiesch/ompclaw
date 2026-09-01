@@ -55,11 +55,9 @@ const PAIRING_APPROVAL_CHECK_MS = 1_000;
 function startPairingApprovalMonitor(run: () => void | Promise<void>): () => void {
   run();
   const timer = setInterval(run, PAIRING_APPROVAL_CHECK_MS);
-  timer.unref();
+  timer.unref?.();
   return () => clearInterval(timer);
 }
-
-
 
 type InteractiveRequest = Extract<UiRequest, { type: "confirm" | "select" | "input" | "editor" }>;
 type InteractiveResponse = Extract<UiResponse, { type: "confirm" | "select" | "input" | "editor" }>;

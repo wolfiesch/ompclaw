@@ -1089,11 +1089,11 @@ export class GatewayStore implements GatewaySemanticViewStore {
         "ALTER TABLE pending_inbound_messages ADD COLUMN scheduled INTEGER NOT NULL DEFAULT 0 CHECK (scheduled IN (0, 1))",
       );
     }
-  const pairingColumns = this.#database.query("PRAGMA table_info(pairing_requests)").all() as SqlRow[];
-  if (!pairingColumns.some((row) => row.name === "confirmation_delivered_at")) {
-   this.#database.exec("ALTER TABLE pairing_requests ADD COLUMN confirmation_delivered_at INTEGER");
-  }
-  this.#database.exec(`
+    const pairingColumns = this.#database.query("PRAGMA table_info(pairing_requests)").all() as SqlRow[];
+    if (!pairingColumns.some((row) => row.name === "confirmation_delivered_at")) {
+      this.#database.exec("ALTER TABLE pairing_requests ADD COLUMN confirmation_delivered_at INTEGER");
+    }
+    this.#database.exec(`
       CREATE INDEX IF NOT EXISTS pairing_requests_unconfirmed_approval
         ON pairing_requests (transport, account, created_at)
         WHERE state = 'approved' AND confirmation_delivered_at IS NULL
