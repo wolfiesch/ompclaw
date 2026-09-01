@@ -17,7 +17,6 @@ import {
   lastTelegramCall as sentMessage,
   telegramCallbackData as callbackData,
   telegramTestMessage as message,
-  type TelegramApiCall as ApiCall,
 } from "./test-harness";
 
 const scratch: string[] = [];
@@ -86,6 +85,20 @@ describe("Telegram transport lifecycle", () => {
       (error) => error,
     );
     expect(result).toBe(stopError);
+    await expect(access(harness.stateDir)).rejects.toThrow();
+    await expect(disposeTelegramAdapterHarnesses()).resolves.toBeUndefined();
+  });
+
+  test("preserves an undefined polling stop rejection", async () => {
+    const harness = await fixture();
+    harness.poller.stop = () => { throw undefined; };
+
+    const result = await harness.dispose().then(
+      () => ({ rejected: false, error: new Error("harness disposal unexpectedly resolved") }),
+      (error) => ({ rejected: true, error }),
+    );
+    expect(result.rejected).toBe(true);
+    expect(result.error).toBeUndefined();
     await expect(access(harness.stateDir)).rejects.toThrow();
     await expect(disposeTelegramAdapterHarnesses()).resolves.toBeUndefined();
   });

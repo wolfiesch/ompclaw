@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
   contents: read
@@ -105,8 +109,21 @@ jobs:
         with:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
-      - run: bun run check
-      - run: npm pack --dry-run
+      - run: bun run ci
+
+  workflow-lint:
+    name: actionlint
+    needs: classify
+    if: ${{ needs.classify.result == 'success' && needs.classify.outputs.lane == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
 
   verify:
     name: verify
@@ -115,6 +132,7 @@ jobs:
       - classify
       - policy
       - check
+      - workflow-lint
     runs-on: ubuntu-latest
     timeout-minutes: 3
     env:
@@ -122,6 +140,7 @@ jobs:
       LANE: ${{ needs.classify.outputs.lane }}
       POLICY_RESULT: ${{ needs.policy.result }}
       CHECK_RESULT: ${{ needs.check.result }}
+      WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
     steps:
       - name: Require the selected verification lane
         run: |
@@ -132,7 +151,7 @@ jobs:
           fi
           case "$LANE" in
             fast)
-              for result in "$POLICY_RESULT" "$CHECK_RESULT"; do
+              for result in "$POLICY_RESULT" "$CHECK_RESULT" "$WORKFLOW_LINT_RESULT"; do
                 if [[ "$result" != skipped ]]; then
                   echo "::error::Fast-lane job unexpectedly resolved to $result"
                   exit 1
@@ -141,7 +160,7 @@ jobs:
               echo "Fast-lane classification and public-text scan succeeded"
               ;;
             full)
-              for result in "$POLICY_RESULT" "$CHECK_RESULT"; do
+              for result in "$POLICY_RESULT" "$CHECK_RESULT" "$WORKFLOW_LINT_RESULT"; do
                 if [[ "$result" != success ]]; then
                   echo "::error::Required full-lane job resolved to $result"
                   exit 1
