@@ -134,19 +134,27 @@ ENV
 chmod 600 ~/.config/ompclaw/ompclaw.env
 ```
 
-Request Telegram pairing, send the bot a direct message while the listener is
-active, then run the local approval command it prints:
+When the gateway is running, an unknown user can pair without stopping the
+service: send the bot a direct message, copy the short-lived pairing code from
+its reply, and run the local approval command shown in that reply:
 
 ```bash
-ompclaw pairing-listen \
-  --config ~/.config/ompclaw/config.json \
-  --env-file ~/.config/ompclaw/ompclaw.env
+ompclaw pairing-approve ABCD2345 \
+  --config ~/.config/ompclaw/config.json
 ```
 
-The request expires after ten minutes. Five invalid local approval attempts
-exhaust it. `pairing-list` shows token-free request metadata;
-`pairing-reject` denies a request; and `pairing-clear` removes all pairing
-request records without changing approved principal bindings.
+The bot confirms approval in the same chat; the user's next message enters the
+normal OMP conversation. If the gateway is stopped, `ompclaw pairing-listen`
+provides the bootstrap listener and prints the code and approval command only
+on the gateway host.
+
+The request expires after ten minutes. Each unresolved identity retains one
+pending request; a new private message rotates its code instead of accumulating
+another record. Only three pending requests are retained per Telegram account.
+Five invalid local approval attempts exhaust a request.
+`pairing-list` shows token-free request metadata; `pairing-reject` denies a
+request; and `pairing-clear` removes all pairing request records without
+changing approved principal bindings.
 
 Authorize the example local WebSocket identity separately:
 

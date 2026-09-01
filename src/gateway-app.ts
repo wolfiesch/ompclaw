@@ -13,6 +13,7 @@ import {
   type GatewayIngressComposerOptions,
   type GatewayIngressCompositionStore,
 } from "./gateway-ingress-composer";
+import { GatewayPairingService, type GatewayPairingPersistence } from "./gateway-pairing";
 import type { GatewayDelivery } from "./gateway-tools";
 import {
   GatewayScheduler,
@@ -38,6 +39,7 @@ import { WebSocketTransportAdapter, type WebSocketTransportOptions } from "./tra
 
 export interface GatewayApplicationStore
   extends GatewayIngressCompositionStore,
+    GatewayPairingPersistence,
     Partial<GatewayScheduledJobStore>,
     Partial<GatewayTurnLifecycleStore> {
   close(): void;
@@ -315,6 +317,7 @@ export class GatewayApplication {
           account: telegram.account,
           stateDir: this.#config.stateDir,
           store,
+          pairing: new GatewayPairingService(store),
           commands: runtimeCommandMenu(this.#config.omp.allowRpcBash),
           createTopicsFromRoot: telegram.topicSessions.enabled && telegram.topicSessions.createFromRoot,
           ...(telegram.transcribeCommand === undefined ? {} : { transcribeCommand: telegram.transcribeCommand }),

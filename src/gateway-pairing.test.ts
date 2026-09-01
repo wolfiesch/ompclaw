@@ -233,4 +233,62 @@ describe("GatewayPairingService", () => {
     expect(store.resolvePrincipal(identity("100"))).toEqual({ id: "operator:telegram:default:100", roles: ["operator"] });
     store.close();
   });
+  test("queries only unconfirmed approvals for one transport account", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const pairing = service(store, "CONFIRM1", "CONFIRM2");
+    const first = pairing.request(identity("100"), address("100"), now);
+    const otherIdentity = { ...identity("200"), account: "other" };
+    const otherAddress = { ...address("200"), account: "other" };
+    const other = pairing.request(otherIdentity, otherAddress, now + 1);
+    pairing.approve(first.code, undefined, now + 2);
+    pairing.approve(other.code, undefined, now + 3);
+
+    expect(store.listPendingPairingRequests("telegram", "default")).toEqual([]);
+    expect(store.listPendingPairingRequests("telegram", "other")).toEqual([]);
+    expect(pairing.listUnconfirmedApprovals("telegram", "default")).toEqual([
+      expect.objectContaining({ identity: identity("100"), state: "approved" }),
+    ]);
+    expect(pairing.completeConfirmation(identity("100"), now + 4)).toBe(true);
+    expect(pairing.completeConfirmation(identity("100"), now + 5)).toBe(false);
+    expect(pairing.listUnconfirmedApprovals("telegram", "default")).toEqual([]);
+    expect(pairing.listUnconfirmedApprovals("telegram", "other")).toEqual([
+      expect.objectContaining({ identity: otherIdentity, state: "approved" }),
+    ]);
+    store.close();
+  });
+
+  test("bounds pending runtime challenges per transport account while allowing code rotation", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const pairing = service(store, "WSFIRST1", "FIRST001", "SECOND01", "THIRD001", "ROTATE01");
+    const websocketIdentity = { ...identity("websocket"), transport: "websocket" };
+    const websocketAddress = { ...address("websocket"), transport: "websocket" };
+
+    expect(pairing.requestFromTransport(websocketIdentity, websocketAddress, now).status).toBe("created");
+    expect(pairing.requestFromTransport(identity("100"), address("100"), now).status).toBe("created");
+    expect(pairing.requestFromTransport(identity("200"), address("200"), now).status).toBe("created");
+    expect(pairing.requestFromTransport(identity("300"), address("300"), now).status).toBe("created");
+    expect(pairing.requestFromTransport(identity("400"), address("400"), now)).toEqual({ status: "capacity" });
+    expect(store.listPendingPairingRequests("telegram", "default").map((request) => request.identity.subject)).toEqual([
+      "100",
+      "200",
+      "300",
+    ]);
+    expect(store.listPendingPairingRequests("websocket", "default").map((request) => request.identity.subject)).toEqual([
+      "websocket",
+    ]);
+
+    const rotated = pairing.requestFromTransport(identity("100"), address("100"), now + 1);
+    expect(rotated).toEqual(
+      expect.objectContaining({
+        status: "created",
+        result: expect.objectContaining({
+          code: "ROTATE01",
+          request: expect.objectContaining({ identity: identity("100"), createdAt: now + 1 }),
+        }),
+      }),
+    );
+    expect(pairing.list(now + 1)).toHaveLength(4);
+    store.close();
+  });
+
 });

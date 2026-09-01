@@ -6,6 +6,7 @@ import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { GatewayStore, JsonValue, PendingInteraction } from "../../gateway-store";
+import type { GatewayPairingService } from "../../gateway-pairing";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -16,6 +17,7 @@ import type {
   Reaction,
   TransportAdapter,
   TransportCapabilities,
+  TransportIdentity,
   TransportStartContext,
   UiRequest,
   UiResponse,
@@ -48,6 +50,14 @@ const INTERACTION_CALLBACK = "ompui";
 const STOP_CALLBACK = "ompctl:stop";
 const SELECT_PAGE_SIZE = 8;
 const TOPIC_NAME_LIMIT = 128;
+const PAIRING_APPROVAL_CHECK_MS = 1_000;
+
+function startPairingApprovalMonitor(run: () => void | Promise<void>): () => void {
+  run();
+  const timer = setInterval(run, PAIRING_APPROVAL_CHECK_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
 
 type InteractiveRequest = Extract<UiRequest, { type: "confirm" | "select" | "input" | "editor" }>;
 type InteractiveResponse = Extract<UiResponse, { type: "confirm" | "select" | "input" | "editor" }>;
@@ -69,6 +79,7 @@ export interface TelegramApiSeams {
   readonly now?: () => number;
   readonly randomId?: () => string;
   readonly transcribe?: (command: readonly string[], file: string, signal?: AbortSignal) => Promise<string>;
+  readonly startPairingApprovalMonitor?: (run: () => void | Promise<void>) => () => void;
 }
 
 export interface TelegramTransportAdapterOptions {
@@ -85,6 +96,10 @@ export interface TelegramTransportAdapterOptions {
     | "listPendingInboundMessages"
     | "getSemanticView"
     | "putSemanticView"
+  >;
+  readonly pairing?: Pick<
+    GatewayPairingService,
+    "requestFromTransport" | "listUnconfirmedApprovals" | "completeConfirmation"
   >;
   readonly transcribeCommand?: readonly string[];
   readonly logger?: Logger;
@@ -372,6 +387,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #dropLock: NonNullable<TelegramApiSeams["releaseLock"]>;
   readonly #heartbeat: NonNullable<TelegramApiSeams["startLockHeartbeat"]>;
   readonly #clock: () => number;
+  readonly #pairing: TelegramTransportAdapterOptions["pairing"];
+  readonly #startPairingApprovalMonitor: NonNullable<TelegramApiSeams["startPairingApprovalMonitor"]>;
   readonly #newId: () => string;
   readonly #transcriptionCommand: readonly string[] | undefined;
   readonly #transcriptionOverride: TelegramApiSeams["transcribe"];
@@ -390,6 +407,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
   #lockPath: string | undefined;
   #stopHeartbeat: (() => void) | undefined;
   #stopTask: Promise<void> | undefined;
+  #stopPairingApprovalMonitor: (() => void) | undefined;
+  #pairingApprovalDrain: Promise<void> | undefined;
 
   constructor(options: TelegramTransportAdapterOptions) {
     if (options.token.length === 0) throw new Error("Telegram bot token is required");
@@ -409,6 +428,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#dropLock = options.api?.releaseLock ?? releaseLock;
     this.#heartbeat = options.api?.startLockHeartbeat ?? startLockHeartbeat;
     this.#clock = options.api?.now ?? Date.now;
+    this.#pairing = options.pairing;
+    this.#startPairingApprovalMonitor = options.api?.startPairingApprovalMonitor ?? startPairingApprovalMonitor;
     this.#newId = options.api?.randomId ?? (() => randomBytes(18).toString("base64url"));
     this.#transcriptionCommand = options.transcribeCommand;
     this.#transcriptionOverride = options.api?.transcribe;
@@ -435,6 +456,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#lockPath = lock;
     this.#context = context;
     this.#stopHeartbeat = this.#heartbeat(lock);
+    let pollerStarted = false;
     try {
       if (this.#commands.length > 0) {
         try {
@@ -448,6 +470,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
         }
       }
       this.#poller.start(this.#token, (update) => this.#trackUpdate(update), this.#log);
+      pollerStarted = true;
+      if (this.#pairing !== undefined) {
+        this.#stopPairingApprovalMonitor = this.#startPairingApprovalMonitor(() =>
+          this.#schedulePairingApprovalDrain(),
+        );
+      }
       if (context.signal) {
         const abort = (): void => {
           void this.stop();
@@ -455,6 +483,30 @@ export class TelegramTransportAdapter implements TransportAdapter {
         context.signal.addEventListener("abort", abort, { once: true });
       }
     } catch (error) {
+      try {
+        this.#stopPairingApprovalMonitor?.();
+      } catch (cleanupError) {
+        this.#log?.warn(
+          `[telegram] pairing approval monitor cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          }`,
+        );
+      }
+      this.#stopPairingApprovalMonitor = undefined;
+      if (pollerStarted) {
+        try {
+          this.#poller.stop();
+        } catch (cleanupError) {
+          this.#log?.warn(
+            `[telegram] poller cleanup failed after startup error: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+            }`,
+          );
+        }
+        await Promise.allSettled([
+          this.#poller.done(),
+          ...this.#updateTasks,
+          ...(this.#pairingApprovalDrain === undefined ? [] : [this.#pairingApprovalDrain]),
+        ]);
+      }
       this.#releaseRuntimeOwnership();
       this.#context = undefined;
       throw error;
@@ -465,8 +517,14 @@ export class TelegramTransportAdapter implements TransportAdapter {
     if (this.#context === undefined) return;
     if (this.#stopTask) return this.#stopTask;
     this.#stopTask = (async () => {
+      this.#stopPairingApprovalMonitor?.();
+      this.#stopPairingApprovalMonitor = undefined;
       this.#poller.stop();
-      await Promise.allSettled([this.#poller.done(), ...this.#updateTasks]);
+      await Promise.allSettled([
+        this.#poller.done(),
+        ...this.#updateTasks,
+        ...(this.#pairingApprovalDrain === undefined ? [] : [this.#pairingApprovalDrain]),
+      ]);
       for (const state of [...this.#interactions.values()]) {
         this.#finishInteraction(state, this.#cancelledResponse(state.request));
       }
@@ -638,8 +696,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
         );
       } catch (messageError) {
         this.#log?.warn(
-          `[telegram] voice acknowledgement failed for message ${message.message_id}: ${
-            messageError instanceof Error ? messageError.message : String(messageError)
+          `[telegram] voice acknowledgement failed for message ${message.message_id}: ${messageError instanceof Error ? messageError.message : String(messageError)
           } (reaction: ${reactionError instanceof Error ? reactionError.message : String(reactionError)})`,
         );
       }
@@ -652,7 +709,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const principal = await context.resolveIdentity(identity, context.signal);
     let address = telegramAddress(message, this.#account);
     if (!principal) {
-      if (identityHelp(message.text)) await this.#sendIdentityHelp(message);
+      if (message.chat.type === "private" && this.#pairing !== undefined) {
+        await this.#sendPairingChallenge(message, identity);
+      } else if (identityHelp(message.text)) {
+        await this.#sendIdentityHelp(message);
+      }
       return;
     }
     if (await this.#captureReply(message, principal.id, address)) return;
@@ -690,12 +751,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
     });
     const transcript = attachment?.transcribable
       ? await this.#transcribe(attachment.localPath, context.signal).catch((error) => {
-          if (context.signal?.aborted) throw error;
-          this.#log?.warn(
-            `[telegram] transcription failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`,
-          );
-          return undefined;
-        })
+        if (context.signal?.aborted) throw error;
+        this.#log?.warn(
+          `[telegram] transcription failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return undefined;
+      })
       : undefined;
     const textParts = [message.text ?? message.caption, transcript].filter(
       (part): part is string => typeof part === "string" && part.length > 0,
@@ -704,10 +765,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
       attachment === undefined
         ? undefined
         : {
-            url: pathToFileURL(attachment.localPath).href,
-            name: attachment.displayName,
-            mediaType: attachment.mediaType,
-          };
+          url: pathToFileURL(attachment.localPath).href,
+          name: attachment.displayName,
+          mediaType: attachment.mediaType,
+        };
     const replyContext = replyContextFrom(message);
     const envelope: InboundEnvelope = {
       id: `telegram:${this.#account}:${message.chat.id}:${message.message_id}`,
@@ -721,9 +782,9 @@ export class TelegramTransportAdapter implements TransportAdapter {
       ...(message.reply_to_message === undefined
         ? {}
         : {
-            replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) },
-            ...(replyContext === undefined ? {} : { replyContext }),
-          }),
+          replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) },
+          ...(replyContext === undefined ? {} : { replyContext }),
+        }),
       composition: {
         kind: message.media_group_id === undefined ? "text" : "media",
         ...(message.media_group_id === undefined ? {} : { groupId: message.media_group_id }),
@@ -886,11 +947,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
     signal?: AbortSignal,
   ): Promise<
     | {
-        readonly localPath: string;
-        readonly displayName: string;
-        readonly mediaType: string;
-        readonly transcribable: boolean;
-      }
+      readonly localPath: string;
+      readonly displayName: string;
+      readonly mediaType: string;
+      readonly transcribable: boolean;
+    }
     | undefined
   > {
     const media = mediaFrom(message);
@@ -1288,6 +1349,87 @@ export class TelegramTransportAdapter implements TransportAdapter {
     for (const [name, lines] of card.widgets) sections.push(`${name}\n${lines.join("\n")}`);
     if (card.editorText) sections.push(`Suggested reply\n${card.editorText}`);
     return sections.join("\n\n");
+  }
+
+  async #sendPairingChallenge(message: TgMessage, identity: TransportIdentity): Promise<void> {
+    const pairing = this.#pairing;
+    if (pairing === undefined) return;
+    const address = telegramAddress(message, this.#account);
+    const principal = { id: `telegram-unresolved:${identity.subject}`, roles: [] };
+    const challenge = pairing.requestFromTransport(identity, address, this.#clock());
+    if (challenge.status === "capacity") {
+      await this.#outbound.sendMessage(
+        address,
+        [
+          "Pairing is temporarily unavailable because this Telegram account has too many pending requests.",
+          "Ask the gateway operator to approve or clear an existing request, then try again.",
+        ].join("\n"),
+        { principal, origin: address },
+      );
+      return;
+    }
+
+    const { code, request } = challenge.result;
+    const minutes = Math.max(1, Math.ceil((request.expiresAt - request.createdAt) / 60_000));
+    await this.#outbound.sendMessage(
+      address,
+      [
+        "OmpClaw needs local approval before this Telegram account can send tasks.",
+        "",
+        `Pairing code: ${code}`,
+        `Expires in ${minutes} ${minutes === 1 ? "minute" : "minutes"}. A newer code replaces this one.`,
+        "",
+        "On the gateway host, run:",
+        `ompclaw pairing-approve ${code}`,
+        "",
+        `Telegram user ID: ${identity.subject}`,
+        `Chat ID: ${message.chat.id}`,
+      ].join("\n"),
+      { principal, origin: address },
+    );
+  }
+
+  #schedulePairingApprovalDrain(): Promise<void> | undefined {
+    if (this.#context === undefined) return;
+    if (this.#pairingApprovalDrain !== undefined) return this.#pairingApprovalDrain;
+    const drain = this.#drainPairingApprovals()
+      .catch((error) => {
+        this.#log?.warn(
+          `[telegram] pairing approval check failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        if (this.#pairingApprovalDrain === drain) this.#pairingApprovalDrain = undefined;
+      });
+    this.#pairingApprovalDrain = drain;
+    return drain;
+  }
+
+  async #drainPairingApprovals(): Promise<void> {
+    const pairing = this.#pairing;
+    const context = this.#context;
+    if (pairing === undefined || context === undefined) return;
+    const approved = pairing.listUnconfirmedApprovals("telegram", this.#account);
+    for (const request of approved) {
+      try {
+        const principal = await context.resolveIdentity(request.identity, context.signal);
+        if (principal === undefined || principal.id !== request.principalId) continue;
+        await this.#outbound.sendMessage(
+          request.address,
+          "Paired. Send your first task.",
+          { principal, origin: request.address },
+          {},
+          context.signal,
+        );
+        pairing.completeConfirmation(request.identity, this.#clock());
+      } catch (error) {
+        if (context.signal?.aborted) return;
+        this.#log?.warn(
+          `[telegram] pairing confirmation failed for user ${request.identity.subject}: ${error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
   }
 
   async #sendIdentityHelp(message: TgMessage): Promise<void> {

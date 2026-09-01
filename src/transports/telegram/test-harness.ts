@@ -16,7 +16,12 @@ import type {
   Principal,
   TransportStartContext,
 } from "../../gateway-types";
-import { TelegramTransportAdapter, type TelegramApiSeams, type TelegramPoller } from "./adapter";
+import {
+  TelegramTransportAdapter,
+  type TelegramApiSeams,
+  type TelegramPoller,
+  type TelegramTransportAdapterOptions,
+} from "./adapter";
 import type { TgMessage, TgUpdate } from "./bot-api";
 
 export interface TelegramApiCall {
@@ -56,15 +61,19 @@ export interface FakeTelegramApiOptions {
   readonly setCommandsError?: Error;
   readonly reactionError?: Error;
   readonly transcribe?: boolean;
+  readonly poller?: TelegramTestPoller;
+  readonly pairingApprovalMonitorError?: Error;
 }
 
 export class FakeTelegramApi {
   readonly calls: TelegramApiCall[] = [];
-  readonly poller = new TelegramTestPoller();
+  readonly poller: TelegramTestPoller;
   readonly seams: TelegramApiSeams;
   #messageId = 200;
+  #pairingApprovalRun: (() => void | Promise<void>) | undefined;
 
   constructor(options: FakeTelegramApiOptions = {}) {
+    this.poller = options.poller ?? new TelegramTestPoller();
     this.seams = {
       poller: this.poller,
       acquireLock: () => ({ ok: true }),
@@ -72,6 +81,14 @@ export class FakeTelegramApi {
       startLockHeartbeat: () => () => {},
       now: () => 1_800_000_000_000,
       randomId: () => "interaction-id",
+      startPairingApprovalMonitor: (run) => {
+        if (options.pairingApprovalMonitorError) throw options.pairingApprovalMonitorError;
+        this.#pairingApprovalRun = run;
+        run();
+        return () => {
+          if (this.#pairingApprovalRun === run) this.#pairingApprovalRun = undefined;
+        };
+      },
       callTelegram: async (method, payload = {}) => {
         this.calls.push({ method, payload });
         if (method === "setMyCommands" && options.setCommandsError) throw options.setCommandsError;
@@ -92,6 +109,10 @@ export class FakeTelegramApi {
     if (!call) throw new Error(`expected ${method} call`);
     return call;
   }
+
+  async flushPairingApprovals(): Promise<void> {
+    await this.#pairingApprovalRun?.();
+  }
 }
 
 export interface TelegramAdapterHarnessOptions extends FakeTelegramApiOptions {
@@ -103,6 +124,7 @@ export interface TelegramAdapterHarnessOptions extends FakeTelegramApiOptions {
   readonly pendingIngressAttachmentName?: string;
   readonly pendingAttachmentName?: string;
   readonly receive?: (message: InboundEnvelope) => Promise<void>;
+  readonly pairing?: TelegramTransportAdapterOptions["pairing"];
 }
 
 export interface TelegramAdapterHarness {
@@ -116,6 +138,7 @@ export interface TelegramAdapterHarness {
   readonly stateDir: string;
   readonly warnings: string[];
   dispose(): Promise<void>;
+  flushPairingApprovals(): Promise<void>;
 }
 
 const activeHarnesses = new Set<TelegramAdapterHarness>();
@@ -197,6 +220,7 @@ export async function createTelegramAdapterHarness(
     stateDir,
     commands: options.commands,
     createTopicsFromRoot: options.createTopicsFromRoot,
+    pairing: options.pairing,
     store: {
       getCheckpoint: (adapterId, checkpoint) => checkpoints.get(key(adapterId, checkpoint)),
       setCheckpoint: (adapterId, checkpoint, value) => {
@@ -254,6 +278,7 @@ export async function createTelegramAdapterHarness(
     received,
     stateDir,
     warnings,
+    flushPairingApprovals: () => api.flushPairingApprovals(),
     async dispose() {
       let stopError: unknown;
       let didStopThrow = false;
