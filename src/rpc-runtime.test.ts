@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,19 +14,25 @@ import type {
 import type { GatewayDelivery } from "./gateway-tools";
 import type { GatewayTurnLifecycleStore, TurnLifecycle } from "./gateway-store";
 import type { GatewayUpdateControl } from "./gateway-update";
-import type { RpcCommandInput } from "./rpc-client";
+import type {
+  OmpRpcClientOptions,
+  RpcClient,
+  RpcCommandInput,
+  RpcFrameListener,
+} from "./rpc-client";
 import type { RpcRuntimeConfig } from "./rpc-config";
+import {
+  RpcGatewayRuntime,
+  runtimeCommandMenu,
+  type RpcGatewayRuntimeOptions,
+  type RpcRuntimeLogger,
+} from "./rpc-runtime";
 import type { RpcRecord, RpcResponse, RpcSessionState } from "./rpc-protocol";
 
-interface FakeRpcOptions {
-  readonly argv: string[];
-}
 
-class FakeRpcCommandError extends Error {}
-
-class FakeOmpRpcClient {
+class FakeOmpRpcClient implements RpcClient {
   static instances: FakeOmpRpcClient[] = [];
-  readonly options: FakeRpcOptions;
+  readonly options: OmpRpcClientOptions;
   readonly sent: RpcCommandInput[] = [];
   readonly writes: RpcRecord[] = [];
   running = false;
@@ -39,15 +45,15 @@ class FakeOmpRpcClient {
     sessionFile: "/sessions/initial.jsonl",
     model: { provider: "provider", id: "model" },
   };
-  #frameListener: ((frame: RpcRecord) => void) | undefined;
+  #frameListener: RpcFrameListener | undefined;
   #exitListener: ((error: Error) => void | Promise<void>) | undefined;
 
-  constructor(options: FakeRpcOptions) {
+  constructor(options: OmpRpcClientOptions) {
     this.options = options;
     FakeOmpRpcClient.instances.push(this);
   }
 
-  onFrame(listener: (frame: RpcRecord) => void): () => void {
+  onFrame(listener: RpcFrameListener): () => void {
     this.#frameListener = listener;
     return () => {
       this.#frameListener = undefined;
@@ -106,13 +112,6 @@ class FakeOmpRpcClient {
   }
 }
 
-mock.module("./rpc-client", () => ({
-  OmpRpcClient: FakeOmpRpcClient,
-  RpcCommandError: FakeRpcCommandError,
-}));
-
-// The mocked client must be registered before the runtime module is evaluated.
-const { RpcGatewayRuntime, runtimeCommandMenu } = await import("./rpc-runtime");
 
 interface DeliveryCall {
   readonly method: "send" | "typing" | "update" | "finalize" | "react" | "presentUi";
@@ -139,6 +138,16 @@ const config: RpcRuntimeConfig = {
   autoRestart: false,
   busyInputMode: "steer",
 };
+
+function createRuntime(
+  options: Omit<RpcGatewayRuntimeOptions, "createRpcClient">,
+  log?: RpcRuntimeLogger,
+): RpcGatewayRuntime {
+  return new RpcGatewayRuntime({
+    ...options,
+    createRpcClient: (clientOptions) => new FakeOmpRpcClient(clientOptions),
+  }, log);
+}
 
 function defaultUiResponse<Request extends UiRequest>(request: Request): UiResponseFor<Request> {
   const responses: Record<UiRequest["type"], UiResponse> = {
@@ -255,7 +264,7 @@ describe("RpcGatewayRuntime", () => {
         .slice(0, limit),
     };
     let now = 100;
-    const runtime = new RpcGatewayRuntime({
+    const runtime = createRuntime({
       config,
       delivery: delivery(),
       turnStore,
@@ -315,7 +324,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("queues another conversation and keeps each response bound to its exact delivery context", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     const first = message("first", "Build this");
     const second = message("second", "Handle this next");
@@ -362,7 +371,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("treats an ordinary message in the active conversation as a correction", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     await runtime.handleInbound(message("same", "Draft the rollout"));
     const rpc = FakeOmpRpcClient.instances[0];
@@ -388,7 +397,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("can queue ordinary active-conversation messages as follow-ups by configuration", async () => {
-    const runtime = new RpcGatewayRuntime({
+    const runtime = createRuntime({
       config: { ...config, busyInputMode: "followup" },
       delivery: delivery(),
     });
@@ -408,7 +417,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("acknowledges a request immediately and finalizes a rich reply to its source message", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     const sourceReceipt = { transport: "test", messageId: "source-1" };
     const inbound = { ...message("companion", "Handle this"), sourceReceipt };
@@ -457,7 +466,7 @@ describe("RpcGatewayRuntime", () => {
         calls.push("discard");
       },
     };
-    const successful = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    const successful = createRuntime({ config, delivery: delivery(), updates });
     await successful.start();
     await successful.handleInbound(message("update-success", "Activate"));
     FakeOmpRpcClient.instances[0]!.emit({
@@ -473,10 +482,8 @@ describe("RpcGatewayRuntime", () => {
     failedDelivery.finalize = async () => {
       throw new Error("final delivery failed");
     };
-    const failed = new RpcGatewayRuntime(
-      { config, delivery: failedDelivery, updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
-    );
+    const failed = createRuntime({ config, delivery: failedDelivery, updates },
+    { info: () => {}, warn: () => {}, error: () => {} },);
     await failed.start();
     await failed.handleInbound(message("update-failure", "Activate"));
     FakeOmpRpcClient.instances[1]!.emit({
@@ -507,7 +514,7 @@ describe("RpcGatewayRuntime", () => {
         throw new Error("not used");
       },
     };
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    const runtime = createRuntime({ config, delivery: delivery(), updates });
     await runtime.start();
     await runtime.handleInbound(message("update-serial-first", "Activate"));
     const queued = runtime.handleInbound(message("update-serial-second", "Run next"));
@@ -549,10 +556,8 @@ describe("RpcGatewayRuntime", () => {
         calls.push("discard");
       },
     };
-    const runtime = new RpcGatewayRuntime(
-      { config, delivery: delivery(), updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
-    );
+    const runtime = createRuntime({ config, delivery: delivery(), updates },
+    { info: () => {}, warn: () => {}, error: () => {} },);
     await runtime.start();
     await runtime.handleInbound(message("update-refresh-failure", "Activate"));
     const rpc = FakeOmpRpcClient.instances[0]!;
@@ -584,7 +589,7 @@ describe("RpcGatewayRuntime", () => {
         calls.push("discard");
       },
     };
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    const runtime = createRuntime({ config, delivery: delivery(), updates });
     await runtime.start();
     await runtime.handleInbound(message("update-stopped-final", "Activate"));
     FakeOmpRpcClient.instances[0]!.emit({
@@ -618,7 +623,7 @@ describe("RpcGatewayRuntime", () => {
         calls.push("discard");
       },
     };
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    const runtime = createRuntime({ config, delivery: delivery(), updates });
     await runtime.start();
     await runtime.handleInbound(message("update-empty-final", "Activate"));
     FakeOmpRpcClient.instances[0]!.emit({
@@ -648,10 +653,8 @@ describe("RpcGatewayRuntime", () => {
         calls.push("discard");
       },
     };
-    const runtime = new RpcGatewayRuntime(
-      { config, delivery: delivery(), updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
-    );
+    const runtime = createRuntime({ config, delivery: delivery(), updates },
+    { info: () => {}, warn: () => {}, error: () => {} },);
     await runtime.start();
     await runtime.handleInbound(message("update-rpc-exit", "Activate"));
     FakeOmpRpcClient.instances[0]!.exit(new Error("RPC child exited"));
@@ -662,7 +665,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("publishes completed commentary before the final answer", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     const sourceReceipt = { transport: "test", messageId: "source-segments" };
     await runtime.handleInbound({ ...message("segments", "Investigate this"), sourceReceipt });
@@ -705,7 +708,7 @@ describe("RpcGatewayRuntime", () => {
   test("dispatches a prompt without waiting for the receipt acknowledgement", async () => {
     const acknowledgement = Promise.withResolvers<void>();
     let acknowledgementStarted = false;
-    const runtime = new RpcGatewayRuntime({
+    const runtime = createRuntime({
       config,
       delivery: delivery(async (reaction) => {
         if (reaction.emoji !== "👀") return;
@@ -734,7 +737,7 @@ describe("RpcGatewayRuntime", () => {
     const acknowledgement = Promise.withResolvers<void>();
     let acknowledgementStarted = false;
     let terminalReactionStarted = false;
-    const runtime = new RpcGatewayRuntime({
+    const runtime = createRuntime({
       config,
       delivery: delivery(async (reaction) => {
         if (reaction.emoji === "👀") {
@@ -769,7 +772,7 @@ describe("RpcGatewayRuntime", () => {
   test("finishes a non-agent prompt without waiting for its terminal reaction", async () => {
     const terminalReaction = Promise.withResolvers<void>();
     let terminalReactionStarted = false;
-    const runtime = new RpcGatewayRuntime({
+    const runtime = createRuntime({
       config,
       delivery: delivery(async (reaction) => {
         if (reaction.emoji !== "👍") return;
@@ -799,7 +802,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("handles abortbash immediately only when RPC bash is enabled", async () => {
-    const runtime = new RpcGatewayRuntime({ config: { ...config, allowRpcBash: true }, delivery: delivery() });
+    const runtime = createRuntime({ config: { ...config, allowRpcBash: true }, delivery: delivery() });
     await runtime.start();
     const active = message("first", "Build this");
     await runtime.handleInbound(active);
@@ -809,7 +812,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("rejects a queued receive when OMP stops before dispatch", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     await runtime.handleInbound(message("first", "Build this"));
     const rpc = FakeOmpRpcClient.instances[0];
@@ -821,7 +824,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("waits for an active turn to reach its terminal RPC event", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     await runtime.handleInbound(message("first", "Build this"));
     const rpc = FakeOmpRpcClient.instances[0];
@@ -847,7 +850,7 @@ describe("RpcGatewayRuntime", () => {
     const terminalReaction = Promise.withResolvers<void>();
     let terminalReactionStarted = false;
     const sessionStates: RpcSessionState[] = [];
-    const runtime = new RpcGatewayRuntime({
+    const runtime = createRuntime({
       config,
       delivery: delivery(async (reaction) => {
         if (reaction.emoji !== "👍") return;
@@ -885,7 +888,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("waits for scheduled turns to finish before acknowledging dispatch", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     const completion = runtime.handleScheduled(message("scheduled", "Run the durable job"));
     let settled = false;
@@ -910,7 +913,7 @@ describe("RpcGatewayRuntime", () => {
     const imagePath = join(directory, "image.png");
     await writeFile(imagePath, Buffer.from([137, 80, 78, 71]));
     try {
-      const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+      const runtime = createRuntime({ config, delivery: delivery() });
       await runtime.start();
       await runtime.handleInbound(message("attachments", "Describe these", [
         { url: pathToFileURL(imagePath).href, mediaType: "image/png", name: "image.png" },
@@ -945,7 +948,7 @@ describe("RpcGatewayRuntime", () => {
       if (textFromContent(content) === "second event") secondDeliveryStarted.resolve();
       return { transport: address.transport, messageId: `message-${deliveries.length}` };
     };
-    const runtime = new RpcGatewayRuntime({ config, delivery: runtimeDelivery });
+    const runtime = createRuntime({ config, delivery: runtimeDelivery });
     await runtime.start();
     await runtime.handleInbound(message("events", "Start"));
     const rpc = FakeOmpRpcClient.instances[0];
@@ -970,10 +973,8 @@ describe("RpcGatewayRuntime", () => {
       if (textFromContent(content) === "later event") laterDeliveryStarted.resolve();
       return { transport: address.transport, messageId: `message-${deliveries.length}` };
     };
-    const runtime = new RpcGatewayRuntime(
-      { config, delivery: runtimeDelivery },
-      { info: () => {}, warn: () => {}, error: (message) => logErrors.push(message) },
-    );
+    const runtime = createRuntime({ config, delivery: runtimeDelivery },
+    { info: () => {}, warn: () => {}, error: (message) => logErrors.push(message) },);
     await runtime.start();
     await runtime.handleInbound(message("events", "Start"));
     const rpc = FakeOmpRpcClient.instances[0];
@@ -998,7 +999,7 @@ describe("RpcGatewayRuntime", () => {
         signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
       });
     };
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     await runtime.handleInbound(message("host", "Ask the operator"));
     const rpc = FakeOmpRpcClient.instances[0];
@@ -1014,7 +1015,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("holds a scheduled dispatch open until the terminal OMP event", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     const scheduled = runtime.handleScheduled(message("scheduled", "Run unattended task"));
     let completed = false;
@@ -1038,7 +1039,7 @@ describe("RpcGatewayRuntime", () => {
   });
 
   test("onboards without invoking the model and gives Telegram turns a mobile conversation contract", async () => {
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     await runtime.handleInbound(message("commands", "/start"));
     await runtime.handleInbound(message("commands", "/help"));
@@ -1084,7 +1085,7 @@ describe("RpcGatewayRuntime", () => {
         ? defaultUiResponse(request)
         : { type: "select", selected }) as UiResponseFor<typeof request>;
     };
-    const runtime = new RpcGatewayRuntime({ config, delivery: delivery() });
+    const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     await runtime.handleInbound(message("commands", "/home"));
 
@@ -1108,7 +1109,7 @@ describe("RpcGatewayRuntime", () => {
 
   test("resumes the supplied session, publishes new-session state, and supports representative commands", async () => {
     const sessionStates: RpcSessionState[] = [];
-    const runtime = new RpcGatewayRuntime({
+    const runtime = createRuntime({
       config,
       delivery: delivery(),
       sessionFile: "/sessions/resume.jsonl",

@@ -22,7 +22,13 @@ import type {
   TurnLifecycle,
   TurnLifecycleState,
 } from "./gateway-store";
-import { OmpRpcClient, RpcCommandError, type RpcCommandInput } from "./rpc-client";
+import {
+  OmpRpcClient,
+  RpcCommandError,
+  type OmpRpcClientOptions,
+  type RpcClient,
+  type RpcCommandInput,
+} from "./rpc-client";
 import { type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-config";
 import {
   type RpcExtensionUiRequest,
@@ -56,6 +62,7 @@ export interface RpcGatewayRuntimeOptions {
   readonly turnStore?: GatewayTurnLifecycleStore;
   readonly updates?: GatewayUpdateControl;
   readonly now?: () => number;
+  readonly createRpcClient?: (options: OmpRpcClientOptions) => RpcClient;
 }
 
 interface RuntimeStatus {
@@ -338,7 +345,7 @@ export class RpcGatewayRuntime {
   readonly #log: RpcRuntimeLogger;
   readonly #status: RuntimeStatus = { availableCommands: [], subagents: [] };
   readonly #hostTools = new Map<string, HostToolExecution>();
-  #rpc: OmpRpcClient | undefined;
+  #rpc: RpcClient | undefined;
   #ui: RpcGatewayUiBroker | undefined;
   #activeTurn: ActiveTurn | undefined;
   #sessionFile: string | undefined;
@@ -565,7 +572,8 @@ export class RpcGatewayRuntime {
     for (const key of Object.keys(childEnv)) {
       if (key.startsWith("GATEWAY_") || key.startsWith("OMPCLAW_") || key.startsWith("OMP_GATEWAY_") || key.startsWith("OMP_TRANSPORT_") || key.startsWith("OMP_WEBSOCKET_") || key.startsWith("WEBSOCKET_")) delete childEnv[key];
     }
-    const rpc = new OmpRpcClient({ argv, cwd: config.cwd, env: childEnv });
+    const rpc = this.#options.createRpcClient?.({ argv, cwd: config.cwd, env: childEnv })
+      ?? new OmpRpcClient({ argv, cwd: config.cwd, env: childEnv });
     rpc.onFrame((frame) => {
       const handled = this.#frameQueue.then(() => this.#handleRpcFrame(frame));
       this.#frameQueue = handled.catch((error: unknown) => {
