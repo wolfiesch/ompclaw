@@ -5,6 +5,7 @@ import {
   type GatewayAutomationControl,
   type ScheduledJobContext,
 } from "./gateway-scheduler";
+import type { GatewayUpdateControl } from "./gateway-update";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -66,6 +67,7 @@ export interface GatewayHostToolContext {
   readonly deliveryContext: DeliveryContext;
   readonly identity: TransportIdentity;
   readonly automation?: GatewayAutomationControl;
+  readonly updates?: GatewayUpdateControl;
 }
 
 const gatewayHostTools: readonly RpcHostToolDefinition[] = [
@@ -213,8 +215,48 @@ const automationHostTools: readonly RpcHostToolDefinition[] = [
   },
 ];
 
-export function gatewayHostToolDefinitions(automation = false): RpcHostToolDefinition[] {
-  const tools = automation ? [...gatewayHostTools, ...automationHostTools] : gatewayHostTools;
+const updateHostTools: readonly RpcHostToolDefinition[] = [
+  {
+    name: "ompclaw_stage_update",
+    label: "Stage OmpClaw update",
+    description: "Build and verify one exact OmpClaw Git commit as an inactive versioned release. This does not restart the gateway.",
+    loadMode: "discoverable",
+    parameters: {
+      type: "object",
+      properties: {
+        commit: { type: "string", minLength: 7, maxLength: 64 },
+      },
+      required: ["commit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ompclaw_activate_update",
+    label: "Activate OmpClaw update",
+    description: "Arm a staged release for activation after the current response is delivered. Use only after the operator explicitly requests activation.",
+    loadMode: "discoverable",
+    parameters: {
+      type: "object",
+      properties: {
+        release_id: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      required: ["release_id"],
+      additionalProperties: false,
+    },
+  },
+];
+
+export interface GatewayHostToolOptions {
+  readonly automation?: boolean;
+  readonly updates?: boolean;
+}
+
+export function gatewayHostToolDefinitions(options: GatewayHostToolOptions = {}): RpcHostToolDefinition[] {
+  const tools = [
+    ...gatewayHostTools,
+    ...(options.automation ? automationHostTools : []),
+    ...(options.updates ? updateHostTools : []),
+  ];
   return tools.map((tool) => ({ ...tool }));
 }
 
@@ -242,6 +284,10 @@ export async function executeGatewayHostTool(
       return executeDeleteJob(call.arguments, context);
     case "ompclaw_run_job":
       return executeRunJob(call.arguments, context);
+    case "ompclaw_stage_update":
+      return executeStageUpdate(call.arguments, context, signal);
+    case "ompclaw_activate_update":
+      return executeActivateUpdate(call.arguments, context);
     default:
       throw new Error(`Unknown host tool: ${call.toolName}`);
   }
@@ -380,6 +426,42 @@ function executeRunJob(arguments_: unknown, context: GatewayHostToolContext): { 
     context.deliveryContext.principal.id,
   );
   return { job: formatScheduledJob(job) };
+}
+
+async function executeStageUpdate(
+  arguments_: unknown,
+  context: GatewayHostToolContext,
+  signal?: AbortSignal,
+): Promise<{ release: string; reused: boolean }> {
+  const updates = requireUpdates(context);
+  requireOperator(context);
+  const argumentsRecord = parseArguments(arguments_, ["commit"]);
+  const staged = await updates.stage(requiredNonEmptyString(argumentsRecord, "commit"), signal);
+  return { release: staged.release.id, reused: staged.reused };
+}
+
+async function executeActivateUpdate(
+  arguments_: unknown,
+  context: GatewayHostToolContext,
+): Promise<{ update: string }> {
+  const updates = requireUpdates(context);
+  requireOperator(context);
+  const argumentsRecord = parseArguments(arguments_, ["release_id"]);
+  return updates.arm(requiredNonEmptyString(argumentsRecord, "release_id"), {
+    address: context.address,
+    principal: context.deliveryContext.principal,
+  });
+}
+
+function requireUpdates(context: GatewayHostToolContext): GatewayUpdateControl {
+  if (context.updates === undefined) throw new Error("OmpClaw transactional updates are disabled");
+  return context.updates;
+}
+
+function requireOperator(context: GatewayHostToolContext): void {
+  if (!context.deliveryContext.principal.roles.includes("operator")) {
+    throw new Error("OmpClaw updates require the operator role");
+  }
 }
 
 function requireAutomation(context: GatewayHostToolContext): GatewayAutomationControl {

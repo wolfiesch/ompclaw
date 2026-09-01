@@ -1,8 +1,10 @@
-import { lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, copyFileSync, lstatSync, mkdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { GatewayConfig } from "./gateway-config";
+import { GatewayUpdateCoordinator, gatewayUpdatePaths } from "./gateway-update";
 
 export interface ServiceInstallResult {
   path: string;
@@ -79,6 +81,47 @@ export function buildServiceArguments(paths: GatewayServicePaths): string[] {
   return [GATEWAY_COMMAND, "run", "--config", paths.configPath, "--env-file", paths.envFile];
 }
 
+export function buildManagedServiceArguments(
+  config: Pick<GatewayConfig, "stateDir" | "updates">,
+  paths: GatewayServicePaths,
+): string[] {
+  return [
+    join(gatewayUpdatePaths(config.stateDir).root, "ompclaw-supervisor"),
+    "--state-dir",
+    config.stateDir,
+    "--config",
+    paths.configPath,
+    "--env-file",
+    paths.envFile,
+    "--health-timeout-ms",
+    String(config.updates.healthTimeoutMs),
+  ];
+}
+
+export function replaceFileAtomically(source: string, destination: string, mode: number): void {
+  const temporary = `${destination}.${randomUUID()}.tmp`;
+  try {
+    copyFileSync(source, temporary);
+    chmodSync(temporary, mode);
+    renameSync(temporary, destination);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+export async function prepareServiceArguments(
+  config: GatewayConfig,
+  paths: GatewayServicePaths,
+): Promise<string[]> {
+  if (!config.updates.enabled) return buildServiceArguments(paths);
+  const updates = new GatewayUpdateCoordinator({ config: config.updates, stateDir: config.stateDir });
+  const staged = await updates.stage("HEAD");
+  const supervisorPath = join(updates.paths.root, "ompclaw-supervisor");
+  replaceFileAtomically(join(staged.release.path, "ompclaw-supervisor"), supervisorPath, 0o700);
+  updates.bootstrap(staged.release);
+  return buildManagedServiceArguments(config, paths);
+}
+
 export function renderSystemdUnit(
   config: Pick<GatewayConfig, "workspace" | "stateDir">,
   args: readonly string[],
@@ -119,13 +162,13 @@ function runManager(executable: string, args: string[], retries = 0): void {
   throw new Error(`${executable} ${args.join(" ")} failed: ${failure}`);
 }
 
-export function installRpcService(
+export async function installRpcService(
   config: GatewayConfig,
   configPath: string,
   envFile: string,
-): ServiceInstallResult {
+): Promise<ServiceInstallResult> {
   const paths = resolveGatewayServicePaths(configPath, envFile);
-  const args = buildServiceArguments(paths);
+  const args = await prepareServiceArguments(config, paths);
   const logs = join(config.stateDir, "logs");
   mkdirSync(logs, { recursive: true, mode: 0o700 });
 
@@ -167,7 +210,8 @@ export function installRpcService(
     const unit = renderSystemdUnit(config, args);
     writeFileSync(path, unit, { mode: 0o600 });
     runManager("systemctl", ["--user", "daemon-reload"]);
-    runManager("systemctl", ["--user", "enable", "--now", SYSTEMD_UNIT]);
+    runManager("systemctl", ["--user", "enable", SYSTEMD_UNIT]);
+    runManager("systemctl", ["--user", "restart", SYSTEMD_UNIT]);
     return { path, manager: "systemd" };
   }
 

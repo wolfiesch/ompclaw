@@ -55,6 +55,26 @@ describe("gateway config", () => {
     expect(() => parseGatewayConfig({ automation: { enabled: true, unknown: true } })).toThrow("unknown key unknown");
   });
 
+  test("keeps transactional updates opt-in with a fixed repository", () => {
+    expect(parseGatewayConfig({}, "/workspace/current").updates).toEqual({
+      enabled: false,
+      healthTimeoutMs: 30_000,
+    });
+    expect(parseGatewayConfig({
+      updates: {
+        enabled: true,
+        repository: "../ompclaw",
+        healthTimeoutMs: 45_000,
+      },
+    }, "/workspace/current").updates).toEqual({
+      enabled: true,
+      repository: "/workspace/ompclaw",
+      healthTimeoutMs: 45_000,
+    });
+    expect(() => parseGatewayConfig({ updates: { enabled: true } })).toThrow("repository is required");
+    expect(() => parseGatewayConfig({ updates: { enabled: true, repository: "/repo", unknown: true } })).toThrow("unknown key unknown");
+  });
+
   test("keeps experimental learning opt-in with an explicit memory model", () => {
     expect(parseGatewayConfig({}).learning).toEqual({
       enabled: false,

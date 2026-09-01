@@ -56,5 +56,10 @@
     "autoCapture": false,
     "minToolCalls": 5,
     "memoryModel": "online"
+  },
+  "updates": {
+    "enabled": false,
+    "repository": "~/Projects/ompclaw",
+    "healthTimeoutMs": 30000
   }
 }

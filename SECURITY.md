@@ -30,6 +30,7 @@ The gateway is designed for one trusted operator environment:
 - A live WebSocket connection is limited to one configured conversation origin. Gateway delivery is constrained to the active principal and origin.
 - The JSON configuration contains paths and environment-variable names, not token values. Transport-secret environment variables are removed before the OMP child starts.
 - The gateway locks its state directory so a second gateway process cannot become another state writer. The Telegram adapter separately locks one polling account. Durable automation remains scoped to the principal and conversation derived when the job was created.
+- Transactional self-update is disabled by default. When enabled, only an authenticated principal with the `operator` role can stage or activate a release, and only from the fixed configured repository.
 
 The gateway does **not** make an OMP workspace safe for untrusted operators. An authorized principal can cause prompts to be processed by OMP with the authority of the configured OMP profile, workspace, tools, and provider credentials. Treat granting a Telegram allowance or binding a WebSocket identity as granting access to that environment.
 
@@ -47,6 +48,7 @@ The gateway does not defend against a compromised host, another process running 
 8. Treat unattended scheduled prompts as standing authorization to use the configured OMP environment. Make prompts with external side effects idempotent, pause jobs that no longer need to run, and remove obsolete jobs.
 9. Leave experimental learning disabled unless the operator accepts automatic provider use and gateway-profile managed-skill mutation. Review learned skills before using them in consequential automation.
 10. Keep Bun, OMP, the gateway, operating system, and any reverse proxy current with their security updates.
+11. Enable transactional self-update only for a trusted checkout owned by the service user. Staging runs repository-defined checks before compilation, so a compromised commit can execute with that user's non-secret build environment. Review the exact commit before activation.
 
 ## Secret handling
 

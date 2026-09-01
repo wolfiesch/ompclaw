@@ -135,6 +135,8 @@ ompclaw service-install \
 
 The command reports `Installed and started <manager> service: <path>`. It installs launchd label `com.ompclaw` on macOS or user systemd unit `ompclaw.service` on Linux.
 
+Transactional self-update is available as an opt-in service mode. It stages one exact commit from a fixed trusted checkout, runs the repository checks, compiles an isolated release, finishes the active Telegram response, then lets an external supervisor switch releases. Failed startup rolls back automatically. See [Transactional self-update](docs/guide.md#transactional-self-update) before enabling it.
+
 ## What the gateway provides
 
 - One authenticated OMP RPC process with serialized session switching, streamed assistant commentary, and a final response routed only to the active authenticated conversation.
@@ -145,6 +147,7 @@ The command reports `Installed and started <manager> service: <path>`. It instal
 - SQLite-backed principals, transport identities, conversation bindings, OMP session checkpointing, inbound deduplication, UI state, durable scheduled jobs, and legacy Telegram migration markers.
 - Optional unattended automation with one-shot and cron schedules, explicit timezone support, bounded retries, restart recovery, per-principal ownership, and natural-language job control through OMP host tools.
 - Optional experimental Mnemopi memory and auto-learn capture in OmpClaw-owned state. Inherited desktop skills are refreshed into a read-only snapshot, while gateway-created managed skills and memory remain isolated in the named OMP profile.
+- Optional transactional self-update with isolated release builds, post-response activation, an external restart supervisor, readiness verification, automatic rollback, and post-restart result delivery.
 
 Read the [operator guide](docs/guide.md) for configuration, migration, operations, and security boundaries. Read the [RPC and transport reference](docs/rpc-service.md) for the command and protocol matrix.
 

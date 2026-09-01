@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Add opt-in transactional self-update from a fixed trusted checkout, with isolated release builds, post-response activation, an external service supervisor, startup readiness verification, automatic rollback, and post-restart result delivery.
+
 ## 0.8.0 (2026-08-31)
 
 ### Changed

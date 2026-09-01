@@ -13,6 +13,7 @@ import type {
 } from "./gateway-types";
 import type { GatewayDelivery } from "./gateway-tools";
 import type { GatewayTurnLifecycleStore, TurnLifecycle } from "./gateway-store";
+import type { GatewayUpdateControl } from "./gateway-update";
 import type { RpcCommandInput } from "./rpc-client";
 import type { RpcRuntimeConfig } from "./rpc-config";
 import type { RpcRecord, RpcResponse, RpcSessionState } from "./rpc-protocol";
@@ -437,6 +438,226 @@ describe("RpcGatewayRuntime", () => {
       },
     });
     expect(deliveries.filter((call) => call.method === "react").map((call) => call.reaction?.emoji)).toEqual(["👀", "👍"]);
+    await runtime.stop();
+  });
+
+  test("commits activation only after final delivery and discards it when delivery fails", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const successful = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    await successful.start();
+    await successful.handleInbound(message("update-success", "Activate"));
+    FakeOmpRpcClient.instances[0]!.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Activation scheduled" }] }],
+    });
+    await waitFor(() => calls.includes("commit"));
+    expect(calls).toEqual(["commit"]);
+    await successful.stop();
+
+    const failedDelivery = delivery();
+    failedDelivery.finalize = async () => {
+      throw new Error("final delivery failed");
+    };
+    const failed = new RpcGatewayRuntime(
+      { config, delivery: failedDelivery, updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
+    await failed.start();
+    await failed.handleInbound(message("update-failure", "Activate"));
+    FakeOmpRpcClient.instances[1]!.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Activation scheduled" }] }],
+    });
+    await waitFor(() => calls.includes("discard"));
+    expect(calls).toEqual(["commit", "discard"]);
+    await failed.stop();
+  });
+
+  test("does not start a queued turn until activation commit finishes", async () => {
+    const commitEntered = Promise.withResolvers<void>();
+    const releaseCommit = Promise.withResolvers<void>();
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        commitEntered.resolve();
+        await releaseCommit.promise;
+      },
+      async discardArmed() {
+        throw new Error("not used");
+      },
+    };
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    await runtime.start();
+    await runtime.handleInbound(message("update-serial-first", "Activate"));
+    const queued = runtime.handleInbound(message("update-serial-second", "Run next"));
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Activation scheduled" }] }],
+    });
+    await commitEntered.promise;
+
+    expect(rpc.sent.filter((command) => command.type === "prompt")).toHaveLength(1);
+    releaseCommit.resolve();
+    await waitFor(() => rpc.sent.filter((command) => command.type === "prompt").length === 2);
+    await queued;
+
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Next complete" }] }],
+    });
+    await runtime.waitUntilIdle();
+    await runtime.stop();
+  });
+
+  test("commits activation even when the post-turn state refresh fails", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const runtime = new RpcGatewayRuntime(
+      { config, delivery: delivery(), updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
+    await runtime.start();
+    await runtime.handleInbound(message("update-refresh-failure", "Activate"));
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    rpc.failNextGetState = true;
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Activation scheduled" }] }],
+    });
+    await waitFor(() => calls.includes("commit"));
+
+    expect(calls).toEqual(["commit"]);
+    await runtime.stop();
+  });
+
+  test("discards activation when the terminal turn is stopped or failed", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    await runtime.start();
+    await runtime.handleInbound(message("update-stopped-final", "Activate"));
+    FakeOmpRpcClient.instances[0]!.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{
+        role: "assistant",
+        stopReason: "aborted",
+        content: [{ type: "text", text: "Activation scheduled" }],
+      }],
+    });
+    await waitFor(() => calls.includes("discard"));
+
+    expect(calls).toEqual(["discard"]);
+    await runtime.stop();
+  });
+
+  test("discards activation when the terminal response is empty", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    await runtime.start();
+    await runtime.handleInbound(message("update-empty-final", "Activate"));
+    FakeOmpRpcClient.instances[0]!.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "" }] }],
+    });
+    await waitFor(() => calls.includes("discard"));
+
+    expect(calls).toEqual(["discard"]);
+    await runtime.stop();
+  });
+
+  test("discards an armed update when the RPC child exits", async () => {
+    const calls: string[] = [];
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        calls.push("commit");
+      },
+      async discardArmed() {
+        calls.push("discard");
+      },
+    };
+    const runtime = new RpcGatewayRuntime(
+      { config, delivery: delivery(), updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
+    await runtime.start();
+    await runtime.handleInbound(message("update-rpc-exit", "Activate"));
+    FakeOmpRpcClient.instances[0]!.exit(new Error("RPC child exited"));
+    await waitFor(() => calls.includes("discard"));
+
+    expect(calls).toEqual(["discard"]);
     await runtime.stop();
   });
 
