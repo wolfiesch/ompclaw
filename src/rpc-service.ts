@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -85,7 +85,7 @@ export function buildManagedServiceArguments(
   paths: GatewayServicePaths,
 ): string[] {
   return [
-    join(gatewayUpdatePaths(config.stateDir).current, "ompclaw-supervisor"),
+    join(gatewayUpdatePaths(config.stateDir).root, "ompclaw-supervisor"),
     "--state-dir",
     config.stateDir,
     "--config",
@@ -104,6 +104,9 @@ export async function prepareServiceArguments(
   if (!config.updates.enabled) return buildServiceArguments(paths);
   const updates = new GatewayUpdateCoordinator({ config: config.updates, stateDir: config.stateDir });
   const staged = await updates.stage("HEAD");
+  const supervisorPath = join(updates.paths.root, "ompclaw-supervisor");
+  copyFileSync(join(staged.release.path, "ompclaw-supervisor"), supervisorPath);
+  chmodSync(supervisorPath, 0o700);
   updates.bootstrap(staged.release);
   return buildManagedServiceArguments(config, paths);
 }

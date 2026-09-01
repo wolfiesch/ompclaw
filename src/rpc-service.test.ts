@@ -50,7 +50,7 @@ describe("systemd service generation", () => {
     });
 
     expect(args).toEqual([
-      "/home/user/.omp/agent/ompclaw/updates/current/ompclaw-supervisor",
+      "/home/user/.omp/agent/ompclaw/updates/ompclaw-supervisor",
       "--state-dir",
       "/home/user/.omp/agent/ompclaw",
       "--config",

@@ -27,7 +27,7 @@ import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } f
 import { RpcGatewayRuntime, runtimeCommandMenu, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import type { RpcSessionState } from "./rpc-protocol";
 import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
-import { GatewayUpdateCoordinator } from "./gateway-update";
+import { GatewayUpdateCoordinator, currentGatewayRelease, gatewayUpdatePaths } from "./gateway-update";
 import { TelegramTransportAdapter, type TelegramTransportAdapterOptions } from "./transports/telegram/adapter";
 import { WebSocketTransportAdapter, type WebSocketTransportOptions } from "./transports/websocket/adapter";
 
@@ -219,7 +219,11 @@ export class GatewayApplication {
       if (learningOverlay !== undefined) rpcConfig = { ...rpcConfig, configFiles: [...rpcConfig.configFiles, learningOverlay] };
 
       const updates = this.#config.updates.enabled
-        ? new GatewayUpdateCoordinator({ config: this.#config.updates, stateDir: this.#config.stateDir })
+        ? new GatewayUpdateCoordinator({
+            config: this.#config.updates,
+            stateDir: this.#config.stateDir,
+            activationEnabled: isSupervisorManagedUpdateProcess(this.#config.stateDir),
+          })
         : undefined;
       await updates?.discardArmed();
       this.#updates = updates;
@@ -657,6 +661,16 @@ export class GatewayApplication {
 
 export function gatewayDatabasePath(config: Pick<GatewayConfig, "stateDir">): string {
   return join(config.stateDir, "ompclaw.sqlite");
+}
+
+function isSupervisorManagedUpdateProcess(stateDir: string): boolean {
+  const releaseId = process.env.OMPCLAW_RELEASE_ID;
+  if (releaseId === undefined) return false;
+  try {
+    return currentGatewayRelease(gatewayUpdatePaths(stateDir)).id === releaseId;
+  } catch {
+    return false;
+  }
 }
 
 function requireScheduledStore(store: GatewayApplicationStore): GatewayScheduledJobStore {

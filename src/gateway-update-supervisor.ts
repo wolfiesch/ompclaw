@@ -139,7 +139,12 @@ export class GatewayUpdateSupervisor {
 
     const ready = await this.#waitForCandidate(requestId);
     if (ready) {
-      switchCurrentRelease(this.#paths, candidate.path);
+      if (active.id === previous.id) {
+        switchCurrentRelease(this.#paths, candidate.path);
+        this.#replacementRequested = true;
+        this.stop();
+        return candidate;
+      }
       const result: GatewayUpdateResult = {
         schema: 1,
         requestId,
@@ -150,8 +155,6 @@ export class GatewayUpdateSupervisor {
       };
       writeUpdateResult(this.#paths.result, result);
       this.#seams.onResult?.(result);
-      this.#replacementRequested = true;
-      this.stop();
       this.#restartAttempt = 0;
       return candidate;
     }
