@@ -139,7 +139,7 @@ service: send the bot a direct message, copy the short-lived pairing code from
 its reply, and run the local approval command shown in that reply:
 
 ```bash
-ompclaw pairing-approve ABC234 \
+ompclaw pairing-approve ABCD2345 \
   --config ~/.config/ompclaw/config.json
 ```
 
@@ -148,9 +148,10 @@ normal OMP conversation. If the gateway is stopped, `ompclaw pairing-listen`
 provides the bootstrap listener and prints the code and approval command only
 on the gateway host.
 
-The request expires after ten minutes. A user receives at most two challenges
-per unresolved request, and only three pending requests are retained per
-Telegram account. Five invalid local approval attempts exhaust a request.
+The request expires after ten minutes. Each unresolved identity retains one
+pending request; a new private message rotates its code instead of accumulating
+another record. Only three pending requests are retained per Telegram account.
+Five invalid local approval attempts exhaust a request.
 `pairing-list` shows token-free request metadata; `pairing-reject` denies a
 request; and `pairing-clear` removes all pairing request records without
 changing approved principal bindings.

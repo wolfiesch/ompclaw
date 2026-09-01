@@ -52,7 +52,7 @@ const SELECT_PAGE_SIZE = 8;
 const TOPIC_NAME_LIMIT = 128;
 const PAIRING_APPROVAL_CHECK_MS = 1_000;
 
-function startPairingApprovalMonitor(run: () => void): () => void {
+function startPairingApprovalMonitor(run: () => void | Promise<void>): () => void {
   run();
   const timer = setInterval(run, PAIRING_APPROVAL_CHECK_MS);
   timer.unref();
@@ -60,7 +60,7 @@ function startPairingApprovalMonitor(run: () => void): () => void {
 }
 
 function pairingCheckpoint(kind: "runtime" | "confirmed", request: PairingRequestView): string {
-  return `pairing:${kind}:${request.identity.account}:${request.identity.subject}:${request.createdAt}`;
+  return `pairing:${kind}:${encodeURIComponent(request.identity.account)}:${encodeURIComponent(request.identity.subject)}`;
 }
 
 
@@ -84,7 +84,7 @@ export interface TelegramApiSeams {
   readonly now?: () => number;
   readonly randomId?: () => string;
   readonly transcribe?: (command: readonly string[], file: string, signal?: AbortSignal) => Promise<string>;
-  readonly startPairingApprovalMonitor?: (run: () => void) => () => void;
+  readonly startPairingApprovalMonitor?: (run: () => void | Promise<void>) => () => void;
 }
 
 export interface TelegramTransportAdapterOptions {
@@ -1363,11 +1363,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
       ].join("\n"),
       { principal, origin: address },
     );
-    this.#store.setCheckpoint(this.id, pairingCheckpoint("runtime", request), true);
+    this.#store.setCheckpoint(this.id, pairingCheckpoint("runtime", request), request.createdAt);
   }
 
-  #schedulePairingApprovalDrain(): void {
-    if (this.#context === undefined || this.#pairingApprovalDrain !== undefined) return;
+  #schedulePairingApprovalDrain(): Promise<void> | undefined {
+    if (this.#context === undefined) return;
+    if (this.#pairingApprovalDrain !== undefined) return this.#pairingApprovalDrain;
     const drain = this.#drainPairingApprovals()
       .catch((error) => {
         this.#log?.warn(
@@ -1378,6 +1379,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
         if (this.#pairingApprovalDrain === drain) this.#pairingApprovalDrain = undefined;
       });
     this.#pairingApprovalDrain = drain;
+    return drain;
   }
 
   async #drainPairingApprovals(): Promise<void> {
@@ -1392,8 +1394,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
           request.principalId !== undefined &&
           request.identity.transport === "telegram" &&
           request.identity.account === this.#account &&
-          this.#store.getCheckpoint(this.id, pairingCheckpoint("runtime", request)) === true &&
-          this.#store.getCheckpoint(this.id, pairingCheckpoint("confirmed", request)) !== true,
+          this.#store.getCheckpoint(this.id, pairingCheckpoint("runtime", request)) === request.createdAt &&
+          this.#store.getCheckpoint(this.id, pairingCheckpoint("confirmed", request)) !== request.createdAt,
       );
     for (const request of approved) {
       try {
@@ -1406,7 +1408,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
           {},
           context.signal,
         );
-        this.#store.setCheckpoint(this.id, pairingCheckpoint("confirmed", request), true);
+        this.#store.setCheckpoint(this.id, pairingCheckpoint("confirmed", request), request.createdAt);
       } catch (error) {
         if (context.signal?.aborted) return;
         this.#log?.warn(

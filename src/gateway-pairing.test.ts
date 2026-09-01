@@ -233,10 +233,13 @@ describe("GatewayPairingService", () => {
     expect(store.resolvePrincipal(identity("100"))).toEqual({ id: "operator:telegram:default:100", roles: ["operator"] });
     store.close();
   });
-  test("bounds pending runtime challenges per account while allowing code rotation", () => {
+  test("bounds pending runtime challenges per transport account while allowing code rotation", () => {
     const store = new GatewayStore(temporaryDatabase());
-    const pairing = service(store, "FIRST001", "SECOND01", "THIRD001", "ROTATE01");
+    const pairing = service(store, "WSFIRST1", "FIRST001", "SECOND01", "THIRD001", "ROTATE01");
+    const websocketIdentity = { ...identity("websocket"), transport: "websocket" };
+    const websocketAddress = { ...address("websocket"), transport: "websocket" };
 
+    expect(pairing.requestFromTransport(websocketIdentity, websocketAddress, now).status).toBe("created");
     expect(pairing.requestFromTransport(identity("100"), address("100"), now).status).toBe("created");
     expect(pairing.requestFromTransport(identity("200"), address("200"), now).status).toBe("created");
     expect(pairing.requestFromTransport(identity("300"), address("300"), now).status).toBe("created");
@@ -252,7 +255,7 @@ describe("GatewayPairingService", () => {
         }),
       }),
     );
-    expect(pairing.list(now + 1)).toHaveLength(3);
+    expect(pairing.list(now + 1)).toHaveLength(4);
     store.close();
   });
 

@@ -68,7 +68,7 @@ export class FakeTelegramApi {
   readonly poller = new TelegramTestPoller();
   readonly seams: TelegramApiSeams;
   #messageId = 200;
-  #pairingApprovalRun: (() => void) | undefined;
+  #pairingApprovalRun: (() => void | Promise<void>) | undefined;
 
   constructor(options: FakeTelegramApiOptions = {}) {
     this.seams = {
@@ -107,9 +107,7 @@ export class FakeTelegramApi {
   }
 
   async flushPairingApprovals(): Promise<void> {
-    this.#pairingApprovalRun?.();
-    await Promise.resolve();
-    await Promise.resolve();
+    await this.#pairingApprovalRun?.();
   }
 }
 

@@ -276,7 +276,10 @@ export class GatewayPairingService {
   now = Date.now(),
  ): RuntimePairingRequestResult {
   const pending = this.list(now).filter(
-   (request) => request.state === "pending" && request.identity.account === identity.account,
+   (request) =>
+    request.state === "pending" &&
+    request.identity.transport === identity.transport &&
+    request.identity.account === identity.account,
   );
   const existing = pending.some(
    (request) =>

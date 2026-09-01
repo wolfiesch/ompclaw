@@ -281,7 +281,7 @@ describe("Telegram inbound conversion", () => {
     });
   });
 
-  test("pairs an unresolved private sender without dispatching the challenge message", async () => {
+  test("pairs an unresolved private sender without dispatching the inbound task", async () => {
     const requests: PairingRequestView[] = [];
     let pairedPrincipal: Principal | undefined;
     const pairing = {
@@ -317,6 +317,7 @@ describe("Telegram inbound conversion", () => {
     expect(harness.received).toEqual([]);
     expect(sentMessage(harness.calls).payload.text).toContain("Pairing code: ABCD2345");
     expect(sentMessage(harness.calls).payload.text).toContain("ompclaw pairing-approve ABCD2345");
+    expect(harness.checkpoints.get("telegram\0pairing:runtime:primary:99")).toBe(1_800_000_000_000);
 
     pairedPrincipal = { id: "operator:telegram:primary:99", roles: ["operator"] };
     requests[0] = {
@@ -332,6 +333,7 @@ describe("Telegram inbound conversion", () => {
       (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
     ).length;
     await harness.flushPairingApprovals();
+    expect(harness.checkpoints.get("telegram\0pairing:confirmed:primary:99")).toBe(1_800_000_000_000);
     expect(
       harness.calls.filter(
         (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",

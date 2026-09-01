@@ -290,7 +290,7 @@ gateway. An unknown sender messages the bot privately and receives a short-lived
 pairing code plus the local command:
 
 ```bash
-ompclaw pairing-approve ABC234 \
+ompclaw pairing-approve ABCD2345 \
   --config ~/.config/ompclaw/config.json
 ```
 
