@@ -31,7 +31,11 @@ afterEach(async () => {
 
 function harness(call?: (method: string, payload: Record<string, unknown>) => Promise<unknown>) {
   const calls: TelegramInvocation[] = [];
-  const uploads: Array<TelegramInvocation & { readonly file: { readonly field: string; readonly path: string; readonly filename?: string } }> = [];
+  const uploads: Array<
+    TelegramInvocation & {
+      readonly file: { readonly field: string; readonly path: string; readonly filename?: string };
+    }
+  > = [];
   let messageId = 100;
   const outbound = new Outbound({
     token: "token",
@@ -55,12 +59,19 @@ describe("Telegram outbound delivery", () => {
     const { outbound, calls } = harness();
     const preview = await outbound.send(address, { text: "working", transient: true }, context);
     expect(telegramDraftId(preview)).toBe(71);
-    await expect(outbound.update(address, preview, { text: "still working", transient: true }, context)).resolves.toEqual(preview);
+    await expect(
+      outbound.update(address, preview, { text: "still working", transient: true }, context),
+    ).resolves.toEqual(preview);
     const final = await outbound.finalize(address, preview, { text: "done" }, context);
 
     expect(calls.map((entry) => entry.method)).toEqual(["sendMessageDraft", "sendMessageDraft", "sendMessage"]);
     expect(calls[0]?.payload).toMatchObject({ chat_id: "42", message_thread_id: 7, can_stop: true, text: "working" });
-    expect(calls[1]?.payload).toMatchObject({ chat_id: "42", message_thread_id: 7, can_stop: true, text: "still working" });
+    expect(calls[1]?.payload).toMatchObject({
+      chat_id: "42",
+      message_thread_id: 7,
+      can_stop: true,
+      text: "still working",
+    });
     expect(final).toEqual([{ transport: "telegram", messageId: "101" }]);
     expect(calls[2]?.payload).toMatchObject({ chat_id: "42", message_thread_id: 7, text: "done" });
   });
@@ -81,10 +92,14 @@ describe("Telegram outbound delivery", () => {
 
   test("chunks long text, replies once, and returns the first receipt", async () => {
     const { outbound, calls } = harness();
-    const receipt = await outbound.send(address, {
-      text: `first paragraph\n\n${"x".repeat(4_300)}`,
-      replyTo: { transport: "telegram", messageId: "12" },
-    }, context);
+    const receipt = await outbound.send(
+      address,
+      {
+        text: `first paragraph\n\n${"x".repeat(4_300)}`,
+        replyTo: { transport: "telegram", messageId: "12" },
+      },
+      context,
+    );
     const sends = calls.filter((entry) => entry.method === "sendMessage");
     expect(sends.length).toBeGreaterThan(1);
     expect(sends[0]?.payload.reply_to_message_id).toBe(12);
@@ -95,15 +110,10 @@ describe("Telegram outbound delivery", () => {
   test("chunks direct UI text and keeps controls on the final message", async () => {
     const { outbound, calls } = harness();
     const replyMarkup = { inline_keyboard: [[{ text: "Approve", callback_data: "approve" }]] };
-    const receipt = await outbound.sendMessage(
-      address,
-      "x".repeat(TELEGRAM_MAX_CHARS + 200),
-      context,
-      {
-        replyTo: { transport: "telegram", messageId: "12" },
-        replyMarkup,
-      },
-    );
+    const receipt = await outbound.sendMessage(address, "x".repeat(TELEGRAM_MAX_CHARS + 200), context, {
+      replyTo: { transport: "telegram", messageId: "12" },
+      replyMarkup,
+    });
     const sends = calls.filter((entry) => entry.method === "sendMessage");
     expect(sends.length).toBeGreaterThan(1);
     expect(sends.every((entry) => String(entry.payload.text).length <= TELEGRAM_MAX_CHARS)).toBe(true);
@@ -114,15 +124,45 @@ describe("Telegram outbound delivery", () => {
     expect(receipt.messageId).toBe(String(100 + sends.length));
   });
 
+  test("maps silent policy to every persistent text payload and omits it by default", async () => {
+    const { outbound, calls } = harness();
+    await outbound.send(
+      address,
+      {
+        text: "x".repeat(TELEGRAM_MAX_CHARS + 200),
+        notification: "silent",
+      },
+      context,
+    );
+    const silentSends = calls.filter((entry) => entry.method === "sendMessage");
+    expect(silentSends).not.toHaveLength(0);
+    expect(silentSends.every((entry) => entry.payload.disable_notification === true)).toBe(true);
+
+    calls.splice(0);
+    await outbound.send(address, { text: "default" }, context);
+    expect(calls[0]?.payload).not.toHaveProperty("disable_notification");
+  });
+
+  test("keeps replacement chunks silent when creating new direct-message chunks", async () => {
+    const { outbound, calls } = harness();
+    const initial = await outbound.sendMessages(address, "initial", context);
+    calls.splice(0);
+
+    await outbound.replaceMessages(address, initial, "x".repeat(TELEGRAM_MAX_CHARS + 200), context, {
+      notification: "silent",
+    });
+
+    const replacements = calls.filter((entry) => entry.method === "sendMessage");
+    expect(replacements).toHaveLength(1);
+    expect(replacements[0]?.payload.disable_notification).toBe(true);
+  });
+
   test("replaces every chunk of a mutable direct message and removes stale chunks", async () => {
     const { outbound, calls } = harness();
     const replyMarkup = { inline_keyboard: [[{ text: "Stop", callback_data: "stop" }]] };
-    const initial = await outbound.sendMessages(
-      address,
-      "x".repeat(TELEGRAM_MAX_CHARS + 200),
-      context,
-      { replyMarkup },
-    );
+    const initial = await outbound.sendMessages(address, "x".repeat(TELEGRAM_MAX_CHARS + 200), context, {
+      replyMarkup,
+    });
     expect(initial).toHaveLength(2);
     calls.splice(0);
 
@@ -157,11 +197,7 @@ describe("Telegram outbound delivery", () => {
       if (method === "sendMessage") return { message_id: ++messageId };
       return true;
     });
-    const initial = await outbound.sendMessages(
-      address,
-      "x".repeat(TELEGRAM_MAX_CHARS + 200),
-      context,
-    );
+    const initial = await outbound.sendMessages(address, "x".repeat(TELEGRAM_MAX_CHARS + 200), context);
     calls.splice(0);
 
     const compact = await outbound.replaceMessages(address, initial, "updated", context);
@@ -178,21 +214,14 @@ describe("Telegram outbound delivery", () => {
       return true;
     });
     const replyMarkup = { inline_keyboard: [[{ text: "Stop", callback_data: "stop" }]] };
-    const initial = await outbound.sendMessages(
-      address,
-      "x".repeat(TELEGRAM_MAX_CHARS + 200),
-      context,
-      { replyMarkup },
-    );
+    const initial = await outbound.sendMessages(address, "x".repeat(TELEGRAM_MAX_CHARS + 200), context, {
+      replyMarkup,
+    });
     calls.splice(0);
 
     const retained = await outbound.replaceMessages(address, initial, "updated", context, { replyMarkup });
     expect(retained).toEqual(initial);
-    expect(calls.map((entry) => entry.method)).toEqual([
-      "deleteMessage",
-      "editMessageText",
-      "editMessageText",
-    ]);
+    expect(calls.map((entry) => entry.method)).toEqual(["deleteMessage", "editMessageText", "editMessageText"]);
     const edits = calls.filter((entry) => entry.method === "editMessageText");
     expect(edits[0]?.payload).toMatchObject({
       message_id: 101,
@@ -232,17 +261,32 @@ describe("Telegram outbound delivery", () => {
     await writeFile(report, "report");
     const { outbound, uploads } = harness();
 
-    const receipt = await outbound.send(address, {
-      attachments: [
-        { url: pathToFileURL(image).href, name: "shot.png", mediaType: "image/png" },
-        { url: pathToFileURL(report).href, name: "report.txt", mediaType: "text/plain" },
-      ],
-    }, context);
+    const receipt = await outbound.send(
+      address,
+      {
+        notification: "silent",
+        attachments: [
+          { url: pathToFileURL(image).href, name: "shot.png", mediaType: "image/png" },
+          { url: pathToFileURL(report).href, name: "report.txt", mediaType: "text/plain" },
+        ],
+      },
+      context,
+    );
     expect(uploads.map((entry) => [entry.method, entry.file.field, entry.file.filename])).toEqual([
       ["sendPhoto", "photo", "shot.png"],
       ["sendDocument", "document", "report.txt"],
     ]);
     expect(receipt.messageId).toBe("101");
+    expect(uploads.every((entry) => entry.payload.disable_notification === "true")).toBe(true);
+    uploads.splice(0);
+    await outbound.send(
+      address,
+      {
+        attachments: [{ url: pathToFileURL(image).href, name: "shot.png", mediaType: "image/png" }],
+      },
+      context,
+    );
+    expect(uploads[0]?.payload).not.toHaveProperty("disable_notification");
   });
 
   test("edits persistent messages and tolerates unchanged final text", async () => {
@@ -265,8 +309,14 @@ describe("Telegram outbound delivery", () => {
 
   test("rejects cross-account, cross-transport, and unauthorized targets", async () => {
     const { outbound } = harness();
-    await expect(outbound.send({ ...address, account: "other" }, { text: "x" }, context)).rejects.toThrow("another account");
-    await expect(outbound.send({ ...address, transport: "email" }, { text: "x" }, context)).rejects.toThrow("Telegram address");
-    await expect(outbound.send({ ...address, channel: "99" }, { text: "x" }, context)).rejects.toThrow("not authorized");
+    await expect(outbound.send({ ...address, account: "other" }, { text: "x" }, context)).rejects.toThrow(
+      "another account",
+    );
+    await expect(outbound.send({ ...address, transport: "email" }, { text: "x" }, context)).rejects.toThrow(
+      "Telegram address",
+    );
+    await expect(outbound.send({ ...address, channel: "99" }, { text: "x" }, context)).rejects.toThrow(
+      "not authorized",
+    );
   });
 });

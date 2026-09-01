@@ -63,11 +63,13 @@ describe("Telegram transport lifecycle", () => {
   test("removes its temporary state directory when startup fails", async () => {
     const prefix = "ompclaw adapter ";
     const entriesBefore = new Set(await readdir(tmpdir()));
-    await expect(fixture({
-      pendingAttachmentName: "startup-failure.bin",
-      commands: [{ command: "home", description: "Open control center" }],
-      setCommandsError: new TgError("Unauthorized", 401),
-    })).rejects.toThrow("Unauthorized");
+    await expect(
+      fixture({
+        pendingAttachmentName: "startup-failure.bin",
+        commands: [{ command: "home", description: "Open control center" }],
+        setCommandsError: new TgError("Unauthorized", 401),
+      }),
+    ).rejects.toThrow("Unauthorized");
     const leakedPaths = (await readdir(tmpdir()))
       .filter((entry) => entry.startsWith(prefix) && !entriesBefore.has(entry))
       .map((entry) => join(tmpdir(), entry));
@@ -78,7 +80,9 @@ describe("Telegram transport lifecycle", () => {
   test("removes temporary state and unregisters when polling stop fails", async () => {
     const harness = await fixture();
     const stopError = new Error("poller stop failed");
-    harness.poller.stop = () => { throw stopError; };
+    harness.poller.stop = () => {
+      throw stopError;
+    };
 
     const result = await harness.dispose().then(
       () => new Error("harness disposal unexpectedly resolved"),
@@ -91,7 +95,9 @@ describe("Telegram transport lifecycle", () => {
 
   test("preserves an undefined polling stop rejection", async () => {
     const harness = await fixture();
-    harness.poller.stop = () => { throw undefined; };
+    harness.poller.stop = () => {
+      throw undefined;
+    };
 
     const result = await harness.dispose().then(
       () => ({ rejected: false, error: new Error("harness disposal unexpectedly resolved") }),
@@ -106,7 +112,9 @@ describe("Telegram transport lifecycle", () => {
   test("waits for an in-flight polled update before shutdown completes", async () => {
     let entered = false;
     let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     const { adapter, poller } = await fixture({
       receive: async () => {
         entered = true;
@@ -117,7 +125,9 @@ describe("Telegram transport lifecycle", () => {
     if (!update) throw new Error("poller did not capture its update handler");
     while (!entered) await flush();
     let stopped = false;
-    const stopping = adapter.stop().then(() => { stopped = true; });
+    const stopping = adapter.stop().then(() => {
+      stopped = true;
+    });
     await flush();
     expect(stopped).toBe(false);
     release();
@@ -133,14 +143,16 @@ describe("Telegram transport lifecycle", () => {
       stateDir,
       store: {
         getCheckpoint: () => undefined,
-        setCheckpoint: () => { },
-        putPendingInteraction: () => { },
-        deletePendingInteraction: () => { },
+        setCheckpoint: () => {},
+        putPendingInteraction: () => {},
+        deletePendingInteraction: () => {},
         listPendingInboundMessages: () => [],
       },
       api: { acquireLock: () => ({ ok: false, holder: 912 }) },
     });
-    await expect(adapter.start({ receive: async () => { }, resolveIdentity: () => owner })).rejects.toThrow("process 912");
+    await expect(adapter.start({ receive: async () => {}, resolveIdentity: () => owner })).rejects.toThrow(
+      "process 912",
+    );
   });
 });
 
@@ -152,10 +164,12 @@ describe("Telegram typing", () => {
 
     await adapter.typing(address, context);
 
-    expect(calls).toEqual([{
-      method: "sendChatAction",
-      payload: { chat_id: "-100", message_thread_id: 19, action: "typing" },
-    }]);
+    expect(calls).toEqual([
+      {
+        method: "sendChatAction",
+        payload: { chat_id: "-100", message_thread_id: 19, action: "typing" },
+      },
+    ]);
   });
 });
 
@@ -163,15 +177,17 @@ describe("Telegram inbound conversion", () => {
   test("converts a private message into a principal-free gateway envelope", async () => {
     const { adapter, received, checkpoints } = await fixture();
     await adapter.handleUpdate({ update_id: 5, message: message() });
-    expect(received).toEqual([{
-      id: "telegram:primary:42:10",
-      sentAt: 1_800_000_000_000,
-      identity: { transport: "telegram", account: "primary", subject: "42" },
-      address: baseAddress,
-      content: { text: "hello" },
-      sourceReceipt: { transport: "telegram", messageId: "10" },
-      edited: false,
-    }]);
+    expect(received).toEqual([
+      {
+        id: "telegram:primary:42:10",
+        sentAt: 1_800_000_000_000,
+        identity: { transport: "telegram", account: "primary", subject: "42" },
+        address: baseAddress,
+        content: { text: "hello" },
+        sourceReceipt: { transport: "telegram", messageId: "10" },
+        edited: false,
+      },
+    ]);
     expect(checkpoints.get("telegram\0update_id:primary")).toBe(5);
   });
 
@@ -213,7 +229,6 @@ describe("Telegram inbound conversion", () => {
     expect(received).toEqual([]);
     expect(calls.some((entry) => entry.method === "getFile")).toBe(false);
   });
-
 
   test("downloads attachments into the private inbox before dispatch", async () => {
     const { adapter, received } = await fixture();
@@ -268,10 +283,12 @@ describe("Telegram inbound conversion", () => {
     } as const;
     await expect(adapter.handleUpdate(update)).rejects.toThrow("temporary receive failure");
     await adapter.handleUpdate(update);
-    expect(calls.filter((entry) => entry.method === "createForumTopic")).toEqual([{
-      method: "createForumTopic",
-      payload: { chat_id: -100, name: "Plan a release" },
-    }]);
+    expect(calls.filter((entry) => entry.method === "createForumTopic")).toEqual([
+      {
+        method: "createForumTopic",
+        payload: { chat_id: -100, name: "Plan a release" },
+      },
+    ]);
     expect(received.map((entry) => entry.address.thread)).toEqual(["77"]);
   });
 });
@@ -279,13 +296,17 @@ describe("Telegram inbound conversion", () => {
 describe("Telegram interactive UI", () => {
   test("settles a confirm request from its owning principal and clears persistence", async () => {
     const { adapter, calls, pending } = await fixture();
-    const answer = adapter.presentUi(baseAddress, {
-      type: "confirm",
-      title: "Deploy",
-      message: "Ship this build?",
-      confirmLabel: "Ship",
-      cancelLabel: "Wait",
-    }, delivery);
+    const answer = adapter.presentUi(
+      baseAddress,
+      {
+        type: "confirm",
+        title: "Deploy",
+        message: "Ship this build?",
+        confirmLabel: "Ship",
+        cancelLabel: "Wait",
+      },
+      delivery,
+    );
     await flush();
     const prompt = sentMessage(calls);
     expect(pending.has("interaction-id")).toBe(true);
@@ -304,11 +325,15 @@ describe("Telegram interactive UI", () => {
 
   test("accepts text input only as a reply to the correlated prompt", async () => {
     const { adapter, calls } = await fixture();
-    const answer = adapter.presentUi(baseAddress, {
-      type: "input",
-      title: "Release name",
-      prompt: "Enter a name",
-    }, delivery);
+    const answer = adapter.presentUi(
+      baseAddress,
+      {
+        type: "input",
+        title: "Release name",
+        prompt: "Enter a name",
+      },
+      delivery,
+    );
     await flush();
     const prompt = sentMessage(calls);
     const promptId = 201;
@@ -340,14 +365,60 @@ describe("Telegram interactive UI", () => {
     expect(received[0]).toMatchObject({ content: { text: "/stop" }, address: baseAddress });
   });
 
+  test("passes status notification policy to control-card sends and new chunks", async () => {
+    const { adapter, calls } = await fixture();
+    await adapter.presentUi(
+      baseAddress,
+      {
+        type: "status",
+        key: "Task",
+        text: "Working",
+        notification: "silent",
+      },
+      delivery,
+    );
+    expect(sentMessage(calls).payload.disable_notification).toBe(true);
+
+    calls.splice(0);
+    await adapter.presentUi(
+      baseAddress,
+      {
+        type: "status",
+        key: "Task",
+        text: "x".repeat(TELEGRAM_MAX_CHARS),
+        notification: "silent",
+      },
+      delivery,
+    );
+    const newChunk = calls.find((entry) => entry.method === "sendMessage");
+    expect(newChunk?.payload.disable_notification).toBe(true);
+
+    const { adapter: defaultAdapter, calls: defaultCalls } = await fixture();
+    await defaultAdapter.presentUi(
+      baseAddress,
+      {
+        type: "status",
+        key: "Task",
+        text: "Idle",
+        notification: "default",
+      },
+      delivery,
+    );
+    expect(sentMessage(defaultCalls).payload).not.toHaveProperty("disable_notification");
+  });
+
   test("moves a multipart control card and its stop button as one mutable unit", async () => {
     const { adapter, calls, received } = await fixture();
     await adapter.presentUi(baseAddress, { type: "status", key: "Task", text: "Working" }, delivery);
-    await adapter.presentUi(baseAddress, {
-      type: "widget",
-      key: "Details",
-      lines: ["x".repeat(TELEGRAM_MAX_CHARS)],
-    }, delivery);
+    await adapter.presentUi(
+      baseAddress,
+      {
+        type: "widget",
+        key: "Details",
+        lines: ["x".repeat(TELEGRAM_MAX_CHARS)],
+      },
+      delivery,
+    );
     const sends = calls.filter((entry) => entry.method === "sendMessage");
     const final = sends.at(-1);
     if (!final) throw new Error("expected multipart control card");
@@ -372,7 +443,7 @@ describe("Telegram interactive UI", () => {
   test("rejects a stop button click from a different authorized principal", async () => {
     const attacker: Principal = { id: "principal-attacker", roles: ["operator"] };
     const { adapter, calls, received } = await fixture({
-      resolve: (subject) => subject === "42" ? owner : attacker,
+      resolve: (subject) => (subject === "42" ? owner : attacker),
     });
     await adapter.presentUi(baseAddress, { type: "status", key: "Task", text: "Working\nDeploying" }, delivery);
     const card = sentMessage(calls);

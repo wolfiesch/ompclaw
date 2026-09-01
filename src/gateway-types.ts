@@ -20,7 +20,6 @@ export interface DeliveryContext {
   readonly origin: ConversationAddress;
 }
 
-
 export interface MessageAttachment {
   readonly url: string;
   readonly name?: string;
@@ -52,11 +51,15 @@ export interface InboundMessage extends InboundEnvelope {
   readonly principal: Principal;
 }
 
+export type OutboundNotification = "default" | "silent";
+
 export interface OutboundContent {
   readonly text?: string;
   readonly attachments?: readonly MessageAttachment[];
   readonly replyTo?: OutboundReceipt;
   readonly format?: "text" | "markdown";
+  /** Transport notification policy for newly persisted outbound messages. */
+  readonly notification?: OutboundNotification;
   /** Ephemeral streaming preview; transports must persist finalized content separately. */
   readonly transient?: boolean;
 }
@@ -142,6 +145,7 @@ export interface StatusUiRequest {
   readonly type: "status";
   readonly key: string;
   readonly text?: string;
+  readonly notification?: OutboundNotification;
 }
 
 export interface WidgetUiRequest {
@@ -160,7 +164,6 @@ export interface EditorTextUiRequest {
   readonly type: "editor_text";
   readonly text: string;
 }
-
 
 export type UiRequest =
   | ConfirmUiRequest
@@ -221,7 +224,6 @@ export interface EditorTextUiResponse {
   readonly acknowledged: true;
 }
 
-
 export type UiResponse =
   | ConfirmUiResponse
   | SelectUiResponse
@@ -260,11 +262,7 @@ export interface TransportAdapter {
     context: DeliveryContext,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt>;
-  typing?(
-    address: ConversationAddress,
-    context: DeliveryContext,
-    signal?: AbortSignal,
-  ): Promise<void>;
+  typing?(address: ConversationAddress, context: DeliveryContext, signal?: AbortSignal): Promise<void>;
   update?(
     address: ConversationAddress,
     receipt: OutboundReceipt,

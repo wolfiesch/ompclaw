@@ -51,11 +51,7 @@ type InteractiveRequest = Extract<UiRequest, { type: "confirm" | "select" | "inp
 type InteractiveResponse = Extract<UiResponse, { type: "confirm" | "select" | "input" | "editor" }>;
 
 export interface TelegramPoller {
-  start(
-    token: string,
-    handleUpdate: (update: TgUpdate) => void | Promise<void>,
-    logger?: Logger,
-  ): void;
+  start(token: string, handleUpdate: (update: TgUpdate) => void | Promise<void>, logger?: Logger): void;
   stop(): void;
   done(): Promise<void>;
 }
@@ -79,7 +75,11 @@ export interface TelegramTransportAdapterOptions {
   readonly stateDir: string;
   readonly store: Pick<
     GatewayStore,
-    "getCheckpoint" | "setCheckpoint" | "putPendingInteraction" | "deletePendingInteraction" | "listPendingInboundMessages"
+    | "getCheckpoint"
+    | "setCheckpoint"
+    | "putPendingInteraction"
+    | "deletePendingInteraction"
+    | "listPendingInboundMessages"
   >;
   readonly transcribeCommand?: readonly string[];
   readonly logger?: Logger;
@@ -133,13 +133,19 @@ interface DraftRoute {
 }
 
 function sameAddress(left: ConversationAddress, right: ConversationAddress): boolean {
-  return left.transport === right.transport
-    && left.account === right.account
-    && left.channel === right.channel
-    && left.thread === right.thread;
+  return (
+    left.transport === right.transport &&
+    left.account === right.account &&
+    left.channel === right.channel &&
+    left.thread === right.thread
+  );
 }
 
-function telegramAddress(message: Pick<TgMessage, "chat" | "is_topic_message" | "message_thread_id">, account: string, thread?: number): ConversationAddress {
+function telegramAddress(
+  message: Pick<TgMessage, "chat" | "is_topic_message" | "message_thread_id">,
+  account: string,
+  thread?: number,
+): ConversationAddress {
   const topic = thread ?? (message.is_topic_message ? message.message_thread_id : undefined);
   return {
     transport: "telegram",
@@ -173,7 +179,8 @@ function isBotCommand(text: string | undefined): boolean {
 }
 
 function storedTopicThread(value: JsonValue | undefined, messageId: number): number | undefined {
-  if (value === null || typeof value !== "object" || !("messageId" in value) || !("threadId" in value)) return undefined;
+  if (value === null || typeof value !== "object" || !("messageId" in value) || !("threadId" in value))
+    return undefined;
   return value.messageId === messageId && typeof value.threadId === "number" ? value.threadId : undefined;
 }
 
@@ -249,8 +256,16 @@ function mediaFrom(message: TgMessage): MediaSelection | undefined {
     return {
       telegramId: message.sticker.file_id,
       stableId: message.sticker.file_unique_id,
-      displayName: message.sticker.is_animated ? "sticker.tgs" : message.sticker.is_video ? "sticker.webm" : "sticker.webp",
-      mediaType: message.sticker.is_animated ? "application/x-tgsticker" : message.sticker.is_video ? "video/webm" : "image/webp",
+      displayName: message.sticker.is_animated
+        ? "sticker.tgs"
+        : message.sticker.is_video
+          ? "sticker.webm"
+          : "sticker.webp",
+      mediaType: message.sticker.is_animated
+        ? "application/x-tgsticker"
+        : message.sticker.is_video
+          ? "video/webm"
+          : "image/webp",
       declaredBytes: message.sticker.file_size,
       transcribable: false,
     };
@@ -291,7 +306,9 @@ function assertRemoteFilePath(value: string): void {
   }
 }
 
-function menuCommands(input: readonly { readonly command: string; readonly description: string }[]): readonly { command: string; description: string }[] {
+function menuCommands(
+  input: readonly { readonly command: string; readonly description: string }[],
+): readonly { command: string; description: string }[] {
   const unique = new Set<string>();
   const result: { command: string; description: string }[] = [];
   for (const item of input) {
@@ -359,8 +376,9 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#store = options.store;
     this.#log = options.logger;
     this.#poller = options.api?.poller ?? new Poller();
-    this.#call = options.api?.callTelegram ?? ((method, payload = {}, request = {}) =>
-      tg(this.#token, method, payload, { signal: request.signal }));
+    this.#call =
+      options.api?.callTelegram ??
+      ((method, payload = {}, request = {}) => tg(this.#token, method, payload, { signal: request.signal }));
     this.#download = options.api?.downloadFileBytes ?? downloadFileBytes;
     this.#claimLock = options.api?.acquireLock ?? acquireLock;
     this.#dropLock = options.api?.releaseLock ?? releaseLock;
@@ -403,13 +421,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
           );
         }
       }
-      this.#poller.start(
-        this.#token,
-        (update) => this.#trackUpdate(update),
-        this.#log,
-      );
+      this.#poller.start(this.#token, (update) => this.#trackUpdate(update), this.#log);
       if (context.signal) {
-        const abort = (): void => { void this.stop(); };
+        const abort = (): void => {
+          void this.stop();
+        };
         context.signal.addEventListener("abort", abort, { once: true });
       }
     } catch (error) {
@@ -471,11 +487,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     return sent;
   }
 
-  async typing(
-    address: ConversationAddress,
-    context: DeliveryContext,
-    signal?: AbortSignal,
-  ): Promise<void> {
+  async typing(address: ConversationAddress, context: DeliveryContext, signal?: AbortSignal): Promise<void> {
     await this.#outbound.typing(address, context, signal);
   }
 
@@ -538,12 +550,23 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return { type: "notify", acknowledged: true };
     }
     if (request.type === "open_url") {
-      await this.#outbound.sendMessage(address, request.label ?? request.url, context, {
-        replyMarkup: { inline_keyboard: [[{ text: request.label ?? "Open link", url: request.url }]] },
-      }, signal);
+      await this.#outbound.sendMessage(
+        address,
+        request.label ?? request.url,
+        context,
+        {
+          replyMarkup: { inline_keyboard: [[{ text: request.label ?? "Open link", url: request.url }]] },
+        },
+        signal,
+      );
       return { type: "open_url", opened: true };
     }
-    if (request.type === "status" || request.type === "widget" || request.type === "title" || request.type === "editor_text") {
+    if (
+      request.type === "status" ||
+      request.type === "widget" ||
+      request.type === "title" ||
+      request.type === "editor_text"
+    ) {
       await this.#updateControlCard(address, request, context, signal);
       if (request.type === "status") return { type: "status", acknowledged: true };
       if (request.type === "widget") return { type: "widget", acknowledged: true };
@@ -570,11 +593,20 @@ export class TelegramTransportAdapter implements TransportAdapter {
       const routeKey = `forum-topic:${message.chat.id}`;
       let threadId = storedTopicThread(this.#store.getCheckpoint(this.id, routeKey), message.message_id);
       if (threadId === undefined) {
-        const created = await this.#telegram("createForumTopic", {
-          chat_id: message.chat.id,
-          name: topicName(message.text ?? message.caption ?? ""),
-        }, context.signal);
-        if (created !== null && typeof created === "object" && "message_thread_id" in created && typeof created.message_thread_id === "number") {
+        const created = await this.#telegram(
+          "createForumTopic",
+          {
+            chat_id: message.chat.id,
+            name: topicName(message.text ?? message.caption ?? ""),
+          },
+          context.signal,
+        );
+        if (
+          created !== null &&
+          typeof created === "object" &&
+          "message_thread_id" in created &&
+          typeof created.message_thread_id === "number"
+        ) {
           threadId = created.message_thread_id;
           this.#store.setCheckpoint(this.id, routeKey, { messageId: message.message_id, threadId });
         }
@@ -583,22 +615,31 @@ export class TelegramTransportAdapter implements TransportAdapter {
     }
     const attachment = await this.#saveIncomingMedia(message, context.signal).catch((error) => {
       if (context.signal?.aborted) throw error;
-      this.#log?.warn(`[telegram] attachment retrieval failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`);
+      this.#log?.warn(
+        `[telegram] attachment retrieval failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
       return undefined;
     });
     const transcript = attachment?.transcribable
       ? await this.#transcribe(attachment.localPath, context.signal).catch((error) => {
           if (context.signal?.aborted) throw error;
-          this.#log?.warn(`[telegram] transcription failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`);
+          this.#log?.warn(
+            `[telegram] transcription failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
           return undefined;
         })
       : undefined;
-    const textParts = [message.text ?? message.caption, transcript].filter((part): part is string => typeof part === "string" && part.length > 0);
-    const messageAttachment: MessageAttachment | undefined = attachment === undefined ? undefined : {
-      url: pathToFileURL(attachment.localPath).href,
-      name: attachment.displayName,
-      mediaType: attachment.mediaType,
-    };
+    const textParts = [message.text ?? message.caption, transcript].filter(
+      (part): part is string => typeof part === "string" && part.length > 0,
+    );
+    const messageAttachment: MessageAttachment | undefined =
+      attachment === undefined
+        ? undefined
+        : {
+            url: pathToFileURL(attachment.localPath).href,
+            name: attachment.displayName,
+            mediaType: attachment.mediaType,
+          };
     const envelope: InboundEnvelope = {
       id: `telegram:${this.#account}:${message.chat.id}:${message.message_id}`,
       sentAt: message.date * 1_000,
@@ -608,9 +649,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
         ...(textParts.length === 0 ? {} : { text: textParts.join("\n\n") }),
         ...(messageAttachment === undefined ? {} : { attachments: [messageAttachment] }),
       },
-      ...(message.reply_to_message === undefined ? {} : {
-        replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) },
-      }),
+      ...(message.reply_to_message === undefined
+        ? {}
+        : {
+            replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) },
+          }),
       sourceReceipt: { transport: "telegram", messageId: String(message.message_id) },
       edited: update.edited_message !== undefined,
     };
@@ -619,11 +662,16 @@ export class TelegramTransportAdapter implements TransportAdapter {
   }
 
   async #handleCallback(query: TgCallbackQuery, updateId: number, context: TransportStartContext): Promise<void> {
-    const acknowledge = (text?: string, alert = false): Promise<unknown> => this.#telegram("answerCallbackQuery", {
-      callback_query_id: query.id,
-      ...(text === undefined ? {} : { text }),
-      ...(alert ? { show_alert: true } : {}),
-    }, context.signal);
+    const acknowledge = (text?: string, alert = false): Promise<unknown> =>
+      this.#telegram(
+        "answerCallbackQuery",
+        {
+          callback_query_id: query.id,
+          ...(text === undefined ? {} : { text }),
+          ...(alert ? { show_alert: true } : {}),
+        },
+        context.signal,
+      );
     if (!query.message || !query.data) {
       await acknowledge("This control is no longer available.");
       return;
@@ -646,15 +694,18 @@ export class TelegramTransportAdapter implements TransportAdapter {
         await acknowledge("This control belongs to another user.", true);
         return;
       }
-      await context.receive({
-        id: `telegram:${this.#account}:callback:${updateId}`,
-        sentAt: this.#clock(),
-        identity,
-        address,
-        content: { text: "/stop" },
-        sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
-        edited: false,
-      }, context.signal);
+      await context.receive(
+        {
+          id: `telegram:${this.#account}:callback:${updateId}`,
+          sentAt: this.#clock(),
+          identity,
+          address,
+          content: { text: "/stop" },
+          sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
+          edited: false,
+        },
+        context.signal,
+      );
       await acknowledge("Stopping…");
       return;
     }
@@ -683,7 +734,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
     await this.#applyInteractionAction(state, action, query, acknowledge);
   }
 
-  async #handleDraftStop(event: TgMessageGenerationStopped, updateId: number, context: TransportStartContext): Promise<void> {
+  async #handleDraftStop(
+    event: TgMessageGenerationStopped,
+    updateId: number,
+    context: TransportStartContext,
+  ): Promise<void> {
     const route = this.#draftRoutes.get(event.draft_id);
     if (!route) return;
     const identity = telegramIdentity(event.chat.id, this.#account);
@@ -692,26 +747,37 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const address = telegramAddress(event, this.#account, event.message_thread_id);
     if (!sameAddress(address, route.address)) return;
     this.#draftRoutes.delete(event.draft_id);
-    await context.receive({
-      id: `telegram:${this.#account}:draft-stop:${event.draft_id}:${updateId}`,
-      sentAt: this.#clock(),
-      identity,
-      address,
-      content: { text: "/stop" },
-      edited: false,
-    }, context.signal);
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:draft-stop:${event.draft_id}:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: "/stop" },
+        edited: false,
+      },
+      context.signal,
+    );
   }
 
-  async #saveIncomingMedia(message: TgMessage, signal?: AbortSignal): Promise<{
-    readonly localPath: string;
-    readonly displayName: string;
-    readonly mediaType: string;
-    readonly transcribable: boolean;
-  } | undefined> {
+  async #saveIncomingMedia(
+    message: TgMessage,
+    signal?: AbortSignal,
+  ): Promise<
+    | {
+        readonly localPath: string;
+        readonly displayName: string;
+        readonly mediaType: string;
+        readonly transcribable: boolean;
+      }
+    | undefined
+  > {
     const media = mediaFrom(message);
     if (!media) return undefined;
     if (media.declaredBytes !== undefined && media.declaredBytes > MAX_INBOUND_ATTACHMENT_BYTES) {
-      this.#log?.warn(`[telegram] ignored ${media.displayName}: declared size ${media.declaredBytes} exceeds the inbound limit`);
+      this.#log?.warn(
+        `[telegram] ignored ${media.displayName}: declared size ${media.declaredBytes} exceeds the inbound limit`,
+      );
       return undefined;
     }
     const file = await this.#telegram("getFile", { file_id: media.telegramId }, signal);
@@ -764,7 +830,9 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const needsDirectory = command.some((part) => part.includes("{outputDir}"));
     const directory = needsDirectory ? await mkdtemp(join(tmpdir(), "ompclaw-transcript-")) : undefined;
     try {
-      const expanded = command.map((part) => part.replaceAll("{file}", path).replaceAll("{outputDir}", directory ?? ""));
+      const expanded = command.map((part) =>
+        part.replaceAll("{file}", path).replaceAll("{outputDir}", directory ?? ""),
+      );
       const program = expanded[0];
       if (!program) throw new Error("Telegram transcription command is empty");
       const completed = await executeFile(program, expanded.slice(1), {
@@ -808,7 +876,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
       };
       this.#interactions.set(id, state);
       this.#store.putPendingInteraction(this.#pendingInteraction(state));
-      state.timeout = setTimeout(() => this.#finishInteraction(state, this.#cancelledResponse(request)), this.#interactionLifetime);
+      state.timeout = setTimeout(
+        () => this.#finishInteraction(state, this.#cancelledResponse(request)),
+        this.#interactionLifetime,
+      );
       state.timeout.unref?.();
       if (signal) {
         const abort = (): void => this.#finishInteraction(state, this.#cancelledResponse(request));
@@ -839,26 +910,50 @@ export class TelegramTransportAdapter implements TransportAdapter {
   async #sendInteractionPrompt(state: InteractiveState, signal?: AbortSignal): Promise<void> {
     const request = state.request;
     if (request.type === "confirm") {
-      state.prompt = await this.#outbound.sendMessage(state.address, `${request.title}\n\n${request.message}`, state.context, {
-        replyMarkup: { inline_keyboard: [[
-          { text: request.confirmLabel ?? "Confirm", callback_data: callback(state.id, "accept") },
-          { text: request.cancelLabel ?? "Cancel", callback_data: callback(state.id, "reject") },
-        ]] },
-      }, signal);
+      state.prompt = await this.#outbound.sendMessage(
+        state.address,
+        `${request.title}\n\n${request.message}`,
+        state.context,
+        {
+          replyMarkup: {
+            inline_keyboard: [
+              [
+                { text: request.confirmLabel ?? "Confirm", callback_data: callback(state.id, "accept") },
+                { text: request.cancelLabel ?? "Cancel", callback_data: callback(state.id, "reject") },
+              ],
+            ],
+          },
+        },
+        signal,
+      );
       return;
     }
     if (request.type === "select") {
-      state.prompt = await this.#outbound.sendMessage(state.address, this.#selectPrompt(state), state.context, {
-        replyMarkup: this.#selectKeyboard(state),
-      }, signal);
+      state.prompt = await this.#outbound.sendMessage(
+        state.address,
+        this.#selectPrompt(state),
+        state.context,
+        {
+          replyMarkup: this.#selectKeyboard(state),
+        },
+        signal,
+      );
       return;
     }
     const prompt = request.type === "input" ? request.prompt : undefined;
     const initial = request.initialValue;
-    const lines = [request.title, prompt, initial ? `Current value:\n${initial}` : undefined].filter((part): part is string => Boolean(part));
-    state.prompt = await this.#outbound.sendMessage(state.address, lines.join("\n\n"), state.context, {
-      replyMarkup: { force_reply: true, selective: true },
-    }, signal);
+    const lines = [request.title, prompt, initial ? `Current value:\n${initial}` : undefined].filter(
+      (part): part is string => Boolean(part),
+    );
+    state.prompt = await this.#outbound.sendMessage(
+      state.address,
+      lines.join("\n\n"),
+      state.context,
+      {
+        replyMarkup: { force_reply: true, selective: true },
+      },
+      signal,
+    );
   }
 
   #selectPrompt(state: InteractiveState): string {
@@ -880,10 +975,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const end = Math.min(start + SELECT_PAGE_SIZE, state.labels.length);
     const rows: Record<string, string>[][] = [];
     for (let index = start; index < end; index += 1) {
-      rows.push([{
-        text: `${state.selected.has(index) ? "✓ " : ""}${state.labels[index]}`.slice(0, 64),
-        callback_data: callback(state.id, `pick-${index}`),
-      }]);
+      rows.push([
+        {
+          text: `${state.selected.has(index) ? "✓ " : ""}${state.labels[index]}`.slice(0, 64),
+          callback_data: callback(state.id, `pick-${index}`),
+        },
+      ]);
     }
     const pages = Math.max(1, Math.ceil(state.labels.length / SELECT_PAGE_SIZE));
     if (pages > 1) {
@@ -938,7 +1035,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return;
     }
     if (action === "done") {
-      this.#finishInteraction(state, { type: "select", selected: [...state.selected].sort((a, b) => a - b).map((index) => state.choices[index]!) });
+      this.#finishInteraction(state, {
+        type: "select",
+        selected: [...state.selected].sort((a, b) => a - b).map((index) => state.choices[index]!),
+      });
       await acknowledge("Selected");
       return;
     }
@@ -972,9 +1072,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
       if (state.request.type !== "input" && state.request.type !== "editor") continue;
       if (state.principalId !== principalId || !sameAddress(state.address, address)) continue;
       if (state.prompt?.messageId !== String(message.reply_to_message.message_id)) continue;
-      this.#finishInteraction(state, state.request.type === "input"
-        ? { type: "input", cancelled: false, value: message.text }
-        : { type: "editor", cancelled: false, value: message.text });
+      this.#finishInteraction(
+        state,
+        state.request.type === "input"
+          ? { type: "input", cancelled: false, value: message.text }
+          : { type: "editor", cancelled: false, value: message.text },
+      );
       return true;
     }
     return false;
@@ -992,7 +1095,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
     if (state.timeout) clearTimeout(state.timeout);
     state.detachAbort?.();
     this.#store.deletePendingInteraction(state.id);
-    if (state.prompt) void this.#outbound.setReplyMarkup(state.address, state.prompt, { inline_keyboard: [] }, state.context).catch(() => undefined);
+    if (state.prompt)
+      void this.#outbound
+        .setReplyMarkup(state.address, state.prompt, { inline_keyboard: [] }, state.context)
+        .catch(() => undefined);
     state.settle(response);
   }
 
@@ -1033,12 +1139,20 @@ export class TelegramTransportAdapter implements TransportAdapter {
     card.stopVisible = [...card.statuses.values()].some(activeTask);
     this.#cards.set(key, card);
     const body = this.#renderCard(card);
-    const markup = card.stopVisible ? { inline_keyboard: [[{ text: "Stop", callback_data: STOP_CALLBACK }]] } : { inline_keyboard: [] };
+    const markup = card.stopVisible
+      ? { inline_keyboard: [[{ text: "Stop", callback_data: STOP_CALLBACK }]] }
+      : { inline_keyboard: [] };
+    const options = {
+      replyMarkup: markup,
+      ...(request.type === "status" && request.notification !== undefined
+        ? { notification: request.notification }
+        : {}),
+    };
     if (card.receipts.length === 0) {
-      card.receipts = await this.#outbound.sendMessages(address, body, context, { replyMarkup: markup }, signal);
+      card.receipts = await this.#outbound.sendMessages(address, body, context, options, signal);
       return;
     }
-    card.receipts = await this.#outbound.replaceMessages(address, card.receipts, body, context, { replyMarkup: markup }, signal);
+    card.receipts = await this.#outbound.replaceMessages(address, card.receipts, body, context, options, signal);
   }
 
   #renderCard(card: ControlCard): string {
@@ -1052,29 +1166,40 @@ export class TelegramTransportAdapter implements TransportAdapter {
   async #sendIdentityHelp(message: TgMessage): Promise<void> {
     const address = telegramAddress(message, this.#account);
     const principal = { id: `telegram-unresolved:${message.from?.id ?? "unknown"}`, roles: [] };
-    await this.#outbound.sendMessage(address, [
-      `Telegram user ID: ${message.from?.id ?? "unknown"}`,
-      `Chat ID: ${message.chat.id}`,
-      address.thread ? `Topic ID: ${address.thread}` : undefined,
-      "Ask the gateway operator to authorize this numeric user ID.",
-    ].filter((line): line is string => line !== undefined).join("\n"), { principal, origin: address });
+    await this.#outbound.sendMessage(
+      address,
+      [
+        `Telegram user ID: ${message.from?.id ?? "unknown"}`,
+        `Chat ID: ${message.chat.id}`,
+        address.thread ? `Topic ID: ${address.thread}` : undefined,
+        "Ask the gateway operator to authorize this numeric user ID.",
+      ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n"),
+      { principal, origin: address },
+    );
   }
 
   async #assertUiOrigin(address: ConversationAddress, context: DeliveryContext): Promise<void> {
-    if (!this.#deliveryAllowed(address, context)) throw new Error("Telegram UI target is not authorized for this delivery context");
+    if (!this.#deliveryAllowed(address, context))
+      throw new Error("Telegram UI target is not authorized for this delivery context");
   }
 
   #deliveryAllowed(address: ConversationAddress, context: DeliveryContext): boolean {
-    return address.transport === "telegram"
-      && address.account === this.#account
-      && context.origin.transport === "telegram"
-      && context.origin.account === this.#account
-      && sameAddress(address, context.origin);
+    return (
+      address.transport === "telegram" &&
+      address.account === this.#account &&
+      context.origin.transport === "telegram" &&
+      context.origin.account === this.#account &&
+      sameAddress(address, context.origin)
+    );
   }
 
   #trackUpdate(update: TgUpdate): Promise<void> {
     const task = this.handleUpdate(update).catch((error) => {
-      this.#log?.error(`[telegram] update ${update.update_id} failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#log?.error(
+        `[telegram] update ${update.update_id} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       throw error;
     });
     this.#updateTasks.add(task);
@@ -1084,7 +1209,6 @@ export class TelegramTransportAdapter implements TransportAdapter {
     );
     return task;
   }
-
 
   async #telegram(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     return withTelegramRetry(() => this.#call(method, payload, { signal }), { signal, log: this.#log });

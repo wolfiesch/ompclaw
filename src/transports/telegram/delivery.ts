@@ -44,6 +44,7 @@ export interface TelegramMessageOptions {
   readonly replyTo?: OutboundReceipt;
   readonly parseMode?: "MarkdownV2";
   readonly plainFallbackText?: string;
+  readonly notification?: OutboundContent["notification"];
 }
 
 export interface OutboundOptions {
@@ -118,15 +119,15 @@ function unchangedMessage(error: unknown): boolean {
 }
 
 function missingDeleteTarget(error: unknown): boolean {
-  return error instanceof TgError
-    && error.code === 400
-    && /message (?:to delete )?not found/i.test(error.message);
+  return error instanceof TgError && error.code === 400 && /message (?:to delete )?not found/i.test(error.message);
 }
 
 function draftsUnavailable(error: unknown): boolean {
-  return error instanceof TgError
-    && error.code === 400
-    && /method.*not found|not supported|private chat|draft/i.test(error.message);
+  return (
+    error instanceof TgError &&
+    error.code === 400 &&
+    /method.*not found|not supported|private chat|draft/i.test(error.message)
+  );
 }
 
 function renderText(text: string, format: OutboundContent["format"]): readonly RenderedText[] {
@@ -186,10 +187,13 @@ export class Outbound {
     this.#authorize = options.authorizeAddress;
     this.#log = options.logger;
     this.#draftId = options.nextDraftId ?? (() => randomInt(1, 2_147_483_647));
-    this.#call = options.callTelegram ?? ((method, payload = {}, request = {}) =>
-      tg(options.token, method, payload, { signal: request.signal }));
-    this.#upload = options.uploadTelegram ?? ((method, fields, file, request = {}) =>
-      tgUpload(options.token, method, fields, file, { signal: request.signal }));
+    this.#call =
+      options.callTelegram ??
+      ((method, payload = {}, request = {}) => tg(options.token, method, payload, { signal: request.signal }));
+    this.#upload =
+      options.uploadTelegram ??
+      ((method, fields, file, request = {}) =>
+        tgUpload(options.token, method, fields, file, { signal: request.signal }));
   }
 
   async send(
@@ -206,11 +210,7 @@ export class Outbound {
     return delivered[0]!;
   }
 
-  async typing(
-    address: ConversationAddress,
-    context: DeliveryContext,
-    signal?: AbortSignal,
-  ): Promise<void> {
+  async typing(address: ConversationAddress, context: DeliveryContext, signal?: AbortSignal): Promise<void> {
     await this.#assertTarget(address, context);
     signal?.throwIfAborted();
     await this.#request("sendChatAction", { ...messageBase(address), action: "typing" }, signal, address);
@@ -229,12 +229,17 @@ export class Outbound {
     if (draft !== undefined) {
       if (!content.transient) return target;
       try {
-        await this.#request("sendMessageDraft", {
-          ...messageBase(address),
-          draft_id: draft,
-          can_stop: true,
-          text: (content.text ?? "").slice(0, TELEGRAM_MAX_CHARS),
-        }, signal, address);
+        await this.#request(
+          "sendMessageDraft",
+          {
+            ...messageBase(address),
+            draft_id: draft,
+            can_stop: true,
+            text: (content.text ?? "").slice(0, TELEGRAM_MAX_CHARS),
+          },
+          signal,
+          address,
+        );
         return target;
       } catch (error) {
         if (!draftsUnavailable(error)) throw error;
@@ -244,7 +249,7 @@ export class Outbound {
     }
     if (typingId(target) !== undefined) return target;
     if (content.text === undefined) return target;
-    await this.#editText(address, target, content.text, content.format, signal);
+    await this.#editText(address, target, content.text, content.format, content.notification, signal);
     return target;
   }
 
@@ -261,12 +266,24 @@ export class Outbound {
     if (ephemeral !== undefined) {
       return this.#deliverPersistent(address, { ...content, transient: false }, context, signal);
     }
-    if (target === undefined) return this.#deliverPersistent(address, { ...content, transient: false }, context, signal);
+    if (target === undefined)
+      return this.#deliverPersistent(address, { ...content, transient: false }, context, signal);
 
     const completed: OutboundReceipt[] = [target];
-    if (content.text !== undefined) await this.#editText(address, target, content.text, content.format, signal);
+    if (content.text !== undefined) {
+      await this.#editText(address, target, content.text, content.format, content.notification, signal);
+    }
     if ((content.attachments?.length ?? 0) > 0) {
-      completed.push(...await this.#sendAttachments(address, content.attachments!, context, undefined, signal));
+      completed.push(
+        ...(await this.#sendAttachments(
+          address,
+          content.attachments!,
+          context,
+          undefined,
+          content.notification,
+          signal,
+        )),
+      );
     }
     return completed;
   }
@@ -295,10 +312,18 @@ export class Outbound {
     const pieces = renderDirectText(text, options);
     const results: OutboundReceipt[] = [];
     for (let index = 0; index < pieces.length; index += 1) {
-      results.push(await this.#sendOneText(address, pieces[index]!, {
-        replyTo: index === 0 ? options.replyTo : undefined,
-        replyMarkup: index === pieces.length - 1 ? options.replyMarkup : undefined,
-      }, signal));
+      results.push(
+        await this.#sendOneText(
+          address,
+          pieces[index]!,
+          {
+            replyTo: index === 0 ? options.replyTo : undefined,
+            replyMarkup: index === pieces.length - 1 ? options.replyMarkup : undefined,
+            notification: options.notification,
+          },
+          signal,
+        ),
+      );
     }
     return results;
   }
@@ -324,10 +349,15 @@ export class Outbound {
       for (let index = targets.length - 1; index >= pieces.length; index -= 1) {
         const target = targets[index]!;
         try {
-          await this.#request("deleteMessage", {
-            ...messageBase(address),
-            message_id: messageId(target),
-          }, signal, address);
+          await this.#request(
+            "deleteMessage",
+            {
+              ...messageBase(address),
+              message_id: messageId(target),
+            },
+            signal,
+            address,
+          );
         } catch (error) {
           if (missingDeleteTarget(error)) continue;
           retainedCount = index + 1;
@@ -344,9 +374,11 @@ export class Outbound {
     for (let index = 0; index < count; index += 1) {
       const target = retainedTargets[index];
       const piece = pieces[index] ?? retainedNotice;
-      const replyMarkup = index === count - 1 ? options.replyMarkup ?? emptyMarkup : emptyMarkup;
+      const replyMarkup = index === count - 1 ? (options.replyMarkup ?? emptyMarkup) : emptyMarkup;
       if (target === undefined) {
-        results.push(await this.#sendOneText(address, piece, { replyMarkup }, signal));
+        results.push(
+          await this.#sendOneText(address, piece, { replyMarkup, notification: options.notification }, signal),
+        );
         continue;
       }
       await this.#editOneText(address, target, piece, replyMarkup, signal);
@@ -363,11 +395,16 @@ export class Outbound {
     signal?: AbortSignal,
   ): Promise<void> {
     await this.#assertTarget(address, context);
-    await this.#request("editMessageReplyMarkup", {
-      ...messageBase(address),
-      message_id: messageId(target),
-      reply_markup: replyMarkup,
-    }, signal, address);
+    await this.#request(
+      "editMessageReplyMarkup",
+      {
+        ...messageBase(address),
+        message_id: messageId(target),
+        reply_markup: replyMarkup,
+      },
+      signal,
+      address,
+    );
   }
 
   async react(
@@ -378,11 +415,16 @@ export class Outbound {
     signal?: AbortSignal,
   ): Promise<void> {
     await this.#assertTarget(address, context);
-    await this.#request("setMessageReaction", {
-      ...messageBase(address),
-      message_id: messageId(target),
-      reaction: [{ type: "emoji", emoji: reaction.emoji }],
-    }, signal, address);
+    await this.#request(
+      "setMessageReaction",
+      {
+        ...messageBase(address),
+        message_id: messageId(target),
+        reaction: [{ type: "emoji", emoji: reaction.emoji }],
+      },
+      signal,
+      address,
+    );
   }
 
   async #startPreview(
@@ -393,12 +435,17 @@ export class Outbound {
   ): Promise<OutboundReceipt> {
     const draft = this.#draftId();
     try {
-      await this.#request("sendMessageDraft", {
-        ...messageBase(address),
-        draft_id: draft,
-        can_stop: true,
-        text: text.slice(0, TELEGRAM_MAX_CHARS),
-      }, signal, address);
+      await this.#request(
+        "sendMessageDraft",
+        {
+          ...messageBase(address),
+          draft_id: draft,
+          can_stop: true,
+          text: text.slice(0, TELEGRAM_MAX_CHARS),
+        },
+        signal,
+        address,
+      );
       return receipt(`${DRAFT_MARKER}${draft}`);
     } catch (error) {
       if (!draftsUnavailable(error)) throw error;
@@ -418,12 +465,31 @@ export class Outbound {
     if (content.text !== undefined && content.text.length > 0) {
       const pieces = renderText(content.text, content.format);
       for (const piece of pieces) {
-        delivered.push(await this.#sendOneText(address, piece, { replyTo: pendingReply }, signal));
+        delivered.push(
+          await this.#sendOneText(
+            address,
+            piece,
+            {
+              replyTo: pendingReply,
+              notification: content.notification,
+            },
+            signal,
+          ),
+        );
         pendingReply = undefined;
       }
     }
     if ((content.attachments?.length ?? 0) > 0) {
-      delivered.push(...await this.#sendAttachments(address, content.attachments!, context, pendingReply, signal));
+      delivered.push(
+        ...(await this.#sendAttachments(
+          address,
+          content.attachments!,
+          context,
+          pendingReply,
+          content.notification,
+          signal,
+        )),
+      );
     }
     return delivered;
   }
@@ -431,7 +497,11 @@ export class Outbound {
   async #sendOneText(
     address: ConversationAddress,
     text: RenderedText,
-    options: Readonly<{ replyTo?: OutboundReceipt; replyMarkup?: Record<string, unknown> }>,
+    options: Readonly<{
+      replyTo?: OutboundReceipt;
+      replyMarkup?: Record<string, unknown>;
+      notification?: OutboundContent["notification"];
+    }>,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt> {
     const payload: Record<string, unknown> = {
@@ -440,6 +510,7 @@ export class Outbound {
       ...(text.parseMode === undefined ? {} : { parse_mode: text.parseMode }),
       ...(options.replyMarkup === undefined ? {} : { reply_markup: options.replyMarkup }),
       ...(options.replyTo === undefined ? {} : { reply_to_message_id: messageId(options.replyTo) }),
+      ...(options.notification === "silent" ? { disable_notification: true } : {}),
     };
     let result: unknown;
     try {
@@ -458,12 +529,13 @@ export class Outbound {
     target: OutboundReceipt,
     text: string,
     format: OutboundContent["format"],
+    notification: OutboundContent["notification"],
     signal?: AbortSignal,
   ): Promise<void> {
     const [first, ...remaining] = renderText(text, format);
     if (first === undefined) return;
     await this.#editOneText(address, target, first, undefined, signal);
-    for (const part of remaining) await this.#sendOneText(address, part, {}, signal);
+    for (const part of remaining) await this.#sendOneText(address, part, { notification }, signal);
   }
 
   async #editOneText(
@@ -500,6 +572,7 @@ export class Outbound {
     attachments: NonNullable<OutboundContent["attachments"]>,
     _context: DeliveryContext,
     replyTo: OutboundReceipt | undefined,
+    notification: OutboundContent["notification"],
     signal?: AbortSignal,
   ): Promise<OutboundReceipt[]> {
     const receipts: OutboundReceipt[] = [];
@@ -508,7 +581,8 @@ export class Outbound {
       const path = attachmentPath(attachment.url);
       const details = await stat(path);
       if (!details.isFile()) throw new Error(`Telegram attachment is not a regular file: ${path}`);
-      if (details.size > MAX_ATTACHMENT_BYTES) throw new Error(`Telegram attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes`);
+      if (details.size > MAX_ATTACHMENT_BYTES)
+        throw new Error(`Telegram attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes`);
       const photo = photoAttachment(path, attachment.mediaType);
       const method = photo ? "sendPhoto" : "sendDocument";
       const field = photo ? "photo" : "document";
@@ -516,18 +590,24 @@ export class Outbound {
         chat_id: address.channel,
         message_thread_id: topicId(address),
         reply_to_message_id: pendingReply === undefined ? undefined : messageId(pendingReply),
+        ...(notification === "silent" ? { disable_notification: "true" } : {}),
       };
-      const result = await this.#uploadRequest(method, fields, {
-        field,
-        path,
-        filename: safeUploadName(attachment.name),
-      }, signal, address);
+      const result = await this.#uploadRequest(
+        method,
+        fields,
+        {
+          field,
+          path,
+          filename: safeUploadName(attachment.name),
+        },
+        signal,
+        address,
+      );
       receipts.push(receipt(messageIdFromResult(result, method)));
       pendingReply = undefined;
     }
     return receipts;
   }
-
 
   async #request(
     method: string,
@@ -538,7 +618,8 @@ export class Outbound {
     try {
       return await withTelegramRetry(() => this.#call(method, payload, { signal }), { log: this.#log, signal });
     } catch (error) {
-      if (!isMissingThreadError(error) || address.thread === undefined || !("message_thread_id" in payload)) throw error;
+      if (!isMissingThreadError(error) || address.thread === undefined || !("message_thread_id" in payload))
+        throw error;
       const rootPayload = { ...payload };
       delete rootPayload.message_thread_id;
       this.#log?.warn(`[telegram] topic ${address.thread} is unavailable; retrying in the root chat`);
@@ -556,7 +637,8 @@ export class Outbound {
     try {
       return await withTelegramRetry(() => this.#upload(method, fields, file, { signal }), { log: this.#log, signal });
     } catch (error) {
-      if (!isMissingThreadError(error) || address.thread === undefined || fields.message_thread_id === undefined) throw error;
+      if (!isMissingThreadError(error) || address.thread === undefined || fields.message_thread_id === undefined)
+        throw error;
       const rootFields = { ...fields, message_thread_id: undefined };
       this.#log?.warn(`[telegram] topic ${address.thread} is unavailable; retrying attachment in the root chat`);
       return withTelegramRetry(() => this.#upload(method, rootFields, file, { signal }), { log: this.#log, signal });
@@ -566,6 +648,7 @@ export class Outbound {
   async #assertTarget(address: ConversationAddress, context: DeliveryContext): Promise<void> {
     if (address.transport !== "telegram") throw new Error("Expected a Telegram address");
     if (address.account !== this.#account) throw new Error("Telegram delivery cannot target another account");
-    if (await this.#authorize(address, context) === false) throw new Error("Telegram delivery address is not authorized");
+    if ((await this.#authorize(address, context)) === false)
+      throw new Error("Telegram delivery address is not authorized");
   }
 }
