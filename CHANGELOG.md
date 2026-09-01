@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add `omp.autonomyMode`: `inherit` preserves existing OMP approval resolution; `autopilot`, `balanced`, and `review` generate `yolo`, `write`, and `always-ask`, respectively, with read-only Telegram Home state.
 - Add a reusable credential-free Telegram scenario harness, a guarded live Bot API canary for dedicated test bots, and an ephemeral SSH dispatcher for running the complete check on a macOS worker without transferring credentials or state.
 
 ## 0.9.2 (2026-09-01)
@@ -159,4 +160,4 @@ All notable changes to this project will be documented in this file.
 
 ### Alpha
 
-- Initial alpha release of the authenticated Telegram and WebSocket gateway, persistent OMP RPC runtime, SQLite state store, interactive UI bridge, host tools, and user-service installers.
+- Initial alpha release of the authenticated Telegram and WebSocket gateway, persistent OMP RPC runtime, SQLite state store, interactive UI, host tools, and user-service installers.

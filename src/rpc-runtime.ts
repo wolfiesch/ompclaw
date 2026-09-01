@@ -29,7 +29,7 @@ import {
   type RpcClient,
   type RpcCommandInput,
 } from "./rpc-client";
-import { type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-config";
+import { type AutonomyMode, type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-config";
 import {
   type RpcExtensionUiRequest,
   type RpcHostToolCall,
@@ -180,6 +180,13 @@ const THINKING_LEVELS: Record<string, true> = {
   xhigh: true,
   max: true,
   auto: true,
+};
+
+const AUTONOMY_MODE_LABELS: Readonly<Record<AutonomyMode, string>> = {
+  inherit: "Inherited",
+  autopilot: "Autopilot",
+  balanced: "Balanced",
+  review: "Review",
 };
 
 const IMAGE_MEDIA_TYPES: Record<string, string> = {
@@ -981,6 +988,7 @@ export class RpcGatewayRuntime {
         options: [
           { value: "status", label: "Status", description: `${state?.isStreaming ? "Running" : "Idle"} · ${model}` },
           { value: "model", label: "Model", description: model },
+          { value: "autonomy", label: "Autonomy", description: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode] },
           { value: "thinking", label: "Reasoning", description: state?.thinkingLevel ?? "inherit" },
           { value: "fast", label: "Fast mode", description: state?.fastModeEnabled ? "on" : "off" },
           { value: "autocompact", label: "Auto-compaction", description: state?.autoCompactionEnabled ? "on" : "off" },
@@ -993,7 +1001,8 @@ export class RpcGatewayRuntime {
       delivery.deliveryContext,
     );
     const command = response.selected[0];
-    if (command !== undefined) await this.#handleCommand(delivery, command, "");
+    if (command === "autonomy") await this.#handleCommand(delivery, "status", "");
+    else if (command !== undefined) await this.#handleCommand(delivery, command, "");
   }
 
   async #modelCommand(

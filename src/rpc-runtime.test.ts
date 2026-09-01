@@ -133,6 +133,7 @@ const config: RpcRuntimeConfig = {
   ompCommand: "omp",
   configFiles: [],
   ompArgs: [],
+  autonomyMode: "inherit",
   allowRpcBash: false,
   inheritHarness: false,
   autoRestart: false,
@@ -484,7 +485,7 @@ describe("RpcGatewayRuntime", () => {
     };
     const failed = createRuntime(
       { config, delivery: failedDelivery, updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
+      { info: () => { }, warn: () => { }, error: () => { } },
     );
     await failed.start();
     await failed.handleInbound(message("update-failure", "Activate"));
@@ -560,7 +561,7 @@ describe("RpcGatewayRuntime", () => {
     };
     const runtime = createRuntime(
       { config, delivery: delivery(), updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
+      { info: () => { }, warn: () => { }, error: () => { } },
     );
     await runtime.start();
     await runtime.handleInbound(message("update-refresh-failure", "Activate"));
@@ -659,7 +660,7 @@ describe("RpcGatewayRuntime", () => {
     };
     const runtime = createRuntime(
       { config, delivery: delivery(), updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
+      { info: () => { }, warn: () => { }, error: () => { } },
     );
     await runtime.start();
     await runtime.handleInbound(message("update-rpc-exit", "Activate"));
@@ -981,7 +982,7 @@ describe("RpcGatewayRuntime", () => {
     };
     const runtime = createRuntime(
       { config, delivery: runtimeDelivery },
-      { info: () => {}, warn: () => {}, error: (message) => logErrors.push(message) },
+      { info: () => { }, warn: () => { }, error: (message) => logErrors.push(message) },
     );
     await runtime.start();
     await runtime.handleInbound(message("events", "Start"));
@@ -1113,6 +1114,35 @@ describe("RpcGatewayRuntime", () => {
     ]);
     expect(deliveries.some((call) => textFromContent(call.content) === "Model: provider/model")).toBe(true);
     await runtime.stop();
+  });
+
+  test("shows configured autonomy in home as a read-only status path", async () => {
+    const modes: ReadonlyArray<readonly [RpcRuntimeConfig["autonomyMode"], string]> = [
+      ["inherit", "Inherited"],
+      ["autopilot", "Autopilot"],
+      ["balanced", "Balanced"],
+      ["review", "Review"],
+    ];
+    for (const [autonomyMode, label] of modes) {
+      present = async (request) => {
+        if (request.type === "select" && request.title === "OmpClaw control center") {
+          expect(request.options).toContainEqual({
+            value: "autonomy",
+            label: "Autonomy",
+            description: label,
+          });
+          return { type: "select", selected: ["autonomy"] } as UiResponseFor<typeof request>;
+        }
+        return defaultUiResponse(request);
+      };
+      const runtime = createRuntime({ config: { ...config, autonomyMode }, delivery: delivery() });
+      await runtime.start();
+      await runtime.handleInbound(message("commands", "/home"));
+
+      const rpc = FakeOmpRpcClient.instances.at(-1)!;
+      expect(rpc.sent.slice(3)).toEqual([{ type: "get_state" }, { type: "get_state" }]);
+      await runtime.stop();
+    }
   });
 
   test("resumes the supplied session, publishes new-session state, and supports representative commands", async () => {

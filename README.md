@@ -39,7 +39,8 @@ cat > ~/.config/ompclaw/config.json <<'JSON'
   "omp": {
     "command": "omp",
     "autoRestart": true,
-    "busyInputMode": "steer"
+    "busyInputMode": "steer",
+    "autonomyMode": "inherit"
   },
   "transports": {
     "telegram": {
@@ -76,6 +77,28 @@ cat > ~/.config/ompclaw/config.json <<'JSON'
 }
 JSON
 ```
+
+### OMP approval policy
+
+`omp.autonomyMode` defaults to `inherit`, which preserves OMP's existing
+approval-mode resolution. OmpClaw generates no approval flag in this mode, so
+existing raw `omp.args` remain supported.
+
+Set an explicit mode when the gateway should generate the OMP tool approval
+policy:
+
+- `autopilot` generates `--approval-mode yolo`.
+- `balanced` generates `--approval-mode write`.
+- `review` generates `--approval-mode always-ask`.
+
+To prevent conflicting policies, an explicit mode rejects raw
+`--approval-mode VALUE` and `--approval-mode=VALUE` entries in `omp.args`.
+Autonomy mode governs prompts before OMP uses tools. It does not make genuine
+user decisions, including authorization, publication, or other consequential
+actions.
+
+Telegram Home displays the configured mode as read-only state. It has no live
+autonomy switch; update configuration instead.
 
 Put token values only in a private environment file. The values below are placeholders, not usable credentials.
 

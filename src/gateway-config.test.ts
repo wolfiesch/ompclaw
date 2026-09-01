@@ -26,6 +26,21 @@ describe("gateway config", () => {
     expect(expandGatewayPath("~/state", "/workspace/current")).toMatch(/state$/);
   });
 
+  test("defaults autonomy to inherit", () => {
+    expect(parseGatewayConfig({}).omp.autonomyMode).toBe("inherit");
+  });
+
+  for (const args of [
+    ["--approval-mode", "always-ask"],
+    ["--approval-mode=always-ask"],
+  ]) {
+    test(`allows raw ${args[0]} approval arguments under default inherit autonomy`, () => {
+      const config = parseGatewayConfig({ omp: { args } });
+
+      expect(config.omp).toMatchObject({ autonomyMode: "inherit", args });
+    });
+  }
+
   test("defaults busy input mode to steer and forwards an explicit override to RPC", () => {
     expect(parseGatewayConfig({}).omp.busyInputMode).toBe("steer");
 
@@ -35,6 +50,31 @@ describe("gateway config", () => {
     expect(() => parseGatewayConfig({ omp: { busyInputMode: "queue" } }))
       .toThrow('omp.busyInputMode must be "steer" or "followup"');
   });
+
+  test("rejects invalid autonomy modes with the config path", () => {
+    expect(() => parseGatewayConfig({ omp: { autonomyMode: "unattended" } }))
+      .toThrow('omp.autonomyMode must be "inherit", "autopilot", "balanced", or "review"');
+  });
+
+  for (const autonomyMode of ["inherit", "autopilot", "balanced", "review"] as const) {
+    test(`parses ${autonomyMode} autonomy and forwards it to RPC`, () => {
+      const config = parseGatewayConfig({ omp: { autonomyMode } });
+
+      expect(gatewayRpcRuntimeConfig(config).autonomyMode).toBe(autonomyMode);
+    });
+  }
+
+  for (const autonomyMode of ["autopilot", "balanced", "review"] as const) {
+    for (const args of [
+      ["--approval-mode", "always-ask"],
+      ["--approval-mode=always-ask"],
+    ]) {
+      test(`rejects ${autonomyMode} autonomy with raw ${args[0]}`, () => {
+        expect(() => parseGatewayConfig({ omp: { autonomyMode, args } }))
+          .toThrow("omp.autonomyMode conflicts with --approval-mode in omp.args");
+      });
+    }
+  }
 
   test("keeps unattended automation opt-in and validates bounded runtime controls", () => {
     expect(parseGatewayConfig({}).automation).toEqual({
@@ -168,13 +208,15 @@ describe("gateway config", () => {
       webSocketCredentials: [{ token: "web-secret", subject: "alice", channel: "alice" }],
     });
     expect(() => parseGatewayConfig({
-      transports: { websocket: {
-        enabled: true,
-        hostname: "127.0.0.1",
-        port: 1,
-        account: "web",
-        credentials: [{ tokenEnv: "WEBSOCKET_TOKEN", subject: "alice", channel: "alice" }],
-      } },
+      transports: {
+        websocket: {
+          enabled: true,
+          hostname: "127.0.0.1",
+          port: 1,
+          account: "web",
+          credentials: [{ tokenEnv: "WEBSOCKET_TOKEN", subject: "alice", channel: "alice" }],
+        }
+      },
     })).toThrow("OMPCLAW_");
   });
 
