@@ -1,10 +1,14 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { parseGatewayConfig } from "./gateway-config";
+import { gatewayUpdatePaths, withGatewayUpdateLock } from "./gateway-update";
 import {
   buildManagedServiceArguments,
   buildServiceArguments,
+  installRpcService,
+  prepareServiceArguments,
   renderSystemdUnit,
   replaceFileAtomically,
 } from "./rpc-service";
@@ -82,6 +86,87 @@ describe("systemd service generation", () => {
       expect(readFileSync(destination, "utf8")).toBe("candidate");
       expect(statSync(destination).mode & 0o777).toBe(0o700);
       expect(readdirSync(directory).sort()).toEqual(["candidate", "ompclaw-supervisor"]);
+    } finally {
+      rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("blocks service reconfiguration while an update activation is pending", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-service-pending-"));
+    try {
+      const stateDir = join(directory, "state");
+      const updatePaths = gatewayUpdatePaths(stateDir);
+      mkdirSync(join(stateDir, "updates"), { recursive: true });
+      writeFileSync(updatePaths.request, JSON.stringify({
+        schema: 1,
+        id: "pending-request",
+        status: "committed",
+        candidate: {
+          id: "0.9.0-candidate",
+          commit: "b".repeat(40),
+          version: "0.9.0",
+          path: join(updatePaths.releases, "0.9.0-candidate"),
+        },
+        previous: {
+          id: "0.8.0-previous",
+          commit: "a".repeat(40),
+          version: "0.8.0",
+          path: join(updatePaths.releases, "0.8.0-previous"),
+        },
+        origin: {
+          address: { transport: "telegram", account: "bot", channel: "42" },
+          principal: { id: "operator-42", roles: ["operator"] },
+        },
+        requestedAt: "2026-09-01T00:00:00.000Z",
+        committedAt: "2026-09-01T00:00:01.000Z",
+      }));
+      const configs = [
+        parseGatewayConfig({
+          workspace: directory,
+          stateDir,
+          updates: { enabled: true, repository: directory },
+        }),
+        parseGatewayConfig({ workspace: directory, stateDir }),
+      ];
+
+      for (const config of configs) {
+        await expect(prepareServiceArguments(config, {
+          configPath: join(directory, "config.json"),
+          envFile: join(directory, "ompclaw.env"),
+        })).rejects.toThrow("while update pending-request is committed");
+      }
+
+      expect(readdirSync(updatePaths.root)).toEqual(["request.json"]);
+    } finally {
+      rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("serializes the complete service installation with update activation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-service-lock-"));
+    try {
+      const stateDir = join(directory, "state");
+      const updatePaths = gatewayUpdatePaths(stateDir);
+      const configs = [
+        parseGatewayConfig({
+          workspace: directory,
+          stateDir,
+          updates: { enabled: true, repository: directory },
+        }),
+        parseGatewayConfig({ workspace: directory, stateDir }),
+      ];
+
+      await withGatewayUpdateLock(updatePaths.lock, async () => {
+        for (const config of configs) {
+          await expect(installRpcService(
+            config,
+            join(directory, "config.json"),
+            join(directory, "ompclaw.env"),
+          )).rejects.toThrow("Another OmpClaw update operation is running");
+        }
+      });
+
+      expect(readdirSync(updatePaths.root)).toEqual([]);
     } finally {
       rmSync(directory, { force: true, recursive: true });
     }

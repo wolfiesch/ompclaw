@@ -4,7 +4,12 @@ import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { GatewayConfig } from "./gateway-config";
-import { GatewayUpdateCoordinator, gatewayUpdatePaths } from "./gateway-update";
+import {
+  GatewayUpdateCoordinator,
+  gatewayUpdatePaths,
+  readUpdateRequest,
+  withGatewayUpdateLock,
+} from "./gateway-update";
 
 export interface ServiceInstallResult {
   path: string;
@@ -113,6 +118,13 @@ export async function prepareServiceArguments(
   config: GatewayConfig,
   paths: GatewayServicePaths,
 ): Promise<string[]> {
+  const updatePaths = gatewayUpdatePaths(config.stateDir);
+  const pending = readUpdateRequest(updatePaths.request);
+  if (pending !== undefined && pending.status !== "notified") {
+    throw new Error(
+      `Cannot install the OmpClaw service while update ${pending.id} is ${pending.status}; let the active supervisor finish it before retrying`,
+    );
+  }
   if (!config.updates.enabled) return buildServiceArguments(paths);
   const updates = new GatewayUpdateCoordinator({ config: config.updates, stateDir: config.stateDir });
   const staged = await updates.stage("HEAD");
@@ -163,6 +175,15 @@ function runManager(executable: string, args: string[], retries = 0): void {
 }
 
 export async function installRpcService(
+  config: GatewayConfig,
+  configPath: string,
+  envFile: string,
+): Promise<ServiceInstallResult> {
+  const lockPath = gatewayUpdatePaths(config.stateDir).lock;
+  return withGatewayUpdateLock(lockPath, () => installRpcServiceUnlocked(config, configPath, envFile));
+}
+
+async function installRpcServiceUnlocked(
   config: GatewayConfig,
   configPath: string,
   envFile: string,
