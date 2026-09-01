@@ -109,6 +109,43 @@ export interface LegacyTelegramStateImportResult {
   readonly checkpointImported: boolean;
 }
 
+export type PairingRequestState = "pending" | "approved" | "rejected" | "expired" | "exhausted";
+
+/**
+ * Private pairing-request material. Code hash and salt must never be returned
+ * from pairing service methods or rendered to an operator.
+ */
+export interface StoredPairingRequest {
+ readonly identity: TransportIdentity;
+ readonly address: ConversationAddress;
+ readonly codeHash: string;
+ readonly codeSalt: string;
+ readonly state: PairingRequestState;
+ readonly failedAttempts: number;
+ readonly maxAttempts: number;
+ readonly createdAt: number;
+ readonly expiresAt: number;
+ readonly resolvedAt?: number;
+ readonly principalId?: string;
+}
+
+export interface StorePairingRequestInput {
+ readonly identity: TransportIdentity;
+ readonly address: ConversationAddress;
+ readonly codeHash: string;
+ readonly codeSalt: string;
+ readonly maxAttempts: number;
+ readonly createdAt: number;
+ readonly expiresAt: number;
+}
+
+export type PairingResolution =
+ | { readonly status: "approved"; readonly request: StoredPairingRequest }
+ | {
+  readonly status: "unavailable" | "expired" | "exhausted" | "identity-conflict";
+  readonly request?: StoredPairingRequest;
+ };
+
 export const LEGACY_TELEGRAM_STATE_MIGRATION = "legacy-telegram-state-v1";
 export const TELEGRAM_TOPIC_SESSION_MIGRATION = "telegram-topic-session-isolation-v1";
 
@@ -174,6 +211,27 @@ function validateAddress(address: ConversationAddress): void {
   requiredText(address.account, "conversation address account");
   requiredText(address.channel, "conversation address channel");
   if (address.thread !== undefined) requiredText(address.thread, "conversation address thread");
+}
+
+function validatePairingRequestInput(input: StorePairingRequestInput): void {
+ validateIdentity(input.identity);
+ validateAddress(input.address);
+ if (input.identity.transport !== input.address.transport || input.identity.account !== input.address.account) {
+  throw new Error("pairing identity and address must share transport and account");
+ }
+ if (!/^[a-f0-9]{64}$/i.test(input.codeHash)) throw new Error("pairing code hash must be a SHA-256 hex digest");
+ if (!/^[a-f0-9]{32,}$/i.test(input.codeSalt) || input.codeSalt.length % 2 !== 0) {
+  throw new Error("pairing code salt must be hexadecimal");
+ }
+ if (!Number.isSafeInteger(input.maxAttempts) || input.maxAttempts < 1 || input.maxAttempts > 5) {
+  throw new Error("pairing maximum attempts must be between one and five");
+ }
+ if (!Number.isSafeInteger(input.createdAt) || input.createdAt < 0) {
+  throw new Error("pairing created timestamp must be a safe nonnegative integer");
+ }
+ if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= input.createdAt) {
+  throw new Error("pairing expiry must follow creation");
+ }
 }
 
 function validateReceipt(value: unknown, context: string): void {
@@ -367,6 +425,59 @@ function decodePrincipal(row: SqlRow): Principal {
     throw new Error("corrupt JSON stored for principal roles");
   }
   return { id: storedString(row, "id", "principal"), roles };
+}
+
+function decodeStoredPairingRequest(row: SqlRow): StoredPairingRequest {
+ const context = "pairing request";
+ const state = storedString(row, "state", context);
+ if (state !== "pending" && state !== "approved" && state !== "rejected" && state !== "expired" && state !== "exhausted") {
+  throw new Error("corrupt stored pairing request: state is invalid");
+ }
+
+ const thread = storedString(row, "thread", context);
+ const identity: TransportIdentity = {
+  transport: storedString(row, "transport", context),
+  account: storedString(row, "account", context),
+  subject: storedString(row, "subject", context),
+ };
+ const address: ConversationAddress = {
+  transport: identity.transport,
+  account: identity.account,
+  channel: storedString(row, "channel", context),
+  ...(thread === "" ? {} : { thread }),
+ };
+ const request: StoredPairingRequest = {
+  identity,
+  address,
+  codeHash: storedString(row, "code_hash", context),
+  codeSalt: storedString(row, "code_salt", context),
+  state,
+  failedAttempts: storedCount(row, "failed_attempts", context),
+  maxAttempts: storedCount(row, "max_attempts", context),
+  createdAt: storedTimestamp(row, "created_at", context),
+  expiresAt: storedTimestamp(row, "expires_at", context),
+  ...(row.resolved_at === null ? {} : { resolvedAt: storedTimestamp(row, "resolved_at", context) }),
+  ...(row.principal_id === null ? {} : { principalId: storedString(row, "principal_id", context) }),
+ };
+ validatePairingRequestInput({
+  identity: request.identity,
+  address: request.address,
+  codeHash: request.codeHash,
+  codeSalt: request.codeSalt,
+  maxAttempts: request.maxAttempts,
+  createdAt: request.createdAt,
+  expiresAt: request.expiresAt,
+ });
+ if (request.failedAttempts > request.maxAttempts) {
+  throw new Error("corrupt stored pairing request: failed attempts exceed maximum");
+ }
+ if (request.state === "pending" && (request.resolvedAt !== undefined || request.principalId !== undefined)) {
+  throw new Error("corrupt stored pairing request: pending request is resolved");
+ }
+ if (request.state === "approved" && (request.resolvedAt === undefined || request.principalId === undefined)) {
+  throw new Error("corrupt stored pairing request: approved request lacks principal");
+ }
+ return request;
 }
 
 function decodeConversationBinding(row: SqlRow): ConversationBinding {
@@ -578,6 +689,23 @@ const SCHEDULED_JOB_FIELDS = [
   "last_error",
 ].join(", ");
 
+const PAIRING_REQUEST_FIELDS = [
+ "transport",
+ "account",
+ "subject",
+ "channel",
+ "thread",
+ "code_hash",
+ "code_salt",
+ "state",
+ "failed_attempts",
+ "max_attempts",
+ "created_at",
+ "expires_at",
+ "resolved_at",
+ "principal_id",
+].join(", ");
+
 function validateScheduledJob(job: ScheduledJob): void {
   requiredText(job.id, "scheduled job id");
   requiredText(job.principalId, "scheduled job principal");
@@ -697,6 +825,28 @@ export class GatewayStore {
         principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
         PRIMARY KEY (transport, account, subject)
       );
+
+      CREATE TABLE IF NOT EXISTS pairing_requests (
+        transport TEXT NOT NULL,
+        account TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        code_salt TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'rejected', 'expired', 'exhausted')),
+        failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
+        max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 5),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        principal_id TEXT REFERENCES principals(id) ON DELETE RESTRICT,
+        PRIMARY KEY (transport, account, subject),
+        CHECK (expires_at > created_at)
+      );
+
+      CREATE INDEX IF NOT EXISTS pairing_requests_state_expiry
+        ON pairing_requests (state, expires_at);
 
       CREATE TABLE IF NOT EXISTS conversation_bindings (
         transport TEXT NOT NULL,
@@ -901,6 +1051,202 @@ export class GatewayStore {
       throw error;
     }
   }
+
+ upsertPairingRequest(input: StorePairingRequestInput): StoredPairingRequest {
+  validatePairingRequestInput(input);
+  const thread = input.address.thread ?? "";
+
+  return this.#transaction(() => {
+   this.#database
+    .query(
+     `INSERT INTO pairing_requests (
+             transport, account, subject, channel, thread, code_hash, code_salt,
+             state, failed_attempts, max_attempts, created_at, expires_at, resolved_at, principal_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, NULL, NULL)
+           ON CONFLICT(transport, account, subject) DO UPDATE SET
+             channel = excluded.channel,
+             thread = excluded.thread,
+             code_hash = excluded.code_hash,
+             code_salt = excluded.code_salt,
+             state = 'pending',
+             failed_attempts = 0,
+             max_attempts = excluded.max_attempts,
+             created_at = excluded.created_at,
+             expires_at = excluded.expires_at,
+             resolved_at = NULL,
+             principal_id = NULL`,
+    )
+    .run(
+     input.identity.transport,
+     input.identity.account,
+     input.identity.subject,
+     input.address.channel,
+     thread,
+     input.codeHash,
+     input.codeSalt,
+     input.maxAttempts,
+     input.createdAt,
+     input.expiresAt,
+    );
+   const request = this.#readPairingRequest(input.identity);
+   if (request === undefined) throw new Error("pairing request was not stored");
+   return request;
+  });
+ }
+
+ listPairingRequests(): StoredPairingRequest[] {
+  const rows = this.#database
+   .query(`SELECT ${PAIRING_REQUEST_FIELDS} FROM pairing_requests ORDER BY created_at ASC, transport ASC, account ASC, subject ASC`)
+   .all() as SqlRow[];
+  return rows.map(decodeStoredPairingRequest);
+ }
+
+ expirePairingRequests(now: number): number {
+  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing expiry timestamp must be a safe nonnegative integer");
+  return this.#expirePairingRequests(now);
+ }
+
+ recordPairingFailures(identities: readonly TransportIdentity[], now: number): number {
+  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing failure timestamp must be a safe nonnegative integer");
+  const uniqueIdentities: TransportIdentity[] = [];
+  for (const identity of identities) {
+   validateIdentity(identity);
+   if (
+    !uniqueIdentities.some(
+     (candidate) =>
+      candidate.transport === identity.transport &&
+      candidate.account === identity.account &&
+      candidate.subject === identity.subject,
+    )
+   ) {
+    uniqueIdentities.push(identity);
+   }
+  }
+
+  return this.#transaction(() => {
+   this.#expirePairingRequests(now);
+   let changed = 0;
+   for (const identity of uniqueIdentities) {
+    changed += this.#database
+     .query(
+      `UPDATE pairing_requests
+             SET failed_attempts = failed_attempts + 1,
+                 state = CASE WHEN failed_attempts + 1 >= max_attempts THEN 'exhausted' ELSE 'pending' END,
+                 resolved_at = CASE WHEN failed_attempts + 1 >= max_attempts THEN ? ELSE NULL END
+             WHERE transport = ? AND account = ? AND subject = ?
+               AND state = 'pending' AND expires_at > ?`,
+     )
+     .run(now, identity.transport, identity.account, identity.subject, now).changes;
+   }
+   return changed;
+  });
+ }
+
+ approvePairingRequest(identity: TransportIdentity, principalId: string, now: number): PairingResolution {
+  validateIdentity(identity);
+  requiredText(principalId, "pairing principal id");
+  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing approval timestamp must be a safe nonnegative integer");
+
+  return this.#transaction(() => {
+   const request = this.#readPairingRequest(identity);
+   if (request === undefined || request.state !== "pending") return { status: "unavailable", ...(request === undefined ? {} : { request }) };
+   if (request.expiresAt <= now) {
+    this.#database
+     .query(
+      `UPDATE pairing_requests
+             SET state = 'expired', resolved_at = ?
+             WHERE transport = ? AND account = ? AND subject = ? AND state = 'pending'`,
+     )
+     .run(now, identity.transport, identity.account, identity.subject);
+    const expired = this.#readPairingRequest(identity);
+    if (expired === undefined) throw new Error("pairing request disappeared while expiring");
+    return { status: "expired", request: expired };
+   }
+   if (request.failedAttempts >= request.maxAttempts) {
+    this.#database
+     .query(
+      `UPDATE pairing_requests
+             SET state = 'exhausted', resolved_at = ?
+             WHERE transport = ? AND account = ? AND subject = ? AND state = 'pending'`,
+     )
+     .run(now, identity.transport, identity.account, identity.subject);
+    const exhausted = this.#readPairingRequest(identity);
+    if (exhausted === undefined) throw new Error("pairing request disappeared while exhausting");
+    return { status: "exhausted", request: exhausted };
+   }
+
+   const binding = this.#database
+    .query(
+     `SELECT principal_id FROM transport_identities
+           WHERE transport = ? AND account = ? AND subject = ?`,
+    )
+    .get(identity.transport, identity.account, identity.subject) as SqlRow | null;
+   if (binding !== null && storedString(binding, "principal_id", "transport identity") !== principalId) {
+    return { status: "identity-conflict", request };
+   }
+
+   const principal = this.#database.query("SELECT id, roles_json FROM principals WHERE id = ?").get(principalId) as SqlRow | null;
+   const existingRoles = principal === null ? [] : decodePrincipal(principal).roles;
+   const roles = existingRoles.includes("operator") ? existingRoles : [...existingRoles, "operator"];
+   this.upsertPrincipal({ id: principalId, roles });
+   this.bindIdentity(identity, principalId);
+   this.#database
+    .query(
+     `UPDATE pairing_requests
+           SET state = 'approved', resolved_at = ?, principal_id = ?
+           WHERE transport = ? AND account = ? AND subject = ? AND state = 'pending'`,
+    )
+    .run(now, principalId, identity.transport, identity.account, identity.subject);
+   const approved = this.#readPairingRequest(identity);
+   if (approved === undefined || approved.state !== "approved") {
+    throw new Error("pairing request was not approved");
+   }
+   return { status: "approved", request: approved };
+  });
+ }
+
+ rejectPairingRequest(identity: TransportIdentity, now: number): PairingResolution {
+  validateIdentity(identity);
+  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing rejection timestamp must be a safe nonnegative integer");
+
+  return this.#transaction(() => {
+   const request = this.#readPairingRequest(identity);
+   if (request === undefined || request.state !== "pending") return { status: "unavailable", ...(request === undefined ? {} : { request }) };
+   if (request.expiresAt <= now) {
+    this.#database
+     .query(
+      `UPDATE pairing_requests
+             SET state = 'expired', resolved_at = ?
+             WHERE transport = ? AND account = ? AND subject = ? AND state = 'pending'`,
+     )
+     .run(now, identity.transport, identity.account, identity.subject);
+    const expired = this.#readPairingRequest(identity);
+    if (expired === undefined) throw new Error("pairing request disappeared while expiring");
+    return { status: "expired", request: expired };
+   }
+
+   this.#database
+    .query(
+     `UPDATE pairing_requests
+           SET state = 'rejected', resolved_at = ?
+           WHERE transport = ? AND account = ? AND subject = ? AND state = 'pending'`,
+    )
+    .run(now, identity.transport, identity.account, identity.subject);
+   const rejected = this.#readPairingRequest(identity);
+   if (rejected === undefined || rejected.state !== "rejected") {
+    throw new Error("pairing request was not rejected");
+   }
+   return { status: "unavailable", request: rejected };
+  });
+ }
+
+ clearPairingRequests(now: number): number {
+  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing clear timestamp must be a safe nonnegative integer");
+  return this.#transaction(() => {
+   this.#expirePairingRequests(now);
+   return this.#database.query("DELETE FROM pairing_requests").run().changes;
+  });
+ }
 
   resolvePrincipal(identity: TransportIdentity): Principal | undefined {
     validateIdentity(identity);
@@ -1690,6 +2036,28 @@ export class GatewayStore {
       return removed;
     });
   }
+
+
+ #readPairingRequest(identity: TransportIdentity): StoredPairingRequest | undefined {
+  const row = this.#database
+   .query(
+    `SELECT ${PAIRING_REQUEST_FIELDS}
+         FROM pairing_requests
+         WHERE transport = ? AND account = ? AND subject = ?`,
+   )
+   .get(identity.transport, identity.account, identity.subject) as SqlRow | null;
+  return row === null ? undefined : decodeStoredPairingRequest(row);
+ }
+
+ #expirePairingRequests(now: number): number {
+  return this.#database
+   .query(
+    `UPDATE pairing_requests
+         SET state = 'expired', resolved_at = ?
+         WHERE state = 'pending' AND expires_at <= ?`,
+   )
+   .run(now, now).changes;
+ }
 
   #readIngressComposition(id: string): IngressCompositionRecord {
     const row = this.#database

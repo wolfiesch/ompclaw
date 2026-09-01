@@ -27,7 +27,31 @@ bun add --global ompclaw
 ompclaw --help
 ```
 
-Create a token-free JSON configuration. Run the command from the OMP workspace you want the gateway to use, or replace the example workspace path with an absolute path.
+From the OMP workspace you want to control, run the guided Telegram setup:
+
+```bash
+ompclaw setup
+```
+
+The command reads the BotFather token without echoing it, validates the bot and
+webhook state, and writes new private default config and environment files. It
+refuses to replace existing setup files. Wait for the listener-ready message,
+then send a direct message to the bot from the Telegram account you want to
+authorize. Setup ignores messages already queued when the listener starts,
+prints a short-lived pairing code
+and the exact local approval command, then runs `doctor`. The code expires after
+ten minutes and is never sent through Telegram or stored in plaintext.
+
+Use `ompclaw setup --install-service` on the first run to install the verified
+configuration as a launchd or user-systemd service. Approval remains a separate
+local command.
+
+### Manual configuration
+
+Use this path when enabling WebSocket, automation, learning, or non-default OMP
+settings. Create a token-free JSON configuration. Run the command from the OMP
+workspace you want the gateway to use, or replace the example workspace path
+with an absolute path.
 
 ```bash
 mkdir -p ~/.config/ompclaw
@@ -110,19 +134,28 @@ ENV
 chmod 600 ~/.config/ompclaw/ompclaw.env
 ```
 
-Authorize the Telegram operator and the example local WebSocket identity. Set `TELEGRAM_USER_ID` to the numeric ID of the person you intend to authorize.
+Request Telegram pairing, send the bot a direct message while the listener is
+active, then run the local approval command it prints:
 
 ```bash
-TELEGRAM_USER_ID=123456789
-ompclaw telegram-allow "$TELEGRAM_USER_ID" \
-  --config ~/.config/ompclaw/config.json
+ompclaw pairing-listen \
+  --config ~/.config/ompclaw/config.json \
+  --env-file ~/.config/ompclaw/ompclaw.env
+```
+
+The request expires after ten minutes. Five invalid local approval attempts
+exhaust it. `pairing-list` shows token-free request metadata;
+`pairing-reject` denies a request; and `pairing-clear` removes all pairing
+request records without changing approved principal bindings.
+
+Authorize the example local WebSocket identity separately:
+
+```bash
 ompclaw principal-add local-operator \
   --config ~/.config/ompclaw/config.json
 ompclaw identity-bind websocket local local-operator local-operator \
   --config ~/.config/ompclaw/config.json
 ```
-
-The first command prints `Telegram user allowed as telegram:default:<numeric-user-id>`. The identity commands print the updated principal and binding.
 
 Validate credentials, the SQLite store, Telegram reachability, and a short OMP RPC session before starting the gateway:
 
