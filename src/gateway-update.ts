@@ -85,7 +85,7 @@ export interface GatewayUpdateCoordinatorOptions {
   readonly stateDir: string;
   readonly runCommand?: GatewayUpdateCommandRunner;
   readonly now?: () => Date;
-  readonly activationEnabled?: boolean;
+  readonly activationEnabled?: boolean | (() => boolean);
 }
 
 export class GatewayUpdateCoordinator implements GatewayUpdateControl {
@@ -93,7 +93,7 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
   readonly #paths: GatewayUpdatePaths;
   readonly #runCommand: GatewayUpdateCommandRunner;
   readonly #now: () => Date;
-  readonly #activationEnabled: boolean;
+  readonly #activationEnabled: () => boolean;
   #watchAbort: AbortController | undefined;
 
   constructor(options: GatewayUpdateCoordinatorOptions) {
@@ -103,7 +103,10 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
     this.#config = options.config;
     this.#paths = gatewayUpdatePaths(options.stateDir);
     this.#runCommand = options.runCommand ?? runUpdateCommand;
-    this.#activationEnabled = options.activationEnabled ?? true;
+    const activationEnabled = options.activationEnabled;
+    this.#activationEnabled = typeof activationEnabled === "function"
+      ? activationEnabled
+      : () => activationEnabled ?? true;
     this.#now = options.now ?? (() => new Date());
     ensureUpdateDirectories(this.#paths);
   }
@@ -167,7 +170,7 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
   }
 
   async arm(releaseId: string, origin: GatewayUpdateOrigin): Promise<{ update: string }> {
-    if (!this.#activationEnabled) {
+    if (!this.#activationEnabled()) {
       throw new Error("OmpClaw update activation requires a supervisor-managed gateway process");
     }
     const candidate = readReleaseManifest(join(this.#paths.releases, requireReleaseId(releaseId)));

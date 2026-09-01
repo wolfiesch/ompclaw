@@ -728,15 +728,18 @@ export class RpcGatewayRuntime {
         if (active) this.#stopTurnPresentation(active);
         this.#activeTurn = undefined;
         if (this.#status.state) this.#status.state.isStreaming = false;
-        this.#wakeIdleWaiters();
         try {
-          if (finalDelivered && terminalState === "completed") await this.#options.updates?.commitArmed();
-          else await this.#options.updates?.discardArmed();
-        } catch (error) {
-          this.#log.error(`[ompclaw update] failed to finalize armed update: ${error instanceof Error ? error.message : String(error)}`);
+          try {
+            if (finalDelivered && terminalState === "completed") await this.#options.updates?.commitArmed();
+            else await this.#options.updates?.discardArmed();
+          } catch (error) {
+            this.#log.error(`[ompclaw update] failed to finalize armed update: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          await this.#refreshState();
+        } finally {
+          this.#wakeIdleWaiters();
+          this.#queueSourceReaction(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
         }
-        await this.#refreshState();
-        this.#queueSourceReaction(active, terminalState === "failed" ? "👎" : terminalState === "stopped" ? "👌" : "👍");
       }
       return;
     }

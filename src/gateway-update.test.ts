@@ -103,6 +103,34 @@ describe("transactional gateway updates", () => {
     expect(currentGatewayRelease(coordinator.paths).id).toBe(previous.id);
   });
 
+  test("rejects activation outside a supervisor-managed gateway process", async () => {
+    const root = temporaryDirectory();
+    const repository = join(root, "repository");
+    const stateDir = join(root, "state");
+    mkdirSync(repository, { recursive: true });
+    let supervisorManaged = false;
+    const coordinator = new GatewayUpdateCoordinator({
+      config: { enabled: true, repository, healthTimeoutMs: 30_000 },
+      stateDir,
+      activationEnabled: () => supervisorManaged,
+    });
+    const previous = createRelease(stateDir, "0.7.0-aaaaaaaaaaaa", COMMIT_A);
+    const candidate = createRelease(stateDir, "0.8.0-bbbbbbbbbbbb", COMMIT_B);
+    coordinator.bootstrap(previous);
+
+    await expect(coordinator.arm(candidate.id, {
+      address: { transport: "telegram", account: "default", channel: "42" },
+      principal: { id: "operator-42", roles: ["operator"] },
+    })).rejects.toThrow("requires a supervisor-managed gateway process");
+    expect(readUpdateRequest(coordinator.paths.request)).toBeUndefined();
+    supervisorManaged = true;
+    await coordinator.arm(candidate.id, {
+      address: { transport: "telegram", account: "default", channel: "42" },
+      principal: { id: "operator-42", roles: ["operator"] },
+    });
+    expect(readUpdateRequest(coordinator.paths.request)?.status).toBe("armed");
+  });
+
   test("explains how to bootstrap a missing current release", () => {
     const paths = gatewayUpdatePaths(temporaryDirectory());
 
@@ -163,7 +191,7 @@ describe("transactional gateway updates", () => {
     expect(readUpdateRequest(coordinator.paths.request)?.status).toBe("notified");
   });
 
-  test("supervisor switches to a candidate only after its readiness marker", async () => {
+  test("hands off to the candidate supervisor only after gateway readiness", async () => {
     const root = temporaryDirectory();
     const repository = join(root, "repository");
     const stateDir = join(root, "state");
@@ -181,16 +209,12 @@ describe("transactional gateway updates", () => {
     });
     await coordinator.commitArmed();
 
-    const resultReady = Promise.withResolvers<void>();
     const supervisor = new GatewayUpdateSupervisor({
       stateDir,
       configPath: join(root, "config.json"),
       envFile: join(root, "ompclaw.env"),
       healthTimeoutMs: 500,
     }, {
-      onResult(result) {
-        if (result.status === "succeeded") resultReady.resolve();
-      },
       spawnRelease(release, requestId) {
         if (release.id === candidate.id && requestId !== undefined) {
           writeFileSync(join(gatewayUpdatePaths(stateDir).ready, `${requestId}.json`), "{}\n");
@@ -209,21 +233,15 @@ describe("transactional gateway updates", () => {
         return process;
       },
     });
-    const running = supervisor.run();
-    await resultReady.promise;
-    supervisor.stop();
-    await running;
-    expect(supervisor.replacementRequested).toBe(true);
+    await supervisor.run();
 
-    expect(readUpdateResult(gatewayUpdatePaths(stateDir).result)).toMatchObject({
-      status: "succeeded",
-      releaseId: candidate.id,
-      previousReleaseId: previous.id,
-    });
+    expect(supervisor.replacementRequested).toBe(true);
+    expect(readUpdateResult(gatewayUpdatePaths(stateDir).result)).toBeUndefined();
+    expect(readUpdateRequest(gatewayUpdatePaths(stateDir).request)?.status).toBe("committed");
     expect(currentGatewayRelease(gatewayUpdatePaths(stateDir)).id).toBe(candidate.id);
   });
 
-  test("relaunches a current candidate with its request after supervisor recovery", async () => {
+  test("candidate supervisor verifies its gateway before recording success", async () => {
     const root = temporaryDirectory();
     const repository = join(root, "repository");
     const stateDir = join(root, "state");
@@ -277,7 +295,7 @@ describe("transactional gateway updates", () => {
     await resultReady.promise;
     supervisor.stop();
     await running;
-    expect(supervisor.replacementRequested).toBe(true);
+    expect(supervisor.replacementRequested).toBe(false);
 
     expect(spawns).toEqual([
       `${candidate.id}:none`,

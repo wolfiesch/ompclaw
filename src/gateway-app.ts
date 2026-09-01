@@ -222,7 +222,7 @@ export class GatewayApplication {
         ? new GatewayUpdateCoordinator({
             config: this.#config.updates,
             stateDir: this.#config.stateDir,
-            activationEnabled: isSupervisorManagedUpdateProcess(this.#config.stateDir),
+            activationEnabled: () => isSupervisorManagedUpdateProcess(this.#config.stateDir),
           })
         : undefined;
       await updates?.discardArmed();

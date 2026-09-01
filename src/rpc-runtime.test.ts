@@ -489,6 +489,50 @@ describe("RpcGatewayRuntime", () => {
     await failed.stop();
   });
 
+  test("does not start a queued turn until activation commit finishes", async () => {
+    const commitEntered = Promise.withResolvers<void>();
+    const releaseCommit = Promise.withResolvers<void>();
+    const updates: GatewayUpdateControl = {
+      async stage() {
+        throw new Error("not used");
+      },
+      async arm() {
+        throw new Error("not used");
+      },
+      async commitArmed() {
+        commitEntered.resolve();
+        await releaseCommit.promise;
+      },
+      async discardArmed() {
+        throw new Error("not used");
+      },
+    };
+    const runtime = new RpcGatewayRuntime({ config, delivery: delivery(), updates });
+    await runtime.start();
+    await runtime.handleInbound(message("update-serial-first", "Activate"));
+    const queued = runtime.handleInbound(message("update-serial-second", "Run next"));
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Activation scheduled" }] }],
+    });
+    await commitEntered.promise;
+
+    expect(rpc.sent.filter((command) => command.type === "prompt")).toHaveLength(1);
+    releaseCommit.resolve();
+    await waitFor(() => rpc.sent.filter((command) => command.type === "prompt").length === 2);
+    await queued;
+
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Next complete" }] }],
+    });
+    await runtime.waitUntilIdle();
+    await runtime.stop();
+  });
+
   test("commits activation even when the post-turn state refresh fails", async () => {
     const calls: string[] = [];
     const updates: GatewayUpdateControl = {
