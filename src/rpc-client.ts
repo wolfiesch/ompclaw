@@ -20,6 +20,16 @@ export interface RpcCommandInput {
 export type RpcFrameListener = (frame: Record<string, unknown>) => void | Promise<void>;
 export type RpcExitListener = (error: Error) => void | Promise<void>;
 
+export interface RpcClient {
+  readonly running: boolean;
+  onFrame(listener: RpcFrameListener): () => void;
+  onExit(listener: RpcExitListener): () => void;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  send(command: RpcCommandInput, timeoutMs?: number): Promise<RpcResponse>;
+  write(frame: RpcInboundFrame): void;
+}
+
 interface PendingRequest {
   command: string;
   resolve(response: RpcResponse): void;
@@ -39,7 +49,7 @@ export class RpcCommandError extends Error {
 }
 
 /** Process-backed OMP RPC client with v2 negotiation, lossless frames, and restart-safe teardown. */
-export class OmpRpcClient {
+export class OmpRpcClient implements RpcClient {
   readonly #options: Required<Pick<OmpRpcClientOptions, "readyTimeoutMs" | "commandTimeoutMs" | "maxStderrBytes">> & OmpRpcClientOptions;
   readonly #frameListeners = new Set<RpcFrameListener>();
   readonly #exitListeners = new Set<RpcExitListener>();
