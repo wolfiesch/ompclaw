@@ -44,6 +44,10 @@ export function buildOmpRpcArgv(config: RpcRuntimeConfig, resume = config.resume
     case "review":
       argv.push("--approval-mode", "always-ask");
       break;
+    default:
+      throw new Error(
+        `Unsupported autonomy mode: ${config.autonomyMode}. Supported values: inherit, autopilot, balanced, review`,
+      );
   }
   argv.push(...config.ompArgs);
   return argv;

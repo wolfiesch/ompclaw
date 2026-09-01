@@ -113,6 +113,12 @@ describe("RPC configuration", () => {
     }
   });
 
+  test("rejects unknown runtime autonomy modes", () => {
+    expect(() => buildOmpRpcArgv(runtimeConfig({
+      autonomyMode: "unknown" as unknown as RpcRuntimeConfig["autonomyMode"],
+    }))).toThrow("Unsupported autonomy mode: unknown. Supported values: inherit, autopilot, balanced, review");
+  });
+
   test("keeps raw approval mode arguments under inherited autonomy", () => {
     expect(buildOmpRpcArgv(runtimeConfig({
       ompArgs: ["--approval-mode", "write"],
