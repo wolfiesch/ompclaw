@@ -98,7 +98,7 @@ user decisions, including authorization, publication, or other consequential
 actions.
 
 Telegram Home displays the configured mode as read-only state. It has no live
-autonomy switch; update configuration instead.
+autonomy switch; change configuration and restart the service.
 
 Put token values only in a private environment file. The values below are placeholders, not usable credentials.
 

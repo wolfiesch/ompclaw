@@ -189,6 +189,22 @@ const AUTONOMY_MODE_LABELS: Readonly<Record<AutonomyMode, string>> = {
   review: "Review",
 };
 
+const AUTONOMY_APPROVAL_MODES: Readonly<Record<AutonomyMode, string>> = {
+  inherit: "inherited (no OmpClaw --approval-mode override)",
+  autopilot: "yolo",
+  balanced: "write",
+  review: "always-ask",
+};
+
+function autonomyText(mode: AutonomyMode): string {
+  return [
+    `Autonomy: ${AUTONOMY_MODE_LABELS[mode]} (${mode})`,
+    `OMP approval mode: ${AUTONOMY_APPROVAL_MODES[mode]}`,
+    "This affects tool approval prompts, not genuine user decisions.",
+    "Changes currently require configuration plus service restart.",
+  ].join("\n");
+}
+
 const IMAGE_MEDIA_TYPES: Record<string, string> = {
   ".gif": "image/gif",
   ".jpeg": "image/jpeg",
@@ -431,7 +447,7 @@ export class RpcGatewayRuntime {
 
     await this.#startTurn(delivery, message);
     const prompt = this.#promptQueue.then(() => this.#deliverPrompt(message, delivery));
-    this.#promptQueue = prompt.catch(() => {});
+    this.#promptQueue = prompt.catch(() => { });
     return prompt;
   }
 
@@ -545,7 +561,7 @@ export class RpcGatewayRuntime {
       reject: (error) => completion.reject(error),
     });
     const prompt = this.#promptQueue.then(() => this.#deliverPrompt(message, delivery));
-    this.#promptQueue = prompt.catch(() => {});
+    this.#promptQueue = prompt.catch(() => { });
     await prompt;
     if (this.#activeTurn && this.#sameDelivery(this.#activeTurn, delivery)) await completion.promise;
   }
@@ -600,10 +616,12 @@ export class RpcGatewayRuntime {
     });
     await rpc.start();
     await rpc.send({ type: "set_subagent_subscription", level: "progress" });
-    await rpc.send({ type: "set_host_tools", tools: gatewayHostToolDefinitions({
-      automation: this.#options.automation !== undefined,
-      updates: this.#options.updates !== undefined,
-    }) });
+    await rpc.send({
+      type: "set_host_tools", tools: gatewayHostToolDefinitions({
+        automation: this.#options.automation !== undefined,
+        updates: this.#options.updates !== undefined,
+      })
+    });
     const state = await this.#requestData<RpcSessionState>({ type: "get_state" });
     this.#status.state = state;
     this.#persistSession(state);
@@ -628,7 +646,7 @@ export class RpcGatewayRuntime {
     this.#failIdleWaiters(error);
     if (active) {
       active.scheduledCompletion?.reject(error);
-      await this.#send(active, `OMP stopped unexpectedly: ${error.message}\n\nThe gateway will ${this.#options.config.autoRestart ? "restart it" : "remain offline"}.`).catch(() => {});
+      await this.#send(active, `OMP stopped unexpectedly: ${error.message}\n\nThe gateway will ${this.#options.config.autoRestart ? "restart it" : "remain offline"}.`).catch(() => { });
     }
     if (!this.#options.config.autoRestart) return;
     const delays = [1_000, 2_000, 5_000, 10_000, 30_000];
@@ -790,7 +808,7 @@ export class RpcGatewayRuntime {
     } catch (error) {
       await this.#setTurnLifecycle("failed", { error: error instanceof Error ? error.message : String(error) });
       this.#clearActiveDelivery(delivery);
-      await this.#send(delivery, `Prompt failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => {});
+      await this.#send(delivery, `Prompt failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => { });
       throw error;
     }
   }
@@ -808,7 +826,7 @@ export class RpcGatewayRuntime {
       this.#queueSourceReaction(delivery, "👍");
     } catch (error) {
       this.#queueSourceReaction(delivery, "👎");
-      await this.#send(delivery, `${mode === "followup" ? "Follow-up" : "Correction"} failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => {});
+      await this.#send(delivery, `${mode === "followup" ? "Follow-up" : "Correction"} failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => { });
       throw error;
     }
   }
@@ -1001,7 +1019,7 @@ export class RpcGatewayRuntime {
       delivery.deliveryContext,
     );
     const command = response.selected[0];
-    if (command === "autonomy") await this.#handleCommand(delivery, "status", "");
+    if (command === "autonomy") await this.#send(delivery, autonomyText(this.#options.config.autonomyMode));
     else if (command !== undefined) await this.#handleCommand(delivery, command, "");
   }
 

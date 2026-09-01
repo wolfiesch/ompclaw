@@ -1116,14 +1116,17 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
-  test("shows configured autonomy in home as a read-only status path", async () => {
-    const modes: ReadonlyArray<readonly [RpcRuntimeConfig["autonomyMode"], string]> = [
-      ["inherit", "Inherited"],
-      ["autopilot", "Autopilot"],
-      ["balanced", "Balanced"],
-      ["review", "Review"],
-    ];
-    for (const [autonomyMode, label] of modes) {
+  test("shows configured autonomy in home as read-only approval guidance", async () => {
+    const modes: ReadonlyArray<readonly [
+      RpcRuntimeConfig["autonomyMode"],
+      string,
+      string,
+    ]> = [
+        ["inherit", "Inherited", "inherited (no OmpClaw --approval-mode override)"],
+        ["balanced", "Balanced", "write"],
+      ];
+    for (const [autonomyMode, label, approvalMode] of modes) {
+      deliveries = [];
       present = async (request) => {
         if (request.type === "select" && request.title === "OmpClaw control center") {
           expect(request.options).toContainEqual({
@@ -1140,7 +1143,19 @@ describe("RpcGatewayRuntime", () => {
       await runtime.handleInbound(message("commands", "/home"));
 
       const rpc = FakeOmpRpcClient.instances.at(-1)!;
-      expect(rpc.sent.slice(3)).toEqual([{ type: "get_state" }, { type: "get_state" }]);
+      expect(rpc.sent.slice(3)).toEqual([{ type: "get_state" }]);
+      expect(rpc.sent.some((command) => command.type.includes("approval"))).toBe(false);
+      expect(
+        deliveries
+          .filter((call) => call.method === "presentUi")
+          .map((call) => call.request?.type === "select" ? call.request.title : undefined),
+      ).toEqual(["OmpClaw control center"]);
+      expect(deliveries.some((call) => textFromContent(call.content) === [
+        `Autonomy: ${label} (${autonomyMode})`,
+        `OMP approval mode: ${approvalMode}`,
+        "This affects tool approval prompts, not genuine user decisions.",
+        "Changes currently require configuration plus service restart.",
+      ].join("\n"))).toBe(true);
       await runtime.stop();
     }
   });
