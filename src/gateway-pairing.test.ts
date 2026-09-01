@@ -233,6 +233,28 @@ describe("GatewayPairingService", () => {
     expect(store.resolvePrincipal(identity("100"))).toEqual({ id: "operator:telegram:default:100", roles: ["operator"] });
     store.close();
   });
+  test("queries only unconfirmed approvals for one transport account", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const pairing = service(store, "CONFIRM1", "CONFIRM2");
+    const first = pairing.request(identity("100"), address("100"), now);
+    const otherIdentity = { ...identity("200"), account: "other" };
+    const otherAddress = { ...address("200"), account: "other" };
+    const other = pairing.request(otherIdentity, otherAddress, now + 1);
+    pairing.approve(first.code, undefined, now + 2);
+    pairing.approve(other.code, undefined, now + 3);
+
+    expect(pairing.listUnconfirmedApprovals("telegram", "default")).toEqual([
+      expect.objectContaining({ identity: identity("100"), state: "approved" }),
+    ]);
+    expect(pairing.completeConfirmation(identity("100"), now + 4)).toBe(true);
+    expect(pairing.completeConfirmation(identity("100"), now + 5)).toBe(false);
+    expect(pairing.listUnconfirmedApprovals("telegram", "default")).toEqual([]);
+    expect(pairing.listUnconfirmedApprovals("telegram", "other")).toEqual([
+      expect.objectContaining({ identity: otherIdentity, state: "approved" }),
+    ]);
+    store.close();
+  });
+
   test("bounds pending runtime challenges per transport account while allowing code rotation", () => {
     const store = new GatewayStore(temporaryDatabase());
     const pairing = service(store, "WSFIRST1", "FIRST001", "SECOND01", "THIRD001", "ROTATE01");

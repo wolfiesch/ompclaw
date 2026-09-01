@@ -61,16 +61,19 @@ export interface FakeTelegramApiOptions {
   readonly setCommandsError?: Error;
   readonly reactionError?: Error;
   readonly transcribe?: boolean;
+  readonly poller?: TelegramTestPoller;
+  readonly pairingApprovalMonitorError?: Error;
 }
 
 export class FakeTelegramApi {
   readonly calls: TelegramApiCall[] = [];
-  readonly poller = new TelegramTestPoller();
+  readonly poller: TelegramTestPoller;
   readonly seams: TelegramApiSeams;
   #messageId = 200;
   #pairingApprovalRun: (() => void | Promise<void>) | undefined;
 
   constructor(options: FakeTelegramApiOptions = {}) {
+    this.poller = options.poller ?? new TelegramTestPoller();
     this.seams = {
       poller: this.poller,
       acquireLock: () => ({ ok: true }),
@@ -79,6 +82,7 @@ export class FakeTelegramApi {
       now: () => 1_800_000_000_000,
       randomId: () => "interaction-id",
       startPairingApprovalMonitor: (run) => {
+        if (options.pairingApprovalMonitorError) throw options.pairingApprovalMonitorError;
         this.#pairingApprovalRun = run;
         run();
         return () => {

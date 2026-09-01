@@ -17,6 +17,7 @@ import {
   disposeTelegramAdapterHarnesses,
   flushTelegramTasks as flush,
   lastTelegramCall as sentMessage,
+  TelegramTestPoller,
   telegramCallbackData as callbackData,
   telegramTestMessage as message,
 } from "./test-harness";
@@ -60,6 +61,23 @@ describe("Telegram transport lifecycle", () => {
     expect(poller.started).toBe(true);
     expect(warnings).toEqual([expect.stringContaining("command menu registration failed: menu unavailable")]);
     await adapter.stop();
+  });
+
+  test("stops polling when pairing approval monitor startup fails", async () => {
+    const poller = new TelegramTestPoller();
+    await expect(
+      fixture({
+        poller,
+        pairingApprovalMonitorError: new Error("monitor unavailable"),
+        pairing: {
+          requestFromTransport: () => ({ status: "capacity" as const }),
+          listUnconfirmedApprovals: () => [],
+          completeConfirmation: () => false,
+        },
+      }),
+    ).rejects.toThrow("monitor unavailable");
+    expect(poller.started).toBe(true);
+    expect(poller.stopped).toBe(true);
   });
 
   test("removes its temporary state directory when startup fails", async () => {
@@ -284,6 +302,7 @@ describe("Telegram inbound conversion", () => {
   test("pairs an unresolved private sender without dispatching the inbound task", async () => {
     const requests: PairingRequestView[] = [];
     let pairedPrincipal: Principal | undefined;
+    let confirmationsCompleted = 0;
     const pairing = {
       requestFromTransport: (
         identity: PairingRequestView["identity"],
@@ -302,7 +321,19 @@ describe("Telegram inbound conversion", () => {
         requests.splice(0, requests.length, request);
         return { status: "created" as const, result: { code: "ABCD2345", request } };
       },
-      list: () => requests,
+      listUnconfirmedApprovals: () => requests.filter((request) => request.state === "approved"),
+      completeConfirmation: (identity: PairingRequestView["identity"]) => {
+        const index = requests.findIndex(
+          (request) =>
+            request.identity.transport === identity.transport &&
+            request.identity.account === identity.account &&
+            request.identity.subject === identity.subject,
+        );
+        if (index < 0) return false;
+        requests.splice(index, 1);
+        confirmationsCompleted += 1;
+        return true;
+      },
     };
     const harness = await fixture({
       pairing,
@@ -317,7 +348,6 @@ describe("Telegram inbound conversion", () => {
     expect(harness.received).toEqual([]);
     expect(sentMessage(harness.calls).payload.text).toContain("Pairing code: ABCD2345");
     expect(sentMessage(harness.calls).payload.text).toContain("ompclaw pairing-approve ABCD2345");
-    expect(harness.checkpoints.get("telegram\0pairing:runtime:primary:99")).toBe(1_800_000_000_000);
 
     pairedPrincipal = { id: "operator:telegram:primary:99", roles: ["operator"] };
     requests[0] = {
@@ -329,11 +359,12 @@ describe("Telegram inbound conversion", () => {
     await harness.flushPairingApprovals();
     expect(sentMessage(harness.calls).payload.text).toBe("Paired. Send your first task.");
 
+    expect(confirmationsCompleted).toBe(1);
     const confirmationCount = harness.calls.filter(
       (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
     ).length;
     await harness.flushPairingApprovals();
-    expect(harness.checkpoints.get("telegram\0pairing:confirmed:primary:99")).toBe(1_800_000_000_000);
+    expect(confirmationsCompleted).toBe(1);
     expect(
       harness.calls.filter(
         (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
@@ -350,7 +381,8 @@ describe("Telegram inbound conversion", () => {
           pairingRequests += 1;
           return { status: "capacity" as const };
         },
-        list: () => [],
+        listUnconfirmedApprovals: () => [],
+        completeConfirmation: () => false,
       },
     });
     await adapter.handleUpdate({

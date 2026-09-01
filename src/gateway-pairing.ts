@@ -60,6 +60,8 @@ export type GatewayPairingPersistence = Pick<
  | "upsertPairingRequest"
  | "expirePairingRequests"
  | "listPairingRequests"
+ | "listUnconfirmedPairingApprovals"
+ | "completePairingConfirmation"
  | "recordPairingFailures"
  | "approvePairingRequest"
  | "rejectPairingRequest"
@@ -189,6 +191,14 @@ export class GatewayPairingStore {
   return this.#store.listPairingRequests().map(viewOf);
  }
 
+ listUnconfirmedApprovals(transport: string, account: string): PairingRequestView[] {
+  return this.#store.listUnconfirmedPairingApprovals(transport, account).map(viewOf);
+ }
+
+ completeConfirmation(identity: TransportIdentity, now: number): boolean {
+  return this.#store.completePairingConfirmation(identity, pairingNow(now));
+ }
+
  approve(
   code: string,
   principalIdOrResolver: string | ((identity: TransportIdentity) => string),
@@ -296,6 +306,14 @@ export class GatewayPairingService {
 
  list(now = Date.now()): PairingRequestView[] {
   return this.#store.list(now);
+ }
+
+ listUnconfirmedApprovals(transport: string, account: string): PairingRequestView[] {
+  return this.#store.listUnconfirmedApprovals(transport, account);
+ }
+
+ completeConfirmation(identity: TransportIdentity, now = Date.now()): boolean {
+  return this.#store.completeConfirmation(identity, now);
  }
 
  approve(code: string, principalId?: string, now = Date.now()): PairingRequestView {

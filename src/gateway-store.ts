@@ -921,6 +921,7 @@ export class GatewayStore implements GatewaySemanticViewStore {
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
         resolved_at INTEGER,
+        confirmation_delivered_at INTEGER,
         principal_id TEXT REFERENCES principals(id) ON DELETE RESTRICT,
         PRIMARY KEY (transport, account, subject),
         CHECK (expires_at > created_at)
@@ -1088,6 +1089,15 @@ export class GatewayStore implements GatewaySemanticViewStore {
         "ALTER TABLE pending_inbound_messages ADD COLUMN scheduled INTEGER NOT NULL DEFAULT 0 CHECK (scheduled IN (0, 1))",
       );
     }
+  const pairingColumns = this.#database.query("PRAGMA table_info(pairing_requests)").all() as SqlRow[];
+  if (!pairingColumns.some((row) => row.name === "confirmation_delivered_at")) {
+   this.#database.exec("ALTER TABLE pairing_requests ADD COLUMN confirmation_delivered_at INTEGER");
+  }
+  this.#database.exec(`
+      CREATE INDEX IF NOT EXISTS pairing_requests_unconfirmed_approval
+        ON pairing_requests (transport, account, created_at)
+        WHERE state = 'approved' AND confirmation_delivered_at IS NULL
+    `);
   }
 
   close(): void {
@@ -1173,6 +1183,7 @@ export class GatewayStore implements GatewaySemanticViewStore {
              created_at = excluded.created_at,
              expires_at = excluded.expires_at,
              resolved_at = NULL,
+             confirmation_delivered_at = NULL,
              principal_id = NULL`,
     )
     .run(
@@ -1200,6 +1211,37 @@ export class GatewayStore implements GatewaySemanticViewStore {
       )
    .all() as SqlRow[];
   return rows.map(decodeStoredPairingRequest);
+ }
+
+ listUnconfirmedPairingApprovals(transport: string, account: string): StoredPairingRequest[] {
+  requiredText(transport, "pairing confirmation transport");
+  requiredText(account, "pairing confirmation account");
+  const rows = this.#database
+   .query(
+    `SELECT ${PAIRING_REQUEST_FIELDS}
+       FROM pairing_requests
+       WHERE transport = ? AND account = ? AND state = 'approved' AND confirmation_delivered_at IS NULL
+       ORDER BY created_at ASC, subject ASC`,
+   )
+   .all(transport, account) as SqlRow[];
+  return rows.map(decodeStoredPairingRequest);
+ }
+
+ completePairingConfirmation(identity: TransportIdentity, now: number): boolean {
+  validateIdentity(identity);
+  if (!Number.isSafeInteger(now) || now < 0) {
+   throw new Error("pairing confirmation timestamp must be a safe nonnegative integer");
+  }
+  return (
+   this.#database
+    .query(
+     `UPDATE pairing_requests
+        SET confirmation_delivered_at = ?
+        WHERE transport = ? AND account = ? AND subject = ?
+          AND state = 'approved' AND confirmation_delivered_at IS NULL`,
+    )
+    .run(now, identity.transport, identity.account, identity.subject).changes === 1
+  );
  }
 
  expirePairingRequests(now: number): number {

@@ -6,7 +6,7 @@ import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { GatewayStore, JsonValue, PendingInteraction } from "../../gateway-store";
-import type { GatewayPairingService, PairingRequestView } from "../../gateway-pairing";
+import type { GatewayPairingService } from "../../gateway-pairing";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -59,9 +59,6 @@ function startPairingApprovalMonitor(run: () => void | Promise<void>): () => voi
   return () => clearInterval(timer);
 }
 
-function pairingCheckpoint(kind: "runtime" | "confirmed", request: PairingRequestView): string {
-  return `pairing:${kind}:${encodeURIComponent(request.identity.account)}:${encodeURIComponent(request.identity.subject)}`;
-}
 
 
 type InteractiveRequest = Extract<UiRequest, { type: "confirm" | "select" | "input" | "editor" }>;
@@ -102,7 +99,10 @@ export interface TelegramTransportAdapterOptions {
     | "getSemanticView"
     | "putSemanticView"
   >;
-  readonly pairing?: Pick<GatewayPairingService, "requestFromTransport" | "list">;
+  readonly pairing?: Pick<
+    GatewayPairingService,
+    "requestFromTransport" | "listUnconfirmedApprovals" | "completeConfirmation"
+  >;
   readonly transcribeCommand?: readonly string[];
   readonly logger?: Logger;
   readonly api?: TelegramApiSeams;
@@ -458,6 +458,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#lockPath = lock;
     this.#context = context;
     this.#stopHeartbeat = this.#heartbeat(lock);
+    let pollerStarted = false;
     try {
       if (this.#commands.length > 0) {
         try {
@@ -471,6 +472,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
         }
       }
       this.#poller.start(this.#token, (update) => this.#trackUpdate(update), this.#log);
+      pollerStarted = true;
       if (this.#pairing !== undefined) {
         this.#stopPairingApprovalMonitor = this.#startPairingApprovalMonitor(() =>
           this.#schedulePairingApprovalDrain(),
@@ -483,6 +485,30 @@ export class TelegramTransportAdapter implements TransportAdapter {
         context.signal.addEventListener("abort", abort, { once: true });
       }
     } catch (error) {
+      try {
+        this.#stopPairingApprovalMonitor?.();
+      } catch (cleanupError) {
+        this.#log?.warn(
+          `[telegram] pairing approval monitor cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          }`,
+        );
+      }
+      this.#stopPairingApprovalMonitor = undefined;
+      if (pollerStarted) {
+        try {
+          this.#poller.stop();
+        } catch (cleanupError) {
+          this.#log?.warn(
+            `[telegram] poller cleanup failed after startup error: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+            }`,
+          );
+        }
+        await Promise.allSettled([
+          this.#poller.done(),
+          ...this.#updateTasks,
+          ...(this.#pairingApprovalDrain === undefined ? [] : [this.#pairingApprovalDrain]),
+        ]);
+      }
       this.#releaseRuntimeOwnership();
       this.#context = undefined;
       throw error;
@@ -1363,7 +1389,6 @@ export class TelegramTransportAdapter implements TransportAdapter {
       ].join("\n"),
       { principal, origin: address },
     );
-    this.#store.setCheckpoint(this.id, pairingCheckpoint("runtime", request), request.createdAt);
   }
 
   #schedulePairingApprovalDrain(): Promise<void> | undefined {
@@ -1386,17 +1411,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const pairing = this.#pairing;
     const context = this.#context;
     if (pairing === undefined || context === undefined) return;
-    const approved = pairing
-      .list(this.#clock())
-      .filter(
-        (request) =>
-          request.state === "approved" &&
-          request.principalId !== undefined &&
-          request.identity.transport === "telegram" &&
-          request.identity.account === this.#account &&
-          this.#store.getCheckpoint(this.id, pairingCheckpoint("runtime", request)) === request.createdAt &&
-          this.#store.getCheckpoint(this.id, pairingCheckpoint("confirmed", request)) !== request.createdAt,
-      );
+    const approved = pairing.listUnconfirmedApprovals("telegram", this.#account);
     for (const request of approved) {
       try {
         const principal = await context.resolveIdentity(request.identity, context.signal);
@@ -1408,7 +1423,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
           {},
           context.signal,
         );
-        this.#store.setCheckpoint(this.id, pairingCheckpoint("confirmed", request), request.createdAt);
+        pairing.completeConfirmation(request.identity, this.#clock());
       } catch (error) {
         if (context.signal?.aborted) return;
         this.#log?.warn(
