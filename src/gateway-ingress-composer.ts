@@ -1,5 +1,5 @@
 import type { AppendIngressFragmentInput, IngressCompositionRecord } from "./gateway-store";
-import type { InboundMessage } from "./gateway-types";
+import type { ConversationAddress, InboundMessage } from "./gateway-types";
 
 export const DEFAULT_INGRESS_DEBOUNCE_MS = 800;
 export const DEFAULT_INGRESS_MEDIA_DEBOUNCE_MS = 800;
@@ -106,7 +106,7 @@ export class GatewayIngressComposer {
     const openEditedFragment = message.edited ? this.#findCompositionByFragment(message.id) : undefined;
     if (message.edited && openEditedFragment === undefined) return;
     if (!message.edited && isCommand(message)) {
-      const flushed = await this.#flushPending();
+      const flushed = await this.#flushConversation(message.principal.id, message.address);
       if (!flushed) throw new Error("Cannot deliver a command before earlier ingress messages");
       await this.#deliver(message);
       return;
@@ -127,7 +127,7 @@ export class GatewayIngressComposer {
       }
     }
 
-    const flushed = await this.#flushPending(groupKey);
+    const flushed = await this.#flushOtherCompositions(message.principal.id, message.address, groupKey);
     if (!flushed) throw new Error("Cannot stage ingress before earlier ingress messages are delivered");
 
     const hint = message.composition;
@@ -161,10 +161,25 @@ export class GatewayIngressComposer {
     return delivered;
   }
 
-  async #flushPending(exceptGroupKey?: string): Promise<boolean> {
+  async #flushConversation(principalId: string, address: ConversationAddress): Promise<boolean> {
     const records = this.#store
       .listPendingIngressCompositions()
-      .filter((record) => exceptGroupKey === undefined || record.groupKey !== exceptGroupKey)
+      .filter((record) => record.principalId === principalId && sameAddress(record.address, address))
+      .sort(compareCompositions);
+
+    for (const record of records) {
+      if (!(await this.#flushComposition(record))) return false;
+    }
+    return true;
+  }
+
+  async #flushOtherCompositions(principalId: string, address: ConversationAddress, groupKey: string): Promise<boolean> {
+    const records = this.#store
+      .listPendingIngressCompositions()
+      .filter(
+        (record) =>
+          record.groupKey !== groupKey && record.principalId === principalId && sameAddress(record.address, address),
+      )
       .sort(compareCompositions);
 
     for (const record of records) {
@@ -292,6 +307,15 @@ function compareCompositions(left: IngressCompositionRecord, right: IngressCompo
 
 function compareFragments(left: InboundMessage, right: InboundMessage): number {
   return (left.composition?.order ?? 0) - (right.composition?.order ?? 0) || left.id.localeCompare(right.id);
+}
+
+function sameAddress(left: ConversationAddress, right: ConversationAddress): boolean {
+  return (
+    left.transport === right.transport &&
+    left.account === right.account &&
+    left.channel === right.channel &&
+    left.thread === right.thread
+  );
 }
 
 function isCommand(message: InboundMessage): boolean {

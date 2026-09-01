@@ -223,13 +223,37 @@ describe("GatewayIngressComposer", () => {
         composition: { kind: "text", order: 2 },
       }),
     );
-    expect(delivered.map((message) => [message.address.channel, message.content.text])).toEqual([["42", "First"]]);
+    expect(delivered).toEqual([]);
     now += 800;
-    expect(await ingress.flushDue()).toBe(1);
+    expect(await ingress.flushDue()).toBe(2);
     expect(delivered.map((message) => [message.address.channel, message.content.text])).toEqual([
       ["42", "First"],
       ["other", "Second"],
     ]);
+  });
+
+  test("does not let a failed composition block another conversation", async () => {
+    const store = new MemoryIngressStore();
+    const delivered: InboundMessage[] = [];
+    const ingress = new GatewayIngressComposer({
+      store,
+      now: () => 0,
+      logger: { warn: () => {}, error: () => {} },
+      deliver: async (message) => {
+        if (message.address.channel === telegramAddress.channel) throw new Error("unavailable");
+        delivered.push(message);
+      },
+    });
+
+    await ingress.accept(inbound("blocked", "Pending", { composition: { kind: "text", order: 1 } }));
+    const command = inbound("other-command", "/status", {
+      address: { ...telegramAddress, channel: "other" },
+      composition: { kind: "text", order: 2 },
+    });
+    await expect(ingress.accept(command)).resolves.toBeUndefined();
+
+    expect(delivered).toEqual([command]);
+    expect(store.listPendingIngressCompositions().map((record) => record.id)).toEqual(["blocked"]);
   });
 
   test("flushes an album in media order and caps an active burst at its original deadline", async () => {
