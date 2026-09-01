@@ -155,6 +155,12 @@ Read the [operator guide](docs/guide.md) for configuration, migration, operation
 
 Package installation above is for operators. Source checkout, development conventions, and verification commands are intentionally separate in [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Pull request verification
+
+Pull requests that change only `README.md`, `CHANGELOG.md`, `LICENSE`, documentation files ending in `.md`, `.rst`, or `.txt` under `docs/`, or a top-level `.github/*.md` file use the lightweight CI lane. The classifier still scans added public text for credentials, private paths, session identifiers, and private hosts. Source, manifest, workflow, executable documentation, mixed, empty, or ambiguous changes use the full lane.
+
+Branch protection requires the stable `verify` check. Before merging, confirm that `verify` succeeded for the current pull request head and that all review threads are resolved.
+
 ## License
 
 `ompclaw` is MIT licensed; see [LICENSE](LICENSE).
