@@ -17,7 +17,7 @@ describe("remote test dispatcher", () => {
       .toBe("/tmp/ompclaw-check.Abc123");
     expect(() => assertRemoteCheckDirectory("/tmp/ompclaw-check"))
       .toThrow("refusing unsafe remote test directory");
-    expect(() => assertRemoteCheckDirectory("/Users/test/ompclaw"))
+    expect(() => assertRemoteCheckDirectory("/srv/test/ompclaw"))
       .toThrow("refusing unsafe remote test directory");
   });
 });
