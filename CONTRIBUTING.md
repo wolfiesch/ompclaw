@@ -22,6 +22,32 @@ Before opening a pull request, run the complete local check:
 bun run check
 ```
 
+### Telegram scenario and remote checks
+
+Run the deterministic Telegram scenario layer without credentials:
+
+```sh
+bun run test:harness
+```
+
+This exercises synthetic Telegram updates through the real adapter, authenticated gateway core, SQLite state, application dispatch, and captured Bot API delivery.
+
+Offload the complete check to an SSH-accessible macOS worker with Bun installed:
+
+```sh
+bun run test:remote -- --host m1-worker
+```
+
+The dispatcher copies the working tree into a new `/tmp/ompclaw-check.*` directory, omits Git metadata, dependencies, environment files, databases, and session logs, clears Telegram credential variables, runs `bun run check`, and removes the remote directory. It does not use a Telegram token or provider authentication.
+
+For an explicit live Telegram transport canary, configure `OMPCLAW_TEST_TELEGRAM_TOKEN` and `OMPCLAW_TEST_TELEGRAM_CHAT_ID` in the process environment, then run:
+
+```sh
+bun run test:telegram:live
+```
+
+Use a dedicated private test bot and test chat. The command refuses the configured production `TELEGRAM_BOT_TOKEN`, refuses bots with an active webhook, performs one visible send, typing action, and edit, and prints a receipt. Add `-- --delete` to remove the canary message after the check. Never point the canary at the product bot.
+
 Do not commit generated package tarballs, local databases, session state, environment files, or credentials. Start configuration from `config.example.json`; it contains only credential environment variable names, never credential values.
 
 ## Architecture boundaries

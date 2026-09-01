@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Add a reusable credential-free Telegram scenario harness, a guarded live Bot API canary for dedicated test bots, and an ephemeral SSH dispatcher for running the complete check on a macOS worker without transferring credentials or state.
+
 ## 0.9.2 (2026-09-01)
 
 ### Changed
