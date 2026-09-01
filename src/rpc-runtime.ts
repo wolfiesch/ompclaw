@@ -198,7 +198,7 @@ function autonomyText(mode: AutonomyMode): string {
   const approvalMode = ompApprovalModeForAutonomy(mode);
   return [
     `Autonomy: ${AUTONOMY_MODE_LABELS[mode]} (${mode})`,
-    `OMP approval mode: ${approvalMode ?? "inherited (no OmpClaw --approval-mode override)"}`,
+    `OMP approval mode: ${approvalMode ?? "inherited (OmpClaw adds no autonomy override; omp.args still apply)"}`,
     "This affects tool approval prompts, not genuine user decisions.",
     "Changes currently require configuration plus service restart.",
   ].join("\n");

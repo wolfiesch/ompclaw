@@ -1122,9 +1122,9 @@ describe("RpcGatewayRuntime", () => {
       string,
       string,
     ]> = [
-      ["inherit", "Inherited", "inherited (no OmpClaw --approval-mode override)"],
-      ["balanced", "Balanced", "write"],
-    ];
+        ["inherit", "Inherited", "inherited (OmpClaw adds no autonomy override; omp.args still apply)"],
+        ["balanced", "Balanced", "write"],
+      ];
     for (const [autonomyMode, label, approvalMode] of modes) {
       deliveries = [];
       present = async (request) => {
