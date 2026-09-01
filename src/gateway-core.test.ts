@@ -10,20 +10,20 @@ import {
   ReceiptTransportMismatchError,
   UnknownTransportIdentityError,
 } from "./gateway-core";
-import {
-  type ConversationAddress,
-  type DeliveryContext,
-  type InboundEnvelope,
-  type InboundMessage,
-  type OutboundContent,
-  type OutboundReceipt,
-  type Principal,
-  type ReceiveInbound,
-  type ResolveTransportIdentity,
-  type TransportAdapter,
-  type TransportCapabilities,
-  type UiRequest,
-  type UiResponseFor,
+import type {
+  ConversationAddress,
+  DeliveryContext,
+  InboundEnvelope,
+  InboundMessage,
+  OutboundContent,
+  OutboundReceipt,
+  Principal,
+  ReceiveInbound,
+  ResolveTransportIdentity,
+  TransportAdapter,
+  TransportCapabilities,
+  UiRequest,
+  UiResponseFor,
   UnsupportedTransportCapabilityError,
 } from "./gateway-types";
 
@@ -296,7 +296,7 @@ describe("GatewayCore", () => {
       },
       async presentUi<Request extends UiRequest>(
         _address: ConversationAddress,
-        request: Request,
+        _request: Request,
         _context: DeliveryContext,
       ): Promise<UiResponseFor<Request>> {
         calls.push("ui");

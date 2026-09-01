@@ -4,7 +4,6 @@ import { extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type {
   ConversationAddress,
-  DeliveryContext,
   InboundMessage,
   MessageAttachment,
   OutboundReceipt,

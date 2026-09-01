@@ -17,7 +17,6 @@ import {
   lastTelegramCall as sentMessage,
   telegramCallbackData as callbackData,
   telegramTestMessage as message,
-  type TelegramApiCall as ApiCall,
 } from "./test-harness";
 
 const scratch: string[] = [];

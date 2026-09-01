@@ -150,7 +150,9 @@ describe("Telegram request helpers", () => {
       { chat_id: 42, caption: "artifact" },
       { field: "document", path },
     )).resolves.toEqual({ message_id: 9 });
-    expect(await (bodies[0]?.get("document") as Blob).arrayBuffer()).toEqual(payload.buffer);
+    const document = bodies[0]?.get("document");
+    expect(document).toBeInstanceOf(Blob);
+    expect(await (document as Blob).arrayBuffer()).toEqual(payload.buffer);
     expect(bodies[0]?.get("chat_id")).toBe("42");
     await expect(downloadFileBytes("secret", "reports/payload.bin")).resolves.toEqual(payload);
   });
