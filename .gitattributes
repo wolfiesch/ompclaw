@@ -12,8 +12,7 @@
 *.tgz -text
 *.db -text
 *.sqlite -text
-*.lock -text
-bun.lock -text
+bun.lock text eol=lf
 
 *.sh text eol=lf
 *.py text eol=lf
