@@ -158,6 +158,11 @@ export class GatewayUpdateSupervisor {
     await this.#stopChild();
     switchCurrentRelease(this.#paths, previous.path);
     this.#recordRollback(requestId, candidate, previous, `Candidate did not become ready within ${this.#args.healthTimeoutMs} ms.`);
+    if (active.id === candidate.id) {
+      this.#replacementRequested = true;
+      this.stop();
+      return previous;
+    }
     if (!this.#stopping) this.#child = this.#spawnRelease(previous);
     this.#restartAttempt = 0;
     return previous;

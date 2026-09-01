@@ -103,6 +103,12 @@ describe("transactional gateway updates", () => {
     expect(currentGatewayRelease(coordinator.paths).id).toBe(previous.id);
   });
 
+  test("explains how to bootstrap a missing current release", () => {
+    const paths = gatewayUpdatePaths(temporaryDirectory());
+
+    expect(() => currentGatewayRelease(paths)).toThrow("run ompclaw service-install");
+  });
+
   test("marks a candidate ready and reports supervisor success once", async () => {
     const root = temporaryDirectory();
     const repository = join(root, "repository");
@@ -123,6 +129,7 @@ describe("transactional gateway updates", () => {
     const request = readUpdateRequest(coordinator.paths.request)!;
     process.env.OMPCLAW_RELEASE_ID = candidate.id;
     process.env.OMPCLAW_UPDATE_REQUEST_ID = request.id;
+    writeFileSync(join(coordinator.paths.ready, `${request.id}.json`), "existing readiness marker");
     writeUpdateResult(coordinator.paths.result, {
       schema: 1,
       requestId: request.id,
@@ -380,7 +387,7 @@ describe("transactional gateway updates", () => {
     await resultReady.promise;
     supervisor.stop();
     await running;
-    expect(supervisor.replacementRequested).toBe(false);
+    expect(supervisor.replacementRequested).toBe(true);
 
     const result = readUpdateResult(gatewayUpdatePaths(stateDir).result);
     expect(result).toMatchObject({

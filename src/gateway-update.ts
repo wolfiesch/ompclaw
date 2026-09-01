@@ -224,7 +224,9 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
     if (requestId === undefined || releaseId === undefined) return;
     const request = readJsonIfPresent(this.#paths.request, parseUpdateRequest);
     if (request?.status !== "committed" || request.id !== requestId || request.candidate.id !== releaseId) return;
-    writeJsonAtomic(join(this.#paths.ready, `${request.id}.json`), {
+    const readyPath = join(this.#paths.ready, `${request.id}.json`);
+    if (existsSync(readyPath)) return;
+    writeJsonAtomic(readyPath, {
       schema: UPDATE_SCHEMA,
       requestId: request.id,
       releaseId,
@@ -277,7 +279,13 @@ export function ensureUpdateDirectories(paths: GatewayUpdatePaths): void {
 }
 
 export function currentGatewayRelease(paths: GatewayUpdatePaths): GatewayUpdateRelease {
-  const target = resolve(dirname(paths.current), readlinkSync(paths.current));
+  let link: string;
+  try {
+    link = readlinkSync(paths.current);
+  } catch {
+    throw new Error(`No active OmpClaw release at ${paths.current}; run ompclaw service-install to bootstrap it.`);
+  }
+  const target = resolve(dirname(paths.current), link);
   requireReleasePath(paths, target);
   return readReleaseManifest(realpathSync(target));
 }
