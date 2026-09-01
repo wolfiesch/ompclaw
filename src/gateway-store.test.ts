@@ -709,6 +709,24 @@ describe("GatewayStore", () => {
     database.close();
   });
 
+  test("rejects negative ingress ordering values", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const negativeComposition = stagedIngress("negative-composition");
+
+    expect(() =>
+      appendIngressFragment(store, {
+        ...negativeComposition,
+        composition: { kind: "text", order: -1 },
+      }),
+    ).toThrow("inbound message composition order must be a nonnegative integer");
+    expect(() =>
+      appendIngressFragment(store, stagedIngress("negative-sort"), {
+        sortOrder: -1,
+      }),
+    ).toThrow("ingress fragment sort order must be a nonnegative integer");
+    store.close();
+  });
+
   test("rejects corrupt persisted ingress fragments", () => {
     const path = temporaryDatabase();
     const first = new GatewayStore(path);
@@ -730,7 +748,7 @@ describe("GatewayStore", () => {
 
     const restarted = new GatewayStore(path);
     expect(() => restarted.listPendingIngressCompositions()).toThrow(
-      "inbound message composition order must be an integer",
+      "inbound message composition order must be a nonnegative integer",
     );
     restarted.close();
   });

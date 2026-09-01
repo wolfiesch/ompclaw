@@ -252,8 +252,12 @@ function validateInboundMessage(value: unknown): asserts value is InboundMessage
     if (value.composition.groupId !== undefined) {
       requiredText(value.composition.groupId, "inbound message composition groupId");
     }
-    if (typeof value.composition.order !== "number" || !Number.isSafeInteger(value.composition.order)) {
-      throw new Error("inbound message composition order must be an integer");
+    if (
+      typeof value.composition.order !== "number" ||
+      !Number.isSafeInteger(value.composition.order) ||
+      value.composition.order < 0
+    ) {
+      throw new Error("inbound message composition order must be a nonnegative integer");
     }
   }
   if (value.sourceReceipt !== undefined) validateReceipt(value.sourceReceipt, "inbound message sourceReceipt");
@@ -278,8 +282,8 @@ function validateIngressFragmentInput(input: AppendIngressFragmentInput): void {
   if (input.deadlineAt < input.receivedAt) {
     throw new Error("ingress composition deadline must not precede receipt");
   }
-  if (!Number.isSafeInteger(input.sortOrder)) {
-    throw new Error("ingress fragment sort order must be an integer");
+  if (!Number.isSafeInteger(input.sortOrder) || input.sortOrder < 0) {
+    throw new Error("ingress fragment sort order must be a nonnegative integer");
   }
 }
 
