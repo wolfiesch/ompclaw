@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import type { RpcRuntimeConfig } from "./rpc-config";
+import type { AutonomyMode, RpcRuntimeConfig } from "./rpc-config";
 import { isRecord } from "./type-guards";
 
 const MAX_CONFIG_BYTES = 256 * 1024;
@@ -18,6 +18,7 @@ export interface GatewayOmpConfig {
   readonly sessionDir?: string;
   readonly configFiles: readonly string[];
   readonly args: readonly string[];
+  readonly autonomyMode: AutonomyMode;
   readonly authBrokerTokenFile?: string;
   readonly allowRpcBash: boolean;
   readonly inheritHarness: boolean;
@@ -183,6 +184,7 @@ export function gatewayRpcRuntimeConfig(config: GatewayConfig): RpcRuntimeConfig
     ...(config.omp.sessionDir === undefined ? {} : { sessionDir: config.omp.sessionDir }),
     configFiles: [...config.omp.configFiles],
     ompArgs: [...config.omp.args],
+    autonomyMode: config.omp.autonomyMode,
     ...(config.omp.authBrokerTokenFile === undefined ? {} : { authBrokerTokenFile: config.omp.authBrokerTokenFile }),
     allowRpcBash: config.omp.allowRpcBash,
     inheritHarness: config.omp.inheritHarness,
@@ -216,6 +218,7 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
       command: "omp",
       configFiles: [],
       args: [],
+      autonomyMode: "inherit",
       allowRpcBash: false,
       inheritHarness: false,
       autoRestart: true,
@@ -232,6 +235,7 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
       "sessionDir",
       "configFiles",
       "args",
+      "autonomyMode",
       "authBrokerTokenFile",
       "allowRpcBash",
       "inheritHarness",
@@ -242,7 +246,11 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
   );
   const configFiles = stringArray(omp.configFiles, "omp.configFiles", MAX_OMP_ARGS).map((path) => expandGatewayPath(path, cwd));
   const args = stringArray(omp.args, "omp.args", MAX_OMP_ARGS);
+  const autonomyMode = omp.autonomyMode === undefined ? "inherit" : parseAutonomyMode(omp.autonomyMode);
   const busyInputMode = omp.busyInputMode === undefined ? "steer" : nonEmptyString(omp.busyInputMode, "omp.busyInputMode");
+  if (autonomyMode !== "inherit" && args.some((arg) => arg === "--approval-mode" || arg.startsWith("--approval-mode="))) {
+    throw new Error("omp.autonomyMode conflicts with --approval-mode in omp.args");
+  }
   if (busyInputMode !== "steer" && busyInputMode !== "followup") {
     throw new Error('omp.busyInputMode must be "steer" or "followup"');
   }
@@ -253,6 +261,7 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
     ...(omp.sessionDir === undefined ? {} : { sessionDir: expandGatewayPath(string(omp.sessionDir, "omp.sessionDir"), cwd) }),
     configFiles,
     args,
+    autonomyMode,
     ...(omp.authBrokerTokenFile === undefined
       ? {}
       : { authBrokerTokenFile: expandGatewayPath(string(omp.authBrokerTokenFile, "omp.authBrokerTokenFile"), cwd) }),
@@ -261,6 +270,19 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
     autoRestart: boolean(omp.autoRestart, "omp.autoRestart", true),
     busyInputMode,
   };
+}
+
+function parseAutonomyMode(value: unknown): AutonomyMode {
+  const mode = nonEmptyString(value, "omp.autonomyMode");
+  switch (mode) {
+    case "inherit":
+    case "autopilot":
+    case "balanced":
+    case "review":
+      return mode;
+    default:
+      throw new Error('omp.autonomyMode must be "inherit", "autopilot", "balanced", or "review"');
+  }
 }
 
 function parseTransports(value: unknown): GatewayConfig["transports"] {

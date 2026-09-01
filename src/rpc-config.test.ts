@@ -16,6 +16,7 @@ function runtimeConfig(overrides: Partial<RpcRuntimeConfig> = {}): RpcRuntimeCon
     ompCommand: "omp",
     configFiles: [],
     ompArgs: [],
+    autonomyMode: "inherit",
     allowRpcBash: false,
     inheritHarness: false,
     autoRestart: true,
@@ -74,6 +75,64 @@ describe("RPC configuration", () => {
       "--plan-yolo",
       "--color",
       "never",
+    ]);
+  });
+
+  for (const [autonomyMode, approvalMode] of [
+    ["autopilot", "yolo"],
+    ["balanced", "write"],
+    ["review", "always-ask"],
+  ] as const) {
+    test(`adds the ${approvalMode} approval mode before raw arguments`, () => {
+      expect(buildOmpRpcArgv(runtimeConfig({
+        autonomyMode,
+        ompArgs: ["--color", "never"],
+      }))).toEqual([
+        "omp",
+        "--mode",
+        "rpc-ui",
+        "--cwd",
+        "/workspace",
+        "--profile",
+        "gateway",
+        "--no-title",
+        "--approval-mode",
+        approvalMode,
+        "--color",
+        "never",
+      ]);
+    });
+  }
+
+  test("rejects raw approval mode arguments alongside explicit autonomy", () => {
+    for (const autonomyMode of ["autopilot", "balanced", "review"] as const) {
+      for (const ompArgs of [["--approval-mode", "write"], ["--approval-mode=write"]]) {
+        expect(() => buildOmpRpcArgv(runtimeConfig({ autonomyMode, ompArgs })))
+          .toThrow("Explicit autonomyMode conflicts with --approval-mode in ompArgs");
+      }
+    }
+  });
+
+  test("rejects unknown runtime autonomy modes", () => {
+    expect(() => buildOmpRpcArgv(runtimeConfig({
+      autonomyMode: "unknown" as unknown as RpcRuntimeConfig["autonomyMode"],
+    }))).toThrow("Unsupported autonomy mode: unknown. Supported values: inherit, autopilot, balanced, review");
+  });
+
+  test("keeps raw approval mode arguments under inherited autonomy", () => {
+    expect(buildOmpRpcArgv(runtimeConfig({
+      ompArgs: ["--approval-mode", "write"],
+    }))).toEqual([
+      "omp",
+      "--mode",
+      "rpc-ui",
+      "--cwd",
+      "/workspace",
+      "--profile",
+      "gateway",
+      "--no-title",
+      "--approval-mode",
+      "write",
     ]);
   });
 

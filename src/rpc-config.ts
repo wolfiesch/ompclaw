@@ -1,5 +1,26 @@
 import { lstatSync, readFileSync } from "node:fs";
 
+export type AutonomyMode = "inherit" | "autopilot" | "balanced" | "review";
+
+export function ompApprovalModeForAutonomy(
+  mode: AutonomyMode,
+): "yolo" | "write" | "always-ask" | undefined {
+  switch (mode) {
+    case "inherit":
+      return undefined;
+    case "autopilot":
+      return "yolo";
+    case "balanced":
+      return "write";
+    case "review":
+      return "always-ask";
+    default:
+      throw new Error(
+        `Unsupported autonomy mode: ${mode}. Supported values: inherit, autopilot, balanced, review`,
+      );
+  }
+}
+
 export interface RpcRuntimeConfig {
   cwd: string;
   stateDir: string;
@@ -10,6 +31,7 @@ export interface RpcRuntimeConfig {
   sessionDir?: string;
   configFiles: string[];
   ompArgs: string[];
+  autonomyMode: AutonomyMode;
   authBrokerTokenFile?: string;
   allowRpcBash: boolean;
   inheritHarness: boolean;
@@ -18,11 +40,19 @@ export interface RpcRuntimeConfig {
 }
 
 export function buildOmpRpcArgv(config: RpcRuntimeConfig, resume = config.resume): string[] {
+  if (
+    config.autonomyMode !== "inherit"
+    && config.ompArgs.some((arg) => arg === "--approval-mode" || arg.startsWith("--approval-mode="))
+  ) {
+    throw new Error("Explicit autonomyMode conflicts with --approval-mode in ompArgs");
+  }
   const argv = [config.ompCommand, "--mode", "rpc-ui", "--cwd", config.cwd, "--profile", config.profile, "--no-title"];
   if (resume) argv.push("--resume", resume);
   if (config.model) argv.push("--model", config.model);
   if (config.sessionDir) argv.push("--session-dir", config.sessionDir);
   for (const file of config.configFiles) argv.push("--config", file);
+  const approvalMode = ompApprovalModeForAutonomy(config.autonomyMode);
+  if (approvalMode !== undefined) argv.push("--approval-mode", approvalMode);
   argv.push(...config.ompArgs);
   return argv;
 }

@@ -133,6 +133,7 @@ const config: RpcRuntimeConfig = {
   ompCommand: "omp",
   configFiles: [],
   ompArgs: [],
+  autonomyMode: "inherit",
   allowRpcBash: false,
   inheritHarness: false,
   autoRestart: false,
@@ -484,7 +485,7 @@ describe("RpcGatewayRuntime", () => {
     };
     const failed = createRuntime(
       { config, delivery: failedDelivery, updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
+      { info: () => { }, warn: () => { }, error: () => { } },
     );
     await failed.start();
     await failed.handleInbound(message("update-failure", "Activate"));
@@ -560,7 +561,7 @@ describe("RpcGatewayRuntime", () => {
     };
     const runtime = createRuntime(
       { config, delivery: delivery(), updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
+      { info: () => { }, warn: () => { }, error: () => { } },
     );
     await runtime.start();
     await runtime.handleInbound(message("update-refresh-failure", "Activate"));
@@ -659,7 +660,7 @@ describe("RpcGatewayRuntime", () => {
     };
     const runtime = createRuntime(
       { config, delivery: delivery(), updates },
-      { info: () => {}, warn: () => {}, error: () => {} },
+      { info: () => { }, warn: () => { }, error: () => { } },
     );
     await runtime.start();
     await runtime.handleInbound(message("update-rpc-exit", "Activate"));
@@ -981,7 +982,7 @@ describe("RpcGatewayRuntime", () => {
     };
     const runtime = createRuntime(
       { config, delivery: runtimeDelivery },
-      { info: () => {}, warn: () => {}, error: (message) => logErrors.push(message) },
+      { info: () => { }, warn: () => { }, error: (message) => logErrors.push(message) },
     );
     await runtime.start();
     await runtime.handleInbound(message("events", "Start"));
@@ -1113,6 +1114,51 @@ describe("RpcGatewayRuntime", () => {
     ]);
     expect(deliveries.some((call) => textFromContent(call.content) === "Model: provider/model")).toBe(true);
     await runtime.stop();
+  });
+
+  test("shows configured autonomy in home as read-only approval guidance", async () => {
+    const modes: ReadonlyArray<readonly [
+      RpcRuntimeConfig["autonomyMode"],
+      string,
+      string,
+    ]> = [
+        ["inherit", "Inherited", "inherited (OmpClaw adds no autonomy override; omp.args still apply)"],
+        ["balanced", "Balanced", "write"],
+      ];
+    for (const [autonomyMode, label, approvalMode] of modes) {
+      deliveries = [];
+      present = async (request) => {
+        if (request.type === "select" && request.title === "OmpClaw control center") {
+          expect(request.options).toContainEqual({
+            value: "autonomy",
+            label: "Autonomy",
+            description: label,
+          });
+          return { type: "select", selected: ["autonomy"] } as UiResponseFor<typeof request>;
+        }
+        return defaultUiResponse(request);
+      };
+      const runtime = createRuntime({ config: { ...config, autonomyMode }, delivery: delivery() });
+      await runtime.start();
+      const rpc = FakeOmpRpcClient.instances.at(-1)!;
+      const postStartSentCount = rpc.sent.length;
+      await runtime.handleInbound(message("commands", "/home"));
+
+      expect(rpc.sent.slice(postStartSentCount)).toEqual([{ type: "get_state" }]);
+      expect(rpc.sent.some((command) => command.type.includes("approval"))).toBe(false);
+      expect(
+        deliveries
+          .filter((call) => call.method === "presentUi")
+          .map((call) => call.request?.type === "select" ? call.request.title : undefined),
+      ).toEqual(["OmpClaw control center"]);
+      expect(deliveries.some((call) => textFromContent(call.content) === [
+        `Autonomy: ${label} (${autonomyMode})`,
+        `OMP approval mode: ${approvalMode}`,
+        "This affects tool approval prompts, not genuine user decisions.",
+        "Changes currently require configuration plus service restart.",
+      ].join("\n"))).toBe(true);
+      await runtime.stop();
+    }
   });
 
   test("resumes the supplied session, publishes new-session state, and supports representative commands", async () => {

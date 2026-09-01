@@ -1,113 +1,83 @@
-# Telegram Bridge
+# OmpClaw Architecture
 
-Connects one paired Telegram operator to one or more omp coding sessions:
-messages become user turns, and assistant output streams back into session topics.
+OmpClaw is one gateway service that gives authenticated remote transports access
+to one owned OMP RPC child and its session. The gateway serializes access to the
+child and is the only writer of OmpClaw's durable state.
 
-## Language
+## Runtime
 
-**Bridge**:
-The running Telegram transport and router shared by omp sessions.
-_Avoid_: bot, integration, plugin
+**Gateway service**:
+The OmpClaw process that owns the OMP RPC child, coordinates transport and
+scheduler work, and persists all gateway state.
 
-**Standalone poller daemon**:
-The laptop-wide Bun process that normally owns Telegram `getUpdates`, handles
-control commands, and routes topic messages through filesystem queues. It never
-executes agent turns.
-_Avoid_: agent daemon, background session
+**OMP RPC child**:
+The child process the gateway starts and owns to operate OMP. Transports never
+receive direct access to this process.
 
-**Session poller fallback**:
-A live omp session that temporarily owns `getUpdates` when the standalone daemon
-is disabled, ineligible, or unavailable. It uses the same router and poll lock.
-_Avoid_: second poller, backup bot
+**OMP session**:
+The OMP conversation operated by the owned RPC child. When topic sessions are
+enabled, the gateway serializes session selection and retains the associated
+bindings.
 
-**Inbound**:
-A Telegram message flowing into the omp session as a user turn.
-_Avoid_: incoming
+**Single-writer invariant**:
+Only the gateway service may mutate OmpClaw's SQLite state or operate its owned
+OMP RPC child. Transports, Home, and scheduled jobs submit work through the
+gateway rather than writing state or controlling OMP directly.
 
-**Outbound**:
-Assistant output flowing from the session back to a Telegram chat.
-_Avoid_: outgoing, response
+**SQLite state**:
+The durable store for principals, bindings, OMP session checkpoints, inbound
+deduplication and queued work, UI state, and scheduled jobs. It survives gateway
+restarts.
 
-**Active chat**:
-A Telegram chat currently mirroring the assistant's output. A chat becomes
-active when it sends an inbound message and stops being active when the run
-goes idle.
-_Avoid_: current chat, live chat
+## Access and routing
 
-**Notify chat**:
-The destination that receives a local run's notifications — an idle ping when a
-run finishes and a blocked ping when it parks for input. Distinct from an active
-chat.
-_Avoid_: alert chat
+**Transport**:
+An authenticated adapter for a client protocol, currently Telegram or
+WebSocket. A transport verifies credentials before it can submit work.
 
-**Telegram-initiated run**:
-An agent run whose first message came from Telegram.
-_Avoid_: remote run
+**Principal**:
+The durable OmpClaw identity that owns permissions, conversations, and scheduled
+jobs.
 
-**Local run**:
-An agent run started by the user typing directly in the omp session.
-_Avoid_: laptop run, direct run
+**Transport identity binding**:
+The server-side association between a verified transport identity and an
+OmpClaw principal. Clients do not choose their principal.
 
-**Skill**:
-A capability the model invokes on its own from natural language, because it is
-listed in the session's system prompt. Reaches the model over Telegram with no
-special syntax.
-_Avoid_: command
-
-**Slash command**:
-An explicit-only instruction (`/name`) — prompt/file commands and built-ins —
-that never auto-triggers and must be typed and expanded to take effect.
-_Avoid_: skill
-
-**Paired operator**:
-The sole Telegram user whose private DM can send control commands and own
-session topics. Group chat permissions never confer operator authority.
-_Avoid_: admin, allowed user
-
-**Control command**:
-An owner-only Telegram bot command such as `/spawn` or `/sessions` that operates
-the bridge or herdr. It is handled by the poll-lock holder and never injected as
-an omp user turn. Distinct from an omp slash command.
-_Avoid_: slash-command relay
-
-**Control topic**:
-The single persistent `omp control` thread where global control-command results
-and interactive pickers live. It belongs to the paired operator, not an omp
-session.
-_Avoid_: session topic, project topic
-
-**Herdr space**:
-An open project context that may contain zero or more omp sessions.
-_Avoid_: session, thread
-
-**Herdr worktree**:
-A new git worktree and herdr workspace created from an existing herdr space by
-`/spawn new`.
-_Avoid_: branch session, cloned space
-
-**Omp session**:
-One running omp agent process. Concurrent sessions in one herdr space remain
-independent and receive distinct topics.
-_Avoid_: space, topic
-
-**Session topic**:
-The Telegram thread claimed by one saved omp conversation. Resume identity is
-the session file; fresh sessions in the same directory receive distinct topics.
-_Avoid_: control topic, space, session
+**Conversation binding**:
+The durable association between an authenticated conversation and its OMP
+session context. It lets the gateway resume the correct context after a restart.
 
 **Topic**:
-A Telegram forum thread. Qualify it as a control topic or session topic when
-the distinction matters.
-_Avoid_: space, session
+A Telegram forum thread. Topic bindings can associate authorized topic
+conversations with their persisted OMP session contexts.
 
-**Blocked ping**:
-A Telegram notification sent when a local run parks for input past a two-second
-grace — a tool approval (`[WAIT]`) or an `ask` prompt (`[BLOCKED]`). It is
-informational; the input is answered terminal-local.
-_Avoid_: remote approval, approval prompt
+**Home**:
+The Telegram control surface for current gateway and OMP state. It displays the
+configured autonomy mode, but that state is read-only in this release.
 
-**Notify mode**:
-Whether local runs notify Telegram, set via `/telegram notify`. `away` notifies
-while the user has stepped away and auto-clears on the next local keystroke;
-`always` notifies regardless (for unwatched herdr sessions); `off` is silent.
-_Avoid_: AFK, absent, away flag
+**Inbound request**:
+An authenticated message or control action submitted by a transport to the
+gateway for serialized handling.
+
+**Outbound response**:
+Assistant output or gateway state delivered to the authenticated conversation
+that originated or owns the work.
+
+## Durable work
+
+**Scheduler**:
+The gateway component that runs durable one-shot and cron jobs with timezone,
+retry, recovery, and principal-ownership rules. Scheduler work uses the same
+serialized OMP runtime as interactive work.
+
+**Scheduled job**:
+A durable, principal-owned unit of scheduler work. Its state and retry history
+are stored in SQLite.
+
+**Tool approval mode**:
+The configured OMP policy that governs prompts before OMP uses a tool. It does
+not decide actions that require a genuine user decision.
+
+**OMP slash command**:
+An explicit OMP instruction that is expanded in the OMP session. It is distinct
+from a gateway control action handled before OMP receives a turn.
