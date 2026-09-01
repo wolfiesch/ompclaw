@@ -8,11 +8,7 @@ import { GatewayStore } from "./gateway-store";
 import type { InboundMessage } from "./gateway-types";
 import type { RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import { TelegramTransportAdapter } from "./transports/telegram/adapter";
-import {
-  FakeTelegramApi,
-  TELEGRAM_TEST_OWNER,
-  telegramTestMessage,
-} from "./transports/telegram/test-harness";
+import { FakeTelegramApi, TELEGRAM_TEST_OWNER, telegramTestMessage } from "./transports/telegram/test-harness";
 
 const scratch: string[] = [];
 const telegramIdentity = { transport: "telegram", account: "primary", subject: "42" } as const;
@@ -22,7 +18,10 @@ afterEach(async () => {
 });
 
 class ScenarioStore extends GatewayStore {
-  constructor(path: string, readonly completedInbound: () => void) {
+  constructor(
+    path: string,
+    readonly completedInbound: () => void,
+  ) {
     super(path);
   }
 
@@ -66,6 +65,7 @@ async function scenario(authorized = true): Promise<GatewayTelegramScenario> {
     config,
     secrets: { telegramToken: "test-token", webSocketCredentials: [] },
     seams: {
+      ingressComposer: { debounceMs: 1, mediaDebounceMs: 1, maxWaitMs: 1 },
       createStore: (path) => {
         store = new ScenarioStore(path, inboundCompleted.resolve);
         if (authorized) {
@@ -87,16 +87,12 @@ async function scenario(authorized = true): Promise<GatewayTelegramScenario> {
             sessionFile: "/sessions/telegram-harness.jsonl",
           });
         },
-        async stop() { },
+        async stop() {},
         canHandleInboundImmediately: () => true,
         async handleInbound(message) {
           handled.push(message);
           const context = { principal: message.principal, origin: message.address };
-          const receipt = await options.delivery.send(
-            message.address,
-            { text: "Working", format: "text" },
-            context,
-          );
+          const receipt = await options.delivery.send(message.address, { text: "Working", format: "text" }, context);
           await options.delivery.update(
             message.address,
             receipt,
@@ -106,9 +102,9 @@ async function scenario(authorized = true): Promise<GatewayTelegramScenario> {
         },
       }),
       acquireLock: () => ({ ok: true }),
-      releaseLock: () => { },
-      startLockHeartbeat: () => () => { },
-      now: () => 1_800_000_000_000,
+      releaseLock: () => {},
+      startLockHeartbeat: () => () => {},
+      now: Date.now,
     },
   });
   await app.start();
@@ -122,12 +118,14 @@ describe("Gateway Telegram scenario harness", () => {
     await harness.adapter.handleUpdate({ update_id: 50, message: telegramTestMessage({ text: "ship it" }) });
     await harness.handledTurn;
 
-    expect(harness.handled).toEqual([expect.objectContaining({
-      id: "telegram:primary:42:10",
-      identity: telegramIdentity,
-      principal: TELEGRAM_TEST_OWNER,
-      content: { text: "ship it" },
-    })]);
+    expect(harness.handled).toEqual([
+      expect.objectContaining({
+        id: "telegram:primary:42:10",
+        identity: telegramIdentity,
+        principal: TELEGRAM_TEST_OWNER,
+        content: { text: "ship it" },
+      }),
+    ]);
     expect(harness.api.calls.filter(({ method }) => method === "sendMessage" || method === "editMessageText")).toEqual([
       {
         method: "sendMessage",
@@ -140,8 +138,9 @@ describe("Gateway Telegram scenario harness", () => {
     ]);
     expect(harness.store.getCheckpoint("telegram", "update_id:primary")).toBe(50);
     expect(harness.store.listPendingInboundMessages()).toEqual([]);
-    expect(harness.store.getConversationBinding(harness.handled[0]!.address)?.ompSessionPath)
-      .toBe("/sessions/telegram-harness.jsonl");
+    expect(harness.store.getConversationBinding(harness.handled[0]!.address)?.ompSessionPath).toBe(
+      "/sessions/telegram-harness.jsonl",
+    );
     await harness.app.stop();
   });
 

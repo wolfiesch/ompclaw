@@ -899,6 +899,7 @@ export class RpcGatewayRuntime {
             ...(attachment.name ? { name: attachment.name } : {}),
             ...(attachment.mediaType ? { mediaType: attachment.mediaType } : {}),
           })),
+          ...(message.replyContext === undefined ? {} : { replyContext: message.replyContext }),
         },
       },
       null,

@@ -95,7 +95,25 @@ export class InboundSourceReceiptTransportMismatchError extends Error {
   }
 }
 
+export class InvalidInboundReplyContextError extends Error {
+  readonly name = "InvalidInboundReplyContextError";
 
+  constructor(readonly replyContext: unknown) {
+    super(
+      "Inbound envelope replyContext must contain a non-empty messageId and optional string author/text and boolean isBot",
+    );
+  }
+}
+
+export class InvalidInboundCompositionError extends Error {
+  readonly name = "InvalidInboundCompositionError";
+
+  constructor(readonly composition: unknown) {
+    super(
+      "Inbound envelope composition must contain a text or media kind, optional non-empty groupId, and safe nonnegative order",
+    );
+  }
+}
 
 export class InboundTransportMismatchError extends Error {
   readonly name = "InboundTransportMismatchError";
@@ -134,7 +152,6 @@ export class CrossOriginDeliveryError extends Error {
   }
 }
 
-
 export class OutboundContentTooLongError extends Error {
   readonly name = "OutboundContentTooLongError";
 
@@ -161,12 +178,40 @@ export class UnsupportedUiRequestError extends Error {
 export class GatewayLifecycleError extends Error {
   readonly name = "GatewayLifecycleError";
 
-  constructor(readonly operation: "register" | "start" | "stop", readonly state: GatewayState) {
+  constructor(
+    readonly operation: "register" | "start" | "stop",
+    readonly state: GatewayState,
+  ) {
     super(`Cannot ${operation} gateway while it is ${state}`);
   }
 }
 
 type GatewayState = "idle" | "starting" | "started" | "stopping";
+
+function isInboundReplyContext(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const replyContext = value as Record<string, unknown>;
+  return (
+    typeof replyContext.messageId === "string" &&
+    replyContext.messageId.length > 0 &&
+    (replyContext.author === undefined || typeof replyContext.author === "string") &&
+    (replyContext.text === undefined || typeof replyContext.text === "string") &&
+    (replyContext.isBot === undefined || typeof replyContext.isBot === "boolean")
+  );
+}
+
+function isInboundComposition(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const composition = value as Record<string, unknown>;
+  return (
+    (composition.kind === "text" || composition.kind === "media") &&
+    (composition.groupId === undefined ||
+      (typeof composition.groupId === "string" && composition.groupId.length > 0)) &&
+    typeof composition.order === "number" &&
+    Number.isSafeInteger(composition.order) &&
+    composition.order >= 0
+  );
+}
 
 /**
  * In-process transport coordinator. Addresses contain the exact registered
@@ -244,11 +289,7 @@ export class GatewayCore {
     return adapter.send(address, content, context, signal);
   }
 
-  async typing(
-    address: ConversationAddress,
-    context: DeliveryContext,
-    signal?: AbortSignal,
-  ): Promise<void> {
+  async typing(address: ConversationAddress, context: DeliveryContext, signal?: AbortSignal): Promise<void> {
     this.#assertDeliveryOrigin(context, address);
     const adapter = this.#adapterFor(address);
     this.#assertAddressSupported(adapter, address);
@@ -284,7 +325,6 @@ export class GatewayCore {
     this.#assertContentSupported(adapter, address, content);
     return adapter.finalize(address, receipt, content, context, signal);
   }
-
 
   async react(
     address: ConversationAddress,
@@ -333,7 +373,8 @@ export class GatewayCore {
     const principal = await this.#identityResolver(envelope.identity, signal);
     if (principal === undefined) throw new UnknownTransportIdentityError(envelope.identity);
 
-    const { id, sentAt, identity, address, content, replyTo, edited } = envelope;
+    const { id, sentAt, identity, address, content, replyTo, replyContext, composition, sourceReceipt, edited } =
+      envelope;
     await this.#onInbound(
       {
         id,
@@ -342,6 +383,9 @@ export class GatewayCore {
         address,
         content,
         ...(replyTo === undefined ? {} : { replyTo }),
+        ...(replyContext === undefined ? {} : { replyContext }),
+        ...(composition === undefined ? {} : { composition }),
+        ...(sourceReceipt === undefined ? {} : { sourceReceipt }),
         ...(edited === undefined ? {} : { edited }),
         principal,
       },
@@ -358,11 +402,7 @@ export class GatewayCore {
     if (typeof envelope.id !== "string" || envelope.id.length === 0) {
       throw new InvalidInboundEnvelopeIdError(envelope.id);
     }
-    if (
-      typeof envelope.sentAt !== "number" ||
-      !Number.isSafeInteger(envelope.sentAt) ||
-      envelope.sentAt < 0
-    ) {
+    if (typeof envelope.sentAt !== "number" || !Number.isSafeInteger(envelope.sentAt) || envelope.sentAt < 0) {
       throw new InvalidInboundEnvelopeSentAtError(envelope.sentAt);
     }
     if (
@@ -375,7 +415,16 @@ export class GatewayCore {
       throw new InboundReplyReceiptTransportMismatchError(envelope.address.transport, envelope.replyTo.transport);
     }
     if (envelope.sourceReceipt !== undefined && envelope.sourceReceipt.transport !== envelope.address.transport) {
-      throw new InboundSourceReceiptTransportMismatchError(envelope.address.transport, envelope.sourceReceipt.transport);
+      throw new InboundSourceReceiptTransportMismatchError(
+        envelope.address.transport,
+        envelope.sourceReceipt.transport,
+      );
+    }
+    if (envelope.replyContext !== undefined && !isInboundReplyContext(envelope.replyContext)) {
+      throw new InvalidInboundReplyContextError(envelope.replyContext);
+    }
+    if (envelope.composition !== undefined && !isInboundComposition(envelope.composition)) {
+      throw new InvalidInboundCompositionError(envelope.composition);
     }
   }
 
@@ -389,7 +438,6 @@ export class GatewayCore {
       throw new CrossOriginDeliveryError(context.origin, address);
     }
   }
-
 
   #assertAddressSupported(adapter: TransportAdapter, address: ConversationAddress): void {
     if (address.thread !== undefined) this.#requireCapability(adapter, "threads");

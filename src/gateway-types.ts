@@ -32,6 +32,23 @@ export interface InboundContent {
 }
 
 /**
+ * Reply data supplied by the transport. It is untrusted message content, not
+ * authenticated metadata about the sender.
+ */
+export interface InboundReplyContext {
+  readonly messageId: string;
+  readonly author?: string;
+  readonly text?: string;
+  readonly isBot?: boolean;
+}
+
+export interface InboundCompositionHint {
+  readonly kind: "text" | "media";
+  readonly groupId?: string;
+  readonly order: number;
+}
+
+/**
  * Transport-provided data. A principal is deliberately absent: it is derived by
  * the gateway from identity before any inbound handler can observe the message.
  */
@@ -42,6 +59,8 @@ export interface InboundEnvelope {
   readonly address: ConversationAddress;
   readonly content: InboundContent;
   readonly replyTo?: OutboundReceipt;
+  readonly replyContext?: InboundReplyContext;
+  readonly composition?: InboundCompositionHint;
   /** Receipt for the inbound message itself, used only for same-origin reactions and replies. */
   readonly sourceReceipt?: OutboundReceipt;
   readonly edited?: boolean;

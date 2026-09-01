@@ -147,6 +147,7 @@ describe("Telegram transport lifecycle", () => {
         putPendingInteraction: () => {},
         deletePendingInteraction: () => {},
         listPendingInboundMessages: () => [],
+        listPendingIngressCompositions: () => [],
       },
       api: { acquireLock: () => ({ ok: false, holder: 912 }) },
     });
@@ -184,6 +185,7 @@ describe("Telegram inbound conversion", () => {
         identity: { transport: "telegram", account: "primary", subject: "42" },
         address: baseAddress,
         content: { text: "hello" },
+        composition: { kind: "text", order: 10 },
         sourceReceipt: { transport: "telegram", messageId: "10" },
         edited: false,
       },
@@ -191,7 +193,7 @@ describe("Telegram inbound conversion", () => {
     expect(checkpoints.get("telegram\0update_id:primary")).toBe(5);
   });
 
-  test("preserves topic, reply, and edited-message metadata", async () => {
+  test("preserves topic, reply, composition, and edited-message metadata", async () => {
     const { adapter, received } = await fixture();
     await adapter.handleUpdate({
       update_id: 6,
@@ -200,13 +202,80 @@ describe("Telegram inbound conversion", () => {
         chat: { id: -100, type: "supergroup" },
         is_topic_message: true,
         message_thread_id: 19,
+        media_group_id: "album-1",
+        edit_date: 1_800_000_100,
         reply_to_message: message({ message_id: 3 }),
       }),
     });
     expect(received[0]).toMatchObject({
       address: { channel: "-100", thread: "19" },
       replyTo: { transport: "telegram", messageId: "3" },
+      composition: { kind: "media", groupId: "album-1", order: 11 },
       edited: true,
+    });
+  });
+  test("sets ordered media composition hints for every album fragment", async () => {
+    const { adapter, received } = await fixture();
+    await adapter.handleUpdate({
+      update_id: 7,
+      message: message({
+        message_id: 12,
+        text: undefined,
+        media_group_id: "album-1",
+        photo: [{ file_id: "photo-2", file_unique_id: "photo-stable-2", width: 1, height: 1 }],
+      }),
+    });
+    await adapter.handleUpdate({
+      update_id: 8,
+      message: message({
+        message_id: 13,
+        text: undefined,
+        media_group_id: "album-1",
+        photo: [{ file_id: "photo-3", file_unique_id: "photo-stable-3", width: 1, height: 1 }],
+      }),
+    });
+    expect(received.map((entry) => entry.composition)).toEqual([
+      { kind: "media", groupId: "album-1", order: 12 },
+      { kind: "media", groupId: "album-1", order: 13 },
+    ]);
+  });
+
+  test("maps quoted reply author, bot status, and truncated text content", async () => {
+    const { adapter, received } = await fixture();
+    await adapter.handleUpdate({
+      update_id: 9,
+      message: message({
+        message_id: 14,
+        reply_to_message: message({
+          message_id: 3,
+          text: "x".repeat(1_001),
+          from: { id: 9, first_name: "Ada", username: "ada", is_bot: false },
+        }),
+      }),
+    });
+    await adapter.handleUpdate({
+      update_id: 10,
+      message: message({
+        message_id: 15,
+        reply_to_message: message({
+          message_id: 4,
+          text: undefined,
+          caption: "Quoted caption",
+          from: { id: 10, username: "replybot", is_bot: true },
+        }),
+      }),
+    });
+    expect(received[0]?.replyContext).toEqual({
+      messageId: "3",
+      author: "Ada",
+      text: "x".repeat(1_000),
+      isBot: false,
+    });
+    expect(received[1]?.replyContext).toEqual({
+      messageId: "4",
+      author: "@replybot",
+      text: "Quoted caption",
+      isBot: true,
     });
   });
 
@@ -249,7 +318,7 @@ describe("Telegram inbound conversion", () => {
   test("retains queued attachments when file URLs contain encoded paths", async () => {
     const queuedName = "queued file.bin";
     const { adapter, stateDir } = await fixture({ pendingAttachmentName: queuedName });
-    const queuedPath = join(stateDir, "inbox", queuedName);
+    const queuedPath = join(stateDir, "inbox", "telegram", "primary", queuedName);
     await writeFile(queuedPath, "queued");
     await utimes(queuedPath, 0, 0);
     await adapter.handleUpdate({
@@ -257,6 +326,22 @@ describe("Telegram inbound conversion", () => {
       message: message({
         text: undefined,
         document: { file_id: "remote", file_unique_id: "new", file_name: "new.bin", file_size: 3 },
+      }),
+    });
+    expect(await readFile(queuedPath, "utf8")).toBe("queued");
+  });
+
+  test("retains staged ingress fragment attachments during inbox cleanup", async () => {
+    const queuedName = "pending album.bin";
+    const { adapter, stateDir } = await fixture({ pendingIngressAttachmentName: queuedName });
+    const queuedPath = join(stateDir, "inbox", "telegram", "primary", queuedName);
+    await writeFile(queuedPath, "queued");
+    await utimes(queuedPath, 0, 0);
+    await adapter.handleUpdate({
+      update_id: 11,
+      message: message({
+        text: undefined,
+        document: { file_id: "remote", file_unique_id: "newer", file_name: "new.bin", file_size: 3 },
       }),
     });
     expect(await readFile(queuedPath, "utf8")).toBe("queued");
@@ -359,10 +444,11 @@ describe("Telegram interactive UI", () => {
         id: "stop-1",
         from: { id: 42 },
         data: callbackData(card, "Stop"),
-        message: message({ message_id: 201 }),
+        message: message({ message_id: 201, media_group_id: "control-album" }),
       },
     });
     expect(received[0]).toMatchObject({ content: { text: "/stop" }, address: baseAddress });
+    expect(received[0]?.composition).toBeUndefined();
   });
 
   test("passes status notification policy to control-card sends and new chunks", async () => {
@@ -479,5 +565,6 @@ describe("Telegram interactive UI", () => {
       identity: { subject: "42" },
       address: baseAddress,
     });
+    expect(received[0]?.composition).toBeUndefined();
   });
 });

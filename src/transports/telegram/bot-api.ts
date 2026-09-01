@@ -87,6 +87,8 @@ export type TgSticker = TgFileBase & Readonly<{ is_animated?: boolean; is_video?
 export type TgMessage = Readonly<{
   message_id: number;
   date: number;
+  edit_date?: number;
+  media_group_id?: string;
   chat: TgChat;
   from?: TgUser;
   sender_chat?: TgChat;
