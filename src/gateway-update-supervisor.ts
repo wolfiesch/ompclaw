@@ -35,7 +35,7 @@ export interface GatewayUpdateSupervisorSeams {
 const POLL_INTERVAL_MS = 250;
 const STOP_TIMEOUT_MS = 15_000;
 const RESTART_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const;
-
+const STABLE_UPTIME_MS = 30_000;
 function processIsRunning(child: ManagedGatewayProcess | undefined): child is ManagedGatewayProcess {
   return child !== undefined && child.exitCode === null && child.signalCode === null;
 }
@@ -47,6 +47,7 @@ export class GatewayUpdateSupervisor {
   #child: ManagedGatewayProcess | undefined;
   #stopping = false;
   #restartAttempt = 0;
+  #childStartedAt = 0;
   readonly #stopRequested = Promise.withResolvers<void>();
   #replacementRequested = false;
 
@@ -93,7 +94,7 @@ export class GatewayUpdateSupervisor {
           }
           continue;
         }
-        this.#restartAttempt = 0;
+        if (Date.now() - this.#childStartedAt >= STABLE_UPTIME_MS) this.#restartAttempt = 0;
         await this.#wait(POLL_INTERVAL_MS);
       }
     } finally {
@@ -104,6 +105,7 @@ export class GatewayUpdateSupervisor {
   }
 
   #spawnRelease(release: GatewayUpdateRelease, requestId?: string): ManagedGatewayProcess {
+    this.#childStartedAt = Date.now();
     if (this.#seams.spawnRelease !== undefined) return this.#seams.spawnRelease(release, requestId);
     const executable = join(release.path, "ompclaw");
     return spawn(executable, ["run", "--config", this.#args.configPath, "--env-file", this.#args.envFile], {
