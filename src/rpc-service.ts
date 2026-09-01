@@ -120,19 +120,17 @@ export async function prepareServiceArguments(
 ): Promise<string[]> {
   if (!config.updates.enabled) return buildServiceArguments(paths);
   const updates = new GatewayUpdateCoordinator({ config: config.updates, stateDir: config.stateDir });
-  return withGatewayUpdateLock(updates.paths.lock, async () => {
-    const pending = readUpdateRequest(updates.paths.request);
-    if (pending !== undefined && pending.status !== "notified") {
-      throw new Error(
-        `Cannot install the OmpClaw service while update ${pending.id} is ${pending.status}; let the active supervisor finish it before retrying`,
-      );
-    }
-    const staged = await updates.stage("HEAD");
-    const supervisorPath = join(updates.paths.root, "ompclaw-supervisor");
-    replaceFileAtomically(join(staged.release.path, "ompclaw-supervisor"), supervisorPath, 0o700);
-    updates.bootstrap(staged.release);
-    return buildManagedServiceArguments(config, paths);
-  });
+  const pending = readUpdateRequest(updates.paths.request);
+  if (pending !== undefined && pending.status !== "notified") {
+    throw new Error(
+      `Cannot install the OmpClaw service while update ${pending.id} is ${pending.status}; let the active supervisor finish it before retrying`,
+    );
+  }
+  const staged = await updates.stage("HEAD");
+  const supervisorPath = join(updates.paths.root, "ompclaw-supervisor");
+  replaceFileAtomically(join(staged.release.path, "ompclaw-supervisor"), supervisorPath, 0o700);
+  updates.bootstrap(staged.release);
+  return buildManagedServiceArguments(config, paths);
 }
 
 export function renderSystemdUnit(
@@ -176,6 +174,16 @@ function runManager(executable: string, args: string[], retries = 0): void {
 }
 
 export async function installRpcService(
+  config: GatewayConfig,
+  configPath: string,
+  envFile: string,
+): Promise<ServiceInstallResult> {
+  if (!config.updates.enabled) return installRpcServiceUnlocked(config, configPath, envFile);
+  const lockPath = gatewayUpdatePaths(config.stateDir).lock;
+  return withGatewayUpdateLock(lockPath, () => installRpcServiceUnlocked(config, configPath, envFile));
+}
+
+async function installRpcServiceUnlocked(
   config: GatewayConfig,
   configPath: string,
   envFile: string,

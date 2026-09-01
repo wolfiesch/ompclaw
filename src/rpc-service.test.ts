@@ -7,6 +7,7 @@ import { gatewayUpdatePaths, withGatewayUpdateLock } from "./gateway-update";
 import {
   buildManagedServiceArguments,
   buildServiceArguments,
+  installRpcService,
   prepareServiceArguments,
   renderSystemdUnit,
   replaceFileAtomically,
@@ -136,7 +137,7 @@ describe("systemd service generation", () => {
     }
   });
 
-  test("serializes service preparation with update activation", async () => {
+  test("serializes the complete service installation with update activation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ompclaw-service-lock-"));
     try {
       const stateDir = join(directory, "state");
@@ -148,13 +149,14 @@ describe("systemd service generation", () => {
       });
 
       await withGatewayUpdateLock(updatePaths.lock, async () => {
-        await expect(prepareServiceArguments(config, {
-          configPath: join(directory, "config.json"),
-          envFile: join(directory, "ompclaw.env"),
-        })).rejects.toThrow("Another OmpClaw update operation is running");
+        await expect(installRpcService(
+          config,
+          join(directory, "config.json"),
+          join(directory, "ompclaw.env"),
+        )).rejects.toThrow("Another OmpClaw update operation is running");
       });
 
-      expect(readdirSync(updatePaths.releases)).toEqual([]);
+      expect(readdirSync(updatePaths.root)).toEqual([]);
     } finally {
       rmSync(directory, { force: true, recursive: true });
     }
