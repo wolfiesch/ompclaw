@@ -8,6 +8,7 @@ import type {
   PendingInboundMessage,
   PendingInteraction,
 } from "../../gateway-store";
+import type { StoredSemanticView } from "../../gateway-views";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -127,6 +128,9 @@ export async function createTelegramAdapterHarness(
   const received: InboundEnvelope[] = [];
   const checkpoints = new Map<string, JsonValue>();
   const pending = new Map<string, PendingInteraction>();
+  const semanticViews = new Map<string, StoredSemanticView>();
+  const semanticKey = (address: ConversationAddress, viewId: string): string =>
+    JSON.stringify([address.transport, address.account, address.channel, address.thread ?? "", viewId]);
   const pendingInbound: PendingInboundMessage[] =
     options.pendingAttachmentName === undefined
       ? []
@@ -202,6 +206,11 @@ export async function createTelegramAdapterHarness(
       deletePendingInteraction: (id) => pending.delete(id),
       listPendingInboundMessages: () => pendingInbound,
       listPendingIngressCompositions: () => pendingIngress,
+      getSemanticView: (address, viewId) => semanticViews.get(semanticKey(address, viewId)),
+      putSemanticView: (record) => {
+        semanticViews.set(semanticKey(record.address, record.view.id), record);
+        return true;
+      },
     },
     logger: {
       debug: () => {},

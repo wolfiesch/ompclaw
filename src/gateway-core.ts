@@ -467,6 +467,9 @@ export class GatewayCore {
       case "editor":
         this.#requireCapability(adapter, "textInput");
         return;
+      case "semantic_view":
+        this.#requireCapability(adapter, "buttons");
+        return;
       case "notify":
       case "status":
       case "widget":

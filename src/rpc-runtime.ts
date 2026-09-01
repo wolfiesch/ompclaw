@@ -12,7 +12,13 @@ import type {
 import { executeGatewayHostTool, gatewayHostToolDefinitions, type GatewayDelivery } from "./gateway-tools";
 import { formatScheduledJob, ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
 import type { GatewayUpdateControl } from "./gateway-update";
-import type { GatewayTurnLifecycleStore, TurnLifecycle, TurnLifecycleState } from "./gateway-store";
+import type {
+  GatewaySemanticViewStore,
+  GatewayTurnLifecycleStore,
+  TurnLifecycle,
+  TurnLifecycleState,
+} from "./gateway-store";
+import type { SemanticView } from "./gateway-views";
 import {
   OmpRpcClient,
   RpcCommandError,
@@ -42,6 +48,7 @@ import {
   isRpcResponse,
 } from "./rpc-protocol";
 import { RpcGatewayUiBroker, type RpcGatewayUiTarget } from "./rpc-ui";
+import { homeSemanticView, taskSemanticView } from "./rpc-semantic-views";
 import { isRecord } from "./type-guards";
 
 export interface RpcRuntimeLogger {
@@ -50,13 +57,15 @@ export interface RpcRuntimeLogger {
   error(message: string): void;
 }
 
+type RpcRuntimeStore = GatewayTurnLifecycleStore & Partial<Pick<GatewaySemanticViewStore, "getSemanticView">>;
+
 export interface RpcGatewayRuntimeOptions {
   readonly config: RpcRuntimeConfig;
   readonly delivery: GatewayDelivery;
   readonly sessionFile?: string;
   readonly onSessionState?: (state: RpcSessionState) => void;
   readonly automation?: GatewayAutomationControl;
-  readonly turnStore?: GatewayTurnLifecycleStore;
+  readonly turnStore?: RpcRuntimeStore;
   readonly updates?: GatewayUpdateControl;
   readonly now?: () => number;
   readonly createRpcClient?: (options: OmpRpcClientOptions) => RpcClient;
@@ -114,6 +123,7 @@ const RUNTIME_COMMANDS = [
   ["followup", "Add work after the current response"],
   ["compact", "Compact context with optional focus"],
   ["model", "List or select provider/model"],
+  ["autonomy", "Show configured autonomy policy"],
   ["thinking", "Show or set reasoning level"],
   ["fast", "Show or toggle fast mode"],
   ["queue", "Inspect or tune queue behavior"],
@@ -241,7 +251,10 @@ function commandDescription(command: string): string {
 function runtimeHelp(allowRpcBash: boolean): string {
   const groups: ReadonlyArray<readonly [string, readonly string[]]> = [
     ["Everyday", ["start", "home", "status", "stop", "new", "steer", "followup"]],
-    ["Session", ["model", "thinking", "fast", "compact", "autocompact", "retry", "queue", "name", "history"]],
+    [
+      "Session",
+      ["model", "autonomy", "thinking", "fast", "compact", "autocompact", "retry", "queue", "name", "history"],
+    ],
     ["Work", ["todos", "tasks", "subagents", "jobs", "job_pause", "job_resume", "job_run", "job_delete"]],
     ["Advanced", ["branch", "handoff", "switch", "export", "login", "commands"]],
   ];
@@ -306,17 +319,6 @@ function activityForFrame(frame: RpcRecord): string {
   return activityForTool(typeof frame.toolName === "string" ? frame.toolName : "tool");
 }
 
-function activityTimeline(activities: readonly string[]): string {
-  const limit = 8;
-  const hidden = Math.max(0, activities.length - limit);
-  const recent = activities.slice(-limit);
-  return [
-    "Looking into it",
-    ...(hidden > 0 ? [`• ${hidden} earlier ${hidden === 1 ? "step" : "steps"}`] : []),
-    ...recent.map((activity) => `• ${activity}`),
-  ].join("\n");
-}
-
 function lifecycleLabel(state: TurnLifecycleState): string {
   const labels: Record<TurnLifecycleState, string> = {
     queued: "Queued",
@@ -357,6 +359,7 @@ const TELEGRAM_PRESENTATION_CONTRACT = [
 export class RpcGatewayRuntime {
   readonly #options: RpcGatewayRuntimeOptions;
   readonly #log: RpcRuntimeLogger;
+  readonly #viewVersions = new Map<string, number>();
   readonly #status: RuntimeStatus = { availableCommands: [], subagents: [] };
   readonly #hostTools = new Map<string, HostToolExecution>();
   #rpc: RpcClient | undefined;
@@ -968,6 +971,7 @@ export class RpcGatewayRuntime {
         await this.#refreshState();
         await reply("Compaction complete.");
       } else if (name === "model") await this.#modelCommand(delivery, args, reply);
+      else if (name === "autonomy") await reply(autonomyText(this.#options.config.autonomyMode));
       else if (name === "thinking") await this.#thinkingCommand(delivery, args, reply);
       else if (name === "fast")
         await this.#booleanCommand(delivery, "set_fast_mode", args, this.#status.state?.fastModeEnabled, reply);
@@ -1065,35 +1069,17 @@ export class RpcGatewayRuntime {
 
   async #homeCommand(delivery: GatewayTurnTarget): Promise<void> {
     await this.#refreshState();
-    const state = this.#status.state;
-    const model = `${state?.model?.provider ?? "?"}/${state?.model?.id ?? "?"}`;
-    const response = await this.#options.delivery.presentUi(
-      delivery.address,
-      {
-        type: "select",
-        title: "OmpClaw control center",
-        options: [
-          { value: "status", label: "Status", description: `${state?.isStreaming ? "Running" : "Idle"} · ${model}` },
-          { value: "model", label: "Model", description: model },
-          {
-            value: "autonomy",
-            label: "Autonomy",
-            description: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode],
-          },
-          { value: "thinking", label: "Reasoning", description: state?.thinkingLevel ?? "inherit" },
-          { value: "fast", label: "Fast mode", description: state?.fastModeEnabled ? "on" : "off" },
-          { value: "autocompact", label: "Auto-compaction", description: state?.autoCompactionEnabled ? "on" : "off" },
-          { value: "tasks", label: "Tasks", description: "Recent durable task state" },
-          { value: "jobs", label: "Scheduled jobs", description: "List durable automations" },
-          { value: "new", label: "New session", description: "Start with a clean context" },
-          { value: "stop", label: "Stop", description: "Abort the active run" },
-        ],
-      },
-      delivery.deliveryContext,
+    const now = this.#now();
+    await this.#presentSemanticView(
+      delivery,
+      homeSemanticView({
+        state: this.#status.state,
+        autonomyMode: this.#options.config.autonomyMode,
+        autonomyLabel: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode],
+        version: now,
+        updatedAt: now,
+      }),
     );
-    const command = response.selected[0];
-    if (command === "autonomy") await this.#send(delivery, autonomyText(this.#options.config.autonomyMode));
-    else if (command !== undefined) await this.#handleCommand(delivery, command, "");
   }
 
   async #modelCommand(
@@ -1544,26 +1530,8 @@ export class RpcGatewayRuntime {
   }
 
   async #renderTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle): Promise<void> {
-    const text =
-      lifecycle.state === "completed"
-        ? undefined
-        : lifecycle.state === "running"
-          ? activityTimeline(active.activities)
-          : [
-              lifecycleLabel(lifecycle.state),
-              ...active.activities.slice(-8).map((activity) => `• ${activity}`),
-              lifecycle.error ? "Use /status for details." : "",
-            ]
-              .filter(Boolean)
-              .join("\n");
-    if (text === active.statusText) return;
     try {
-      await this.#options.delivery.presentUi(
-        active.address,
-        { type: "status", key: "Task", text, notification: "silent" },
-        active.deliveryContext,
-      );
-      active.statusText = text;
+      await this.#presentSemanticView(active, taskSemanticView(lifecycle, active.activities, lifecycle.updatedAt));
       active.statusVisible = true;
       active.statusUpdatedAt = this.#now();
     } catch (error) {
@@ -1571,6 +1539,25 @@ export class RpcGatewayRuntime {
         `[ompclaw rpc] Unable to render task lifecycle: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  async #presentSemanticView(delivery: GatewayTurnTarget, view: SemanticView): Promise<void> {
+    const key = JSON.stringify([
+      delivery.address.transport,
+      delivery.address.account,
+      delivery.address.channel,
+      delivery.address.thread ?? "",
+      view.id,
+    ]);
+    const storedVersion = this.#options.turnStore?.getSemanticView?.(delivery.address, view.id)?.view.version;
+    const localVersion = this.#viewVersions.get(key);
+    const version = Math.max(view.version, (storedVersion ?? -1) + 1, (localVersion ?? -1) + 1);
+    this.#viewVersions.set(key, version);
+    await this.#options.delivery.presentUi(
+      delivery.address,
+      { type: "semantic_view", view: { ...view, version } },
+      delivery.deliveryContext,
+    );
   }
 
   #tasksText(address: ConversationAddress): string {

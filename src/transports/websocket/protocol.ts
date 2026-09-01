@@ -79,7 +79,10 @@ export type ServerFrame =
 export class InvalidWebSocketFrameError extends Error {
   readonly name = "InvalidWebSocketFrameError";
 
-  constructor(readonly code: "invalid_frame" | "payload_too_large", message: string) {
+  constructor(
+    readonly code: "invalid_frame" | "payload_too_large",
+    message: string,
+  ) {
     super(message);
   }
 }
@@ -138,7 +141,8 @@ function parseMessageFrame(value: Record<string, unknown>, maxMessageLength: num
   assertExactKeys(value, ["type", "id", "text", "attachments"]);
   const id = boundedString(value.id, "id", Math.min(maxMessageLength, MAX_CLIENT_MESSAGE_ID_LENGTH), false);
   const text = value.text === undefined ? undefined : boundedString(value.text, "text", maxMessageLength, true);
-  const attachments = value.attachments === undefined ? undefined : parseAttachments(value.attachments, maxMessageLength);
+  const attachments =
+    value.attachments === undefined ? undefined : parseAttachments(value.attachments, maxMessageLength);
   if (text === undefined && attachments === undefined) {
     throw new InvalidWebSocketFrameError("invalid_frame", "message requires text or attachments");
   }
@@ -171,7 +175,12 @@ function parseAttachments(value: unknown, maxMessageLength: number): readonly Me
     const name =
       attachment.name === undefined
         ? undefined
-        : boundedString(attachment.name, "attachment.name", Math.min(maxMessageLength, MAX_ATTACHMENT_NAME_LENGTH), true);
+        : boundedString(
+            attachment.name,
+            "attachment.name",
+            Math.min(maxMessageLength, MAX_ATTACHMENT_NAME_LENGTH),
+            true,
+          );
     const mediaType =
       attachment.mediaType === undefined
         ? undefined
@@ -197,7 +206,9 @@ function parseUiResponse(value: unknown, maxMessageLength: number): UiResponse {
       }
       return {
         type: "select",
-        selected: value.selected.map((selected) => boundedString(selected, "response.selected", maxMessageLength, true)),
+        selected: value.selected.map((selected) =>
+          boundedString(selected, "response.selected", maxMessageLength, true),
+        ),
       };
     }
     case "input":
@@ -209,6 +220,7 @@ function parseUiResponse(value: unknown, maxMessageLength: number): UiResponse {
     case "widget":
     case "title":
     case "editor_text":
+    case "semantic_view":
       assertExactKeys(value, ["type", "acknowledged"]);
       if (value.acknowledged !== true) invalid("response.acknowledged must be true");
       return { type: value.type, acknowledged: true };
@@ -237,7 +249,10 @@ function parseTextResponse(
 
 function boundedString(value: unknown, field: string, maxLength: number, allowEmpty: boolean): string {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
-    throw new InvalidWebSocketFrameError("invalid_frame", `${field} must be a ${allowEmpty ? "string" : "non-empty string"}`);
+    throw new InvalidWebSocketFrameError(
+      "invalid_frame",
+      `${field} must be a ${allowEmpty ? "string" : "non-empty string"}`,
+    );
   }
   if (value.length > maxLength) {
     throw new InvalidWebSocketFrameError("payload_too_large", `${field} exceeds the configured payload limit`);

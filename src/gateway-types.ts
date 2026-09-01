@@ -1,3 +1,5 @@
+import type { SemanticView } from "./gateway-views";
+
 export interface TransportIdentity {
   readonly transport: string;
   readonly account: string;
@@ -184,6 +186,11 @@ export interface EditorTextUiRequest {
   readonly text: string;
 }
 
+export interface SemanticViewUiRequest {
+  readonly type: "semantic_view";
+  readonly view: SemanticView;
+}
+
 export type UiRequest =
   | ConfirmUiRequest
   | SelectUiRequest
@@ -194,7 +201,8 @@ export type UiRequest =
   | StatusUiRequest
   | WidgetUiRequest
   | TitleUiRequest
-  | EditorTextUiRequest;
+  | EditorTextUiRequest
+  | SemanticViewUiRequest;
 
 export interface ConfirmUiResponse {
   readonly type: "confirm";
@@ -243,6 +251,11 @@ export interface EditorTextUiResponse {
   readonly acknowledged: true;
 }
 
+export interface SemanticViewUiResponse {
+  readonly type: "semantic_view";
+  readonly acknowledged: true;
+}
+
 export type UiResponse =
   | ConfirmUiResponse
   | SelectUiResponse
@@ -253,7 +266,8 @@ export type UiResponse =
   | StatusUiResponse
   | WidgetUiResponse
   | TitleUiResponse
-  | EditorTextUiResponse;
+  | EditorTextUiResponse
+  | SemanticViewUiResponse;
 
 export type UiResponseFor<Request extends UiRequest> = Extract<UiResponse, { readonly type: Request["type"] }>;
 

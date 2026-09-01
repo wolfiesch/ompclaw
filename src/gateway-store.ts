@@ -2,7 +2,15 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { ConversationAddress, InboundMessage, Principal, TransportIdentity } from "./gateway-types";
+import {
+  isSemanticViewIdentifier,
+  normalizeStoredSemanticView,
+  type GatewaySemanticViewStore,
+  type StoredSemanticView,
+} from "./gateway-views";
 import { isRecord } from "./type-guards";
+
+export type { GatewaySemanticViewStore } from "./gateway-views";
 
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
@@ -430,7 +438,13 @@ function decodePrincipal(row: SqlRow): Principal {
 function decodeStoredPairingRequest(row: SqlRow): StoredPairingRequest {
  const context = "pairing request";
  const state = storedString(row, "state", context);
- if (state !== "pending" && state !== "approved" && state !== "rejected" && state !== "expired" && state !== "exhausted") {
+  if (
+    state !== "pending" &&
+    state !== "approved" &&
+    state !== "rejected" &&
+    state !== "expired" &&
+    state !== "exhausted"
+  ) {
   throw new Error("corrupt stored pairing request: state is invalid");
  }
 
@@ -628,6 +642,73 @@ function decodeTurnLifecycle(row: SqlRow): TurnLifecycle {
   };
 }
 
+function encodeSemanticViewJson(value: unknown, context: string): string {
+  const encoded = JSON.stringify(value);
+  if (typeof encoded !== "string") throw new Error(`${context} must be JSON-serializable`);
+  return encoded;
+}
+
+function decodeStoredSemanticView(row: SqlRow): StoredSemanticView {
+  const context = "semantic view";
+  const thread = storedString(row, "thread", context);
+  const viewId = storedString(row, "view_id", context);
+  const view = decodeJson(row.view_json, `${context} definition`);
+  const receipts = decodeJson(row.receipts_json, `${context} receipts`);
+
+  let record: StoredSemanticView;
+  try {
+    record = normalizeStoredSemanticView({
+      principalId: storedString(row, "principal_id", context),
+      address: {
+        transport: storedString(row, "transport", context),
+        account: storedString(row, "account", context),
+        channel: storedString(row, "channel", context),
+        ...(thread === "" ? {} : { thread }),
+      },
+      view,
+      contentHash: storedString(row, "content_hash", context),
+      receipts,
+      createdAt: storedTimestamp(row, "created_at", context),
+      updatedAt: storedTimestamp(row, "updated_at", context),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`corrupt stored semantic view: ${message}`);
+  }
+
+  if (record.view.id !== viewId) throw new Error("corrupt stored semantic view: view id does not match storage key");
+  return record;
+}
+
+function sameStoredSemanticView(left: StoredSemanticView, right: StoredSemanticView): boolean {
+  return (
+    left.principalId === right.principalId &&
+    left.address.transport === right.address.transport &&
+    left.address.account === right.address.account &&
+    left.address.channel === right.address.channel &&
+    left.address.thread === right.address.thread &&
+    left.contentHash === right.contentHash &&
+    left.createdAt === right.createdAt &&
+    left.updatedAt === right.updatedAt &&
+    JSON.stringify(left.view) === JSON.stringify(right.view) &&
+    JSON.stringify(left.receipts) === JSON.stringify(right.receipts)
+  );
+}
+
+const SEMANTIC_VIEW_FIELDS = [
+  "transport",
+  "account",
+  "channel",
+  "thread",
+  "view_id",
+  "principal_id",
+  "view_json",
+  "content_hash",
+  "receipts_json",
+  "created_at",
+  "updated_at",
+].join(", ");
+
 function validateTurnLifecycle(turn: TurnLifecycle): void {
   requiredText(turn.id, "turn lifecycle id");
   requiredText(turn.principalId, "turn lifecycle principal");
@@ -799,7 +880,7 @@ function legacyUpdateId(rpcState: Record<string, unknown>): number | undefined {
  * Durable, transport-neutral gateway state. Principal resolution deliberately
  * accepts only a transport identity; callers cannot supply their own Principal.
  */
-export class GatewayStore {
+export class GatewayStore implements GatewaySemanticViewStore {
   readonly #database: Database;
 
   constructor(path: string) {
@@ -978,6 +1059,24 @@ export class GatewayStore {
       CREATE INDEX IF NOT EXISTS turn_lifecycles_address_created
         ON turn_lifecycles (transport, account, channel, thread, created_at DESC);
 
+      CREATE TABLE IF NOT EXISTS semantic_views (
+        transport TEXT NOT NULL,
+        account TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        view_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+        view_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        receipts_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (transport, account, channel, thread, view_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS semantic_views_address_updated
+        ON semantic_views (transport, account, channel, thread, updated_at, view_id);
+
       CREATE TABLE IF NOT EXISTS migration_markers (
         marker TEXT PRIMARY KEY NOT NULL,
         completed_at INTEGER NOT NULL
@@ -1096,18 +1195,22 @@ export class GatewayStore {
 
  listPairingRequests(): StoredPairingRequest[] {
   const rows = this.#database
-   .query(`SELECT ${PAIRING_REQUEST_FIELDS} FROM pairing_requests ORDER BY created_at ASC, transport ASC, account ASC, subject ASC`)
+      .query(
+        `SELECT ${PAIRING_REQUEST_FIELDS} FROM pairing_requests ORDER BY created_at ASC, transport ASC, account ASC, subject ASC`,
+      )
    .all() as SqlRow[];
   return rows.map(decodeStoredPairingRequest);
  }
 
  expirePairingRequests(now: number): number {
-  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing expiry timestamp must be a safe nonnegative integer");
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new Error("pairing expiry timestamp must be a safe nonnegative integer");
   return this.#expirePairingRequests(now);
  }
 
  recordPairingFailures(identities: readonly TransportIdentity[], now: number): number {
-  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing failure timestamp must be a safe nonnegative integer");
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new Error("pairing failure timestamp must be a safe nonnegative integer");
   const uniqueIdentities: TransportIdentity[] = [];
   for (const identity of identities) {
    validateIdentity(identity);
@@ -1145,11 +1248,13 @@ export class GatewayStore {
  approvePairingRequest(identity: TransportIdentity, principalId: string, now: number): PairingResolution {
   validateIdentity(identity);
   requiredText(principalId, "pairing principal id");
-  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing approval timestamp must be a safe nonnegative integer");
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new Error("pairing approval timestamp must be a safe nonnegative integer");
 
   return this.#transaction(() => {
    const request = this.#readPairingRequest(identity);
-   if (request === undefined || request.state !== "pending") return { status: "unavailable", ...(request === undefined ? {} : { request }) };
+      if (request === undefined || request.state !== "pending")
+        return { status: "unavailable", ...(request === undefined ? {} : { request }) };
    if (request.expiresAt <= now) {
     this.#database
      .query(
@@ -1185,7 +1290,9 @@ export class GatewayStore {
     return { status: "identity-conflict", request };
    }
 
-   const principal = this.#database.query("SELECT id, roles_json FROM principals WHERE id = ?").get(principalId) as SqlRow | null;
+      const principal = this.#database
+        .query("SELECT id, roles_json FROM principals WHERE id = ?")
+        .get(principalId) as SqlRow | null;
    const existingRoles = principal === null ? [] : decodePrincipal(principal).roles;
    const roles = existingRoles.includes("operator") ? existingRoles : [...existingRoles, "operator"];
    this.upsertPrincipal({ id: principalId, roles });
@@ -1207,11 +1314,13 @@ export class GatewayStore {
 
  rejectPairingRequest(identity: TransportIdentity, now: number): PairingResolution {
   validateIdentity(identity);
-  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing rejection timestamp must be a safe nonnegative integer");
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new Error("pairing rejection timestamp must be a safe nonnegative integer");
 
   return this.#transaction(() => {
    const request = this.#readPairingRequest(identity);
-   if (request === undefined || request.state !== "pending") return { status: "unavailable", ...(request === undefined ? {} : { request }) };
+      if (request === undefined || request.state !== "pending")
+        return { status: "unavailable", ...(request === undefined ? {} : { request }) };
    if (request.expiresAt <= now) {
     this.#database
      .query(
@@ -1241,7 +1350,8 @@ export class GatewayStore {
  }
 
  clearPairingRequests(now: number): number {
-  if (!Number.isSafeInteger(now) || now < 0) throw new Error("pairing clear timestamp must be a safe nonnegative integer");
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new Error("pairing clear timestamp must be a safe nonnegative integer");
   return this.#transaction(() => {
    this.#expirePairingRequests(now);
    return this.#database.query("DELETE FROM pairing_requests").run().changes;
@@ -1715,6 +1825,109 @@ export class GatewayStore {
     return rows.map(decodeTurnLifecycle);
   }
 
+  getSemanticView(address: ConversationAddress, viewId: string): StoredSemanticView | undefined {
+    validateAddress(address);
+    if (!isSemanticViewIdentifier(viewId)) throw new Error("semantic view id must be a bounded opaque identifier");
+    return this.#readSemanticView(address, viewId);
+  }
+
+  putSemanticView(record: StoredSemanticView): boolean {
+    const candidate = normalizeStoredSemanticView(record);
+    return this.#transaction(() => {
+      const principal = this.#database.query("SELECT 1 FROM principals WHERE id = ?").get(candidate.principalId);
+      if (principal === null) throw new Error("semantic view principal does not exist");
+
+      const current = this.#readSemanticView(candidate.address, candidate.view.id);
+      if (current === undefined) {
+        this.#database
+          .query(
+            `INSERT INTO semantic_views (
+              transport, account, channel, thread, view_id, principal_id,
+              view_json, content_hash, receipts_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            candidate.address.transport,
+            candidate.address.account,
+            candidate.address.channel,
+            candidate.address.thread ?? "",
+            candidate.view.id,
+            candidate.principalId,
+            encodeSemanticViewJson(candidate.view, "semantic view definition"),
+            candidate.contentHash,
+            encodeSemanticViewJson(candidate.receipts, "semantic view receipts"),
+            candidate.createdAt,
+            candidate.updatedAt,
+          );
+        return true;
+      }
+
+      if (current.principalId !== candidate.principalId) {
+        throw new Error("semantic view is already owned by a different principal");
+      }
+      if (current.createdAt !== candidate.createdAt) {
+        throw new Error("semantic view creation timestamp cannot change");
+      }
+      if (candidate.view.version < current.view.version) return false;
+      if (candidate.view.version === current.view.version && candidate.contentHash !== current.contentHash) {
+        throw new Error("semantic view has conflicting content at the same version");
+      }
+      if (sameStoredSemanticView(current, candidate)) return false;
+
+      this.#database
+        .query(
+          `UPDATE semantic_views
+           SET view_json = ?, content_hash = ?, receipts_json = ?, updated_at = ?
+           WHERE transport = ? AND account = ? AND channel = ? AND thread = ? AND view_id = ?`,
+        )
+        .run(
+          encodeSemanticViewJson(candidate.view, "semantic view definition"),
+          candidate.contentHash,
+          encodeSemanticViewJson(candidate.receipts, "semantic view receipts"),
+          candidate.updatedAt,
+          candidate.address.transport,
+          candidate.address.account,
+          candidate.address.channel,
+          candidate.address.thread ?? "",
+          candidate.view.id,
+        );
+      return true;
+    });
+  }
+
+  deleteSemanticView(address: ConversationAddress, viewId: string): boolean {
+    validateAddress(address);
+    if (!isSemanticViewIdentifier(viewId)) throw new Error("semantic view id must be a bounded opaque identifier");
+    return (
+      this.#database
+        .query(
+          `DELETE FROM semantic_views
+           WHERE transport = ? AND account = ? AND channel = ? AND thread = ? AND view_id = ?`,
+        )
+        .run(address.transport, address.account, address.channel, address.thread ?? "", viewId).changes > 0
+    );
+  }
+
+  listSemanticViews(address?: ConversationAddress): StoredSemanticView[] {
+    if (address === undefined) {
+      const rows = this.#database
+        .query(`SELECT ${SEMANTIC_VIEW_FIELDS} FROM semantic_views ORDER BY created_at ASC, view_id ASC`)
+        .all() as SqlRow[];
+      return rows.map(decodeStoredSemanticView);
+    }
+
+    validateAddress(address);
+    const rows = this.#database
+      .query(
+        `SELECT ${SEMANTIC_VIEW_FIELDS}
+         FROM semantic_views
+         WHERE transport = ? AND account = ? AND channel = ? AND thread = ?
+         ORDER BY created_at ASC, view_id ASC`,
+      )
+      .all(address.transport, address.account, address.channel, address.thread ?? "") as SqlRow[];
+    return rows.map(decodeStoredSemanticView);
+  }
+
   putPendingInteraction(interaction: PendingInteraction): void {
     requiredText(interaction.id, "pending interaction id");
     validateAddress(interaction.address);
@@ -2037,7 +2250,6 @@ export class GatewayStore {
     });
   }
 
-
  #readPairingRequest(identity: TransportIdentity): StoredPairingRequest | undefined {
   const row = this.#database
    .query(
@@ -2058,6 +2270,17 @@ export class GatewayStore {
    )
    .run(now, now).changes;
  }
+
+  #readSemanticView(address: ConversationAddress, viewId: string): StoredSemanticView | undefined {
+    const row = this.#database
+      .query(
+        `SELECT ${SEMANTIC_VIEW_FIELDS}
+         FROM semantic_views
+         WHERE transport = ? AND account = ? AND channel = ? AND thread = ? AND view_id = ?`,
+      )
+      .get(address.transport, address.account, address.channel, address.thread ?? "", viewId) as SqlRow | null;
+    return row === null ? undefined : decodeStoredSemanticView(row);
+  }
 
   #readIngressComposition(id: string): IngressCompositionRecord {
     const row = this.#database
