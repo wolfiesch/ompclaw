@@ -482,8 +482,10 @@ describe("RpcGatewayRuntime", () => {
     failedDelivery.finalize = async () => {
       throw new Error("final delivery failed");
     };
-    const failed = createRuntime({ config, delivery: failedDelivery, updates },
-    { info: () => {}, warn: () => {}, error: () => {} },);
+    const failed = createRuntime(
+      { config, delivery: failedDelivery, updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
     await failed.start();
     await failed.handleInbound(message("update-failure", "Activate"));
     FakeOmpRpcClient.instances[1]!.emit({
@@ -556,8 +558,10 @@ describe("RpcGatewayRuntime", () => {
         calls.push("discard");
       },
     };
-    const runtime = createRuntime({ config, delivery: delivery(), updates },
-    { info: () => {}, warn: () => {}, error: () => {} },);
+    const runtime = createRuntime(
+      { config, delivery: delivery(), updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
     await runtime.start();
     await runtime.handleInbound(message("update-refresh-failure", "Activate"));
     const rpc = FakeOmpRpcClient.instances[0]!;
@@ -653,8 +657,10 @@ describe("RpcGatewayRuntime", () => {
         calls.push("discard");
       },
     };
-    const runtime = createRuntime({ config, delivery: delivery(), updates },
-    { info: () => {}, warn: () => {}, error: () => {} },);
+    const runtime = createRuntime(
+      { config, delivery: delivery(), updates },
+      { info: () => {}, warn: () => {}, error: () => {} },
+    );
     await runtime.start();
     await runtime.handleInbound(message("update-rpc-exit", "Activate"));
     FakeOmpRpcClient.instances[0]!.exit(new Error("RPC child exited"));
@@ -973,8 +979,10 @@ describe("RpcGatewayRuntime", () => {
       if (textFromContent(content) === "later event") laterDeliveryStarted.resolve();
       return { transport: address.transport, messageId: `message-${deliveries.length}` };
     };
-    const runtime = createRuntime({ config, delivery: runtimeDelivery },
-    { info: () => {}, warn: () => {}, error: (message) => logErrors.push(message) },);
+    const runtime = createRuntime(
+      { config, delivery: runtimeDelivery },
+      { info: () => {}, warn: () => {}, error: (message) => logErrors.push(message) },
+    );
     await runtime.start();
     await runtime.handleInbound(message("events", "Start"));
     const rpc = FakeOmpRpcClient.instances[0];
