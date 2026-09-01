@@ -9,6 +9,13 @@ export type GatewayIngressTimer = NodeJS.Timeout;
 
 export interface GatewayIngressCompositionStore {
   appendIngressFragment(input: AppendIngressFragmentInput): IngressCompositionRecord;
+  getIngressComposition(id: string): IngressCompositionRecord | undefined;
+  getIngressCompositionByGroupKey(groupKey: string): IngressCompositionRecord | undefined;
+  getIngressCompositionByFragment(
+    fragmentId: string,
+    principalId: string,
+    address: ConversationAddress,
+  ): IngressCompositionRecord | undefined;
   listPendingIngressCompositions(): IngressCompositionRecord[];
   deleteIngressComposition(id: string): boolean;
 }
@@ -103,7 +110,7 @@ export class GatewayIngressComposer {
 
   async #acceptTelegram(message: InboundMessage): Promise<void> {
     const receivedAt = this.#now();
-    const openEditedFragment = message.edited ? this.#findCompositionByFragment(message.id) : undefined;
+    const openEditedFragment = message.edited ? this.#findCompositionByFragment(message) : undefined;
     if (message.edited && openEditedFragment === undefined) return;
     if (!message.edited && isCommand(message)) {
       const flushed = await this.#flushConversation(message.principal.id, message.address);
@@ -120,7 +127,7 @@ export class GatewayIngressComposer {
       if (activeFlush !== undefined) {
         await activeFlush;
         if (message.edited) {
-          current = this.#findCompositionByFragment(message.id);
+          current = this.#findCompositionByFragment(message);
           if (current === undefined) return;
           groupKey = current.groupKey;
         }
@@ -155,7 +162,7 @@ export class GatewayIngressComposer {
       .sort(compareCompositions);
 
     for (const record of due) {
-      if (await this.#flushComposition(record)) delivered += 1;
+      if (await this.#flushComposition(record, now)) delivered += 1;
     }
     this.#scheduleNext();
     return delivered;
@@ -188,11 +195,11 @@ export class GatewayIngressComposer {
     return true;
   }
 
-  #flushComposition(record: IngressCompositionRecord): Promise<boolean> {
+  #flushComposition(record: IngressCompositionRecord, retryBaseAt?: number): Promise<boolean> {
     const active = this.#flushing.get(record.id);
     if (active !== undefined) return active;
 
-    const flush = this.#deliverComposition(record).finally(() => {
+    const flush = this.#deliverComposition(record, retryBaseAt).finally(() => {
       this.#flushing.delete(record.id);
       this.#scheduleNext();
     });
@@ -200,7 +207,7 @@ export class GatewayIngressComposer {
     return flush;
   }
 
-  async #deliverComposition(record: IngressCompositionRecord): Promise<boolean> {
+  async #deliverComposition(record: IngressCompositionRecord, retryBaseAt?: number): Promise<boolean> {
     const current = this.#findComposition(record.id);
     if (current === undefined) return true;
 
@@ -212,24 +219,22 @@ export class GatewayIngressComposer {
     } catch (error) {
       const retryDelayMs =
         current.fragments.at(-1)?.composition?.kind === "media" ? this.#mediaDebounceMs : this.#debounceMs;
-      this.#retryAt.set(current.id, this.#now() + retryDelayMs);
+      this.#retryAt.set(current.id, (retryBaseAt ?? this.#now()) + retryDelayMs);
       this.#logger.warn(`Ingress composition ${current.id} delivery failed: ${errorMessage(error)}`);
       return false;
     }
   }
 
   #findComposition(id: string): IngressCompositionRecord | undefined {
-    return this.#store.listPendingIngressCompositions().find((record) => record.id === id);
+    return this.#store.getIngressComposition(id);
   }
 
   #findCompositionByGroupKey(groupKey: string): IngressCompositionRecord | undefined {
-    return this.#store.listPendingIngressCompositions().find((record) => record.groupKey === groupKey);
+    return this.#store.getIngressCompositionByGroupKey(groupKey);
   }
 
-  #findCompositionByFragment(fragmentId: string): IngressCompositionRecord | undefined {
-    return this.#store
-      .listPendingIngressCompositions()
-      .find((record) => record.fragments.some((fragment) => fragment.id === fragmentId));
+  #findCompositionByFragment(message: InboundMessage): IngressCompositionRecord | undefined {
+    return this.#store.getIngressCompositionByFragment(message.id, message.principal.id, message.address);
   }
 
   #dueAt(record: IngressCompositionRecord): number {

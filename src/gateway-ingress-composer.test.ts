@@ -6,7 +6,7 @@ import {
   type GatewayIngressCompositionStore,
   type GatewayIngressTimer,
 } from "./gateway-ingress-composer";
-import type { InboundMessage, MessageAttachment } from "./gateway-types";
+import type { ConversationAddress, InboundMessage, MessageAttachment } from "./gateway-types";
 
 const principal = { id: "operator-42", roles: ["operator"] } as const;
 const telegramIdentity = { transport: "telegram", account: "default", subject: "42" } as const;
@@ -63,6 +63,32 @@ class MemoryIngressStore implements GatewayIngressCompositionStore {
     composition.updatedAt = input.receivedAt;
     composition.flushAt = Math.min(input.flushAt, composition.deadlineAt);
     return this.#snapshot(composition);
+  }
+  getIngressComposition(id: string): IngressCompositionRecord | undefined {
+    const composition = this.#compositionsById.get(id);
+    return composition === undefined ? undefined : this.#snapshot(composition);
+  }
+
+  getIngressCompositionByGroupKey(groupKey: string): IngressCompositionRecord | undefined {
+    const id = this.#compositionIdByGroup.get(groupKey);
+    return id === undefined ? undefined : this.getIngressComposition(id);
+  }
+
+  getIngressCompositionByFragment(
+    fragmentId: string,
+    principalId: string,
+    address: ConversationAddress,
+  ): IngressCompositionRecord | undefined {
+    const composition = [...this.#compositionsById.values()].find(
+      (candidate) =>
+        candidate.principalId === principalId &&
+        candidate.address.transport === address.transport &&
+        candidate.address.account === address.account &&
+        candidate.address.channel === address.channel &&
+        candidate.address.thread === address.thread &&
+        candidate.fragments.some((fragment) => fragment.message.id === fragmentId),
+    );
+    return composition === undefined ? undefined : this.#snapshot(composition);
   }
 
   listPendingIngressCompositions(): IngressCompositionRecord[] {
@@ -345,14 +371,13 @@ describe("GatewayIngressComposer", () => {
     expect(store.listPendingIngressCompositions()).toEqual([]);
   });
 
-  test("retains a failed delivery and retries it after the debounce interval", async () => {
+  test("uses an explicit flush time as the retry schedule base", async () => {
     const store = new MemoryIngressStore();
     const delivered: InboundMessage[] = [];
-    let now = 0;
     let attempts = 0;
     const ingress = new GatewayIngressComposer({
       store,
-      now: () => now,
+      now: () => 0,
       logger: { warn: () => {}, error: () => {} },
       deliver: async (message) => {
         attempts += 1;
@@ -362,13 +387,10 @@ describe("GatewayIngressComposer", () => {
     });
 
     await ingress.accept(inbound("retry", "Retry", { composition: { kind: "text", order: 1 } }));
-    now = 800;
-    expect(await ingress.flushDue()).toBe(0);
+    expect(await ingress.flushDue(800)).toBe(0);
     expect(store.listPendingIngressCompositions()).toHaveLength(1);
-    now = 1_599;
-    expect(await ingress.flushDue()).toBe(0);
-    now = 1_600;
-    expect(await ingress.flushDue()).toBe(1);
+    expect(await ingress.flushDue(1_599)).toBe(0);
+    expect(await ingress.flushDue(1_600)).toBe(1);
     expect(delivered.map((message) => message.id)).toEqual(["retry"]);
     expect(store.listPendingIngressCompositions()).toEqual([]);
   });

@@ -282,6 +282,9 @@ function validateIngressFragmentInput(input: AppendIngressFragmentInput): void {
   if (input.deadlineAt < input.receivedAt) {
     throw new Error("ingress composition deadline must not precede receipt");
   }
+  if (input.flushAt < input.receivedAt || input.flushAt > input.deadlineAt) {
+    throw new Error("ingress composition flush timestamp must be between receipt and deadline");
+  }
   if (!Number.isSafeInteger(input.sortOrder) || input.sortOrder < 0) {
     throw new Error("ingress fragment sort order must be a nonnegative integer");
   }
@@ -1189,6 +1192,51 @@ export class GatewayStore {
 
       return this.#readIngressComposition(compositionId);
     });
+  }
+  getIngressComposition(id: string): IngressCompositionRecord | undefined {
+    requiredText(id, "ingress composition id");
+    const row = this.#database.query("SELECT id FROM ingress_compositions WHERE id = ?").get(id) as SqlRow | null;
+    return row === null ? undefined : this.#readIngressComposition(id);
+  }
+
+  getIngressCompositionByGroupKey(groupKey: string): IngressCompositionRecord | undefined {
+    requiredText(groupKey, "ingress composition group key");
+    const row = this.#database
+      .query("SELECT id FROM ingress_compositions WHERE group_key = ?")
+      .get(groupKey) as SqlRow | null;
+    return row === null ? undefined : this.#readIngressComposition(storedString(row, "id", "ingress composition"));
+  }
+
+  getIngressCompositionByFragment(
+    fragmentId: string,
+    principalId: string,
+    address: ConversationAddress,
+  ): IngressCompositionRecord | undefined {
+    requiredText(fragmentId, "ingress fragment id");
+    requiredText(principalId, "ingress composition principal id");
+    validateAddress(address);
+    const row = this.#database
+      .query(
+        `SELECT composition.id
+         FROM ingress_compositions AS composition
+         INNER JOIN ingress_fragments AS fragment ON fragment.composition_id = composition.id
+         WHERE fragment.fragment_id = ?
+           AND composition.principal_id = ?
+           AND composition.transport = ?
+           AND composition.account = ?
+           AND composition.channel = ?
+           AND composition.thread = ?
+         LIMIT 1`,
+      )
+      .get(
+        fragmentId,
+        principalId,
+        address.transport,
+        address.account,
+        address.channel,
+        address.thread ?? "",
+      ) as SqlRow | null;
+    return row === null ? undefined : this.#readIngressComposition(storedString(row, "id", "ingress composition"));
   }
 
   listPendingIngressCompositions(): IngressCompositionRecord[] {

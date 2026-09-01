@@ -610,6 +610,17 @@ describe("GatewayStore", () => {
 
     const restarted = new GatewayStore(path);
     expect(restarted.listPendingIngressCompositions()).toEqual([saved]);
+    expect(restarted.getIngressComposition("composition-restart")).toEqual(saved);
+    expect(restarted.getIngressCompositionByGroupKey("telegram:default:operator-42:42:text:reply-7")).toEqual(saved);
+    expect(restarted.getIngressCompositionByFragment(fragment.id, fragment.principal.id, fragment.address)).toEqual(
+      saved,
+    );
+    expect(
+      restarted.getIngressCompositionByFragment(fragment.id, fragment.principal.id, {
+        ...fragment.address,
+        channel: "other",
+      }),
+    ).toBeUndefined();
     restarted.close();
   });
 
@@ -674,11 +685,11 @@ describe("GatewayStore", () => {
     store.close();
   });
 
-  test("preserves the first ingress deadline and clamps every flush to it", () => {
+  test("preserves the first ingress deadline and clamps later flushes to it", () => {
     const store = new GatewayStore(temporaryDatabase());
     const first = appendIngressFragment(store, stagedIngress("fragment-first", { order: 1 }), {
       receivedAt: 100,
-      flushAt: 900,
+      flushAt: 500,
       deadlineAt: 500,
       sortOrder: 1,
     });
@@ -724,6 +735,24 @@ describe("GatewayStore", () => {
         sortOrder: -1,
       }),
     ).toThrow("ingress fragment sort order must be a nonnegative integer");
+    store.close();
+  });
+  test("rejects ingress flush timestamps outside receipt and deadline", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    expect(() =>
+      appendIngressFragment(store, stagedIngress("flush-before-receipt"), {
+        receivedAt: 100,
+        flushAt: 99,
+        deadlineAt: 1_000,
+      }),
+    ).toThrow("ingress composition flush timestamp must be between receipt and deadline");
+    expect(() =>
+      appendIngressFragment(store, stagedIngress("flush-after-deadline"), {
+        receivedAt: 100,
+        flushAt: 1_001,
+        deadlineAt: 1_000,
+      }),
+    ).toThrow("ingress composition flush timestamp must be between receipt and deadline");
     store.close();
   });
 

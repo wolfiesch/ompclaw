@@ -19,7 +19,13 @@ import {
   type JsonValue,
   type ScheduledJob,
 } from "./gateway-store";
-import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
+import type {
+  ConversationAddress,
+  InboundMessage,
+  Principal,
+  TransportAdapter,
+  TransportIdentity,
+} from "./gateway-types";
 import type { RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import { identityBind, migrateTelegram, principalAdd, telegramAllow } from "./rpc-cli";
 
@@ -178,6 +184,32 @@ class MemoryStore implements GatewayApplicationStore {
     composition.updatedAt = input.receivedAt;
     composition.flushAt = Math.min(input.flushAt, composition.deadlineAt);
     return this.#ingressRecord(composition);
+  }
+  getIngressComposition(id: string): IngressCompositionRecord | undefined {
+    const composition = this.ingressCompositions.get(id);
+    return composition === undefined ? undefined : this.#ingressRecord(composition);
+  }
+
+  getIngressCompositionByGroupKey(groupKey: string): IngressCompositionRecord | undefined {
+    const composition = [...this.ingressCompositions.values()].find((candidate) => candidate.groupKey === groupKey);
+    return composition === undefined ? undefined : this.#ingressRecord(composition);
+  }
+
+  getIngressCompositionByFragment(
+    fragmentId: string,
+    principalId: string,
+    address: ConversationAddress,
+  ): IngressCompositionRecord | undefined {
+    const composition = [...this.ingressCompositions.values()].find(
+      (candidate) =>
+        candidate.principalId === principalId &&
+        candidate.address.transport === address.transport &&
+        candidate.address.account === address.account &&
+        candidate.address.channel === address.channel &&
+        candidate.address.thread === address.thread &&
+        candidate.fragments.some((fragment) => fragment.message.id === fragmentId),
+    );
+    return composition === undefined ? undefined : this.#ingressRecord(composition);
   }
 
   listPendingIngressCompositions(): IngressCompositionRecord[] {
