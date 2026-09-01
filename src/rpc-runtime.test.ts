@@ -1122,9 +1122,9 @@ describe("RpcGatewayRuntime", () => {
       string,
       string,
     ]> = [
-        ["inherit", "Inherited", "inherited (no OmpClaw --approval-mode override)"],
-        ["balanced", "Balanced", "write"],
-      ];
+      ["inherit", "Inherited", "inherited (no OmpClaw --approval-mode override)"],
+      ["balanced", "Balanced", "write"],
+    ];
     for (const [autonomyMode, label, approvalMode] of modes) {
       deliveries = [];
       present = async (request) => {
@@ -1140,10 +1140,11 @@ describe("RpcGatewayRuntime", () => {
       };
       const runtime = createRuntime({ config: { ...config, autonomyMode }, delivery: delivery() });
       await runtime.start();
+      const rpc = FakeOmpRpcClient.instances.at(-1)!;
+      const postStartSentCount = rpc.sent.length;
       await runtime.handleInbound(message("commands", "/home"));
 
-      const rpc = FakeOmpRpcClient.instances.at(-1)!;
-      expect(rpc.sent.slice(3)).toEqual([{ type: "get_state" }]);
+      expect(rpc.sent.slice(postStartSentCount)).toEqual([{ type: "get_state" }]);
       expect(rpc.sent.some((command) => command.type.includes("approval"))).toBe(false);
       expect(
         deliveries

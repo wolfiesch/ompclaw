@@ -28,7 +28,13 @@ import {
   type RpcClient,
   type RpcCommandInput,
 } from "./rpc-client";
-import { type AutonomyMode, type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-config";
+import {
+  type AutonomyMode,
+  type RpcRuntimeConfig,
+  buildOmpChildEnv,
+  buildOmpRpcArgv,
+  ompApprovalModeForAutonomy,
+} from "./rpc-config";
 import {
   type RpcExtensionUiRequest,
   type RpcHostToolCall,
@@ -188,17 +194,11 @@ const AUTONOMY_MODE_LABELS: Readonly<Record<AutonomyMode, string>> = {
   review: "Review",
 };
 
-const AUTONOMY_APPROVAL_MODES: Readonly<Record<AutonomyMode, string>> = {
-  inherit: "inherited (no OmpClaw --approval-mode override)",
-  autopilot: "yolo",
-  balanced: "write",
-  review: "always-ask",
-};
-
 function autonomyText(mode: AutonomyMode): string {
+  const approvalMode = ompApprovalModeForAutonomy(mode);
   return [
     `Autonomy: ${AUTONOMY_MODE_LABELS[mode]} (${mode})`,
-    `OMP approval mode: ${AUTONOMY_APPROVAL_MODES[mode]}`,
+    `OMP approval mode: ${approvalMode ?? "inherited (no OmpClaw --approval-mode override)"}`,
     "This affects tool approval prompts, not genuine user decisions.",
     "Changes currently require configuration plus service restart.",
   ].join("\n");

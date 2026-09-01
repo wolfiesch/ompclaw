@@ -2,6 +2,25 @@ import { lstatSync, readFileSync } from "node:fs";
 
 export type AutonomyMode = "inherit" | "autopilot" | "balanced" | "review";
 
+export function ompApprovalModeForAutonomy(
+  mode: AutonomyMode,
+): "yolo" | "write" | "always-ask" | undefined {
+  switch (mode) {
+    case "inherit":
+      return undefined;
+    case "autopilot":
+      return "yolo";
+    case "balanced":
+      return "write";
+    case "review":
+      return "always-ask";
+    default:
+      throw new Error(
+        `Unsupported autonomy mode: ${mode}. Supported values: inherit, autopilot, balanced, review`,
+      );
+  }
+}
+
 export interface RpcRuntimeConfig {
   cwd: string;
   stateDir: string;
@@ -32,23 +51,8 @@ export function buildOmpRpcArgv(config: RpcRuntimeConfig, resume = config.resume
   if (config.model) argv.push("--model", config.model);
   if (config.sessionDir) argv.push("--session-dir", config.sessionDir);
   for (const file of config.configFiles) argv.push("--config", file);
-  switch (config.autonomyMode) {
-    case "inherit":
-      break;
-    case "autopilot":
-      argv.push("--approval-mode", "yolo");
-      break;
-    case "balanced":
-      argv.push("--approval-mode", "write");
-      break;
-    case "review":
-      argv.push("--approval-mode", "always-ask");
-      break;
-    default:
-      throw new Error(
-        `Unsupported autonomy mode: ${config.autonomyMode}. Supported values: inherit, autopilot, balanced, review`,
-      );
-  }
+  const approvalMode = ompApprovalModeForAutonomy(config.autonomyMode);
+  if (approvalMode !== undefined) argv.push("--approval-mode", approvalMode);
   argv.push(...config.ompArgs);
   return argv;
 }
