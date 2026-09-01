@@ -151,10 +151,12 @@ describe("Gateway Telegram scenario harness", () => {
 
     expect(harness.handled).toEqual([]);
     const challenge = harness.api.calls.findLast(({ method }) => method === "sendMessage");
-    const code = /Pairing code: ([A-Z0-9]+)/.exec(String(challenge?.payload.text))[1];
+    const codeMatch = /Pairing code: ([A-Z0-9]+)/.exec(String(challenge?.payload.text));
+    expect(codeMatch).not.toBeNull();
+    const code = codeMatch?.[1];
     expect(code).toHaveLength(8);
 
-    expect(new GatewayPairingService(harness.store).approve(code, undefined, 1_800_000_000_001)).toEqual(
+    expect(new GatewayPairingService(harness.store).approve(code!, undefined, 1_800_000_000_001)).toEqual(
       expect.objectContaining({ state: "approved", identity: telegramIdentity }),
     );
     await harness.api.flushPairingApprovals();

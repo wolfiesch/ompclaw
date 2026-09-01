@@ -163,15 +163,15 @@ describe("Telegram transport lifecycle", () => {
       stateDir,
       store: {
         getCheckpoint: () => undefined,
-        setCheckpoint: () => { },
-        putPendingInteraction: () => { },
-        deletePendingInteraction: () => { },
+        setCheckpoint: () => {},
+        putPendingInteraction: () => {},
+        deletePendingInteraction: () => {},
         listPendingInboundMessages: () => [],
         listPendingIngressCompositions: () => [],
       },
       api: { acquireLock: () => ({ ok: false, holder: 912 }) },
     });
-    await expect(adapter.start({ receive: async () => { }, resolveIdentity: () => owner })).rejects.toThrow(
+    await expect(adapter.start({ receive: async () => {}, resolveIdentity: () => owner })).rejects.toThrow(
       "process 912",
     );
   });

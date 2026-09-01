@@ -243,6 +243,8 @@ describe("GatewayPairingService", () => {
     pairing.approve(first.code, undefined, now + 2);
     pairing.approve(other.code, undefined, now + 3);
 
+    expect(store.listPendingPairingRequests("telegram", "default")).toEqual([]);
+    expect(store.listPendingPairingRequests("telegram", "other")).toEqual([]);
     expect(pairing.listUnconfirmedApprovals("telegram", "default")).toEqual([
       expect.objectContaining({ identity: identity("100"), state: "approved" }),
     ]);
@@ -266,6 +268,14 @@ describe("GatewayPairingService", () => {
     expect(pairing.requestFromTransport(identity("200"), address("200"), now).status).toBe("created");
     expect(pairing.requestFromTransport(identity("300"), address("300"), now).status).toBe("created");
     expect(pairing.requestFromTransport(identity("400"), address("400"), now)).toEqual({ status: "capacity" });
+    expect(store.listPendingPairingRequests("telegram", "default").map((request) => request.identity.subject)).toEqual([
+      "100",
+      "200",
+      "300",
+    ]);
+    expect(store.listPendingPairingRequests("websocket", "default").map((request) => request.identity.subject)).toEqual([
+      "websocket",
+    ]);
 
     const rotated = pairing.requestFromTransport(identity("100"), address("100"), now + 1);
     expect(rotated).toEqual(

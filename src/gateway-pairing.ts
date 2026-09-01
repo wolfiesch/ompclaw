@@ -55,6 +55,7 @@ export type GatewayPairingPersistence = Pick<
   | "upsertPairingRequest"
   | "expirePairingRequests"
   | "listPairingRequests"
+  | "listPendingPairingRequests"
   | "listUnconfirmedPairingApprovals"
   | "completePairingConfirmation"
   | "recordPairingFailures"
@@ -182,6 +183,11 @@ export class GatewayPairingStore {
     return this.#store.listPairingRequests().map(viewOf);
   }
 
+  listPending(transport: string, account: string, now: number): PairingRequestView[] {
+    this.#store.expirePairingRequests(pairingNow(now));
+    return this.#store.listPendingPairingRequests(transport, account).map(viewOf);
+  }
+
   listUnconfirmedApprovals(transport: string, account: string): PairingRequestView[] {
     return this.#store.listUnconfirmedPairingApprovals(transport, account).map(viewOf);
   }
@@ -288,12 +294,7 @@ export class GatewayPairingService {
     address: ConversationAddress,
     now = Date.now(),
   ): RuntimePairingRequestResult {
-    const pending = this.list(now).filter(
-      (request) =>
-        request.state === "pending" &&
-        request.identity.transport === identity.transport &&
-        request.identity.account === identity.account,
-    );
+    const pending = this.#store.listPending(identity.transport, identity.account, now);
     const existing = pending.some(
       (request) =>
         request.identity.transport === identity.transport &&
