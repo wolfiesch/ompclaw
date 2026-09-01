@@ -40,6 +40,7 @@ import {
 } from "./bot-api";
 import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } from "./delivery";
 import { MAX_INBOUND_ATTACHMENT_BYTES, saveInboxAttachment } from "./inbox";
+import { decodeTelegramSemanticCallback, TelegramSemanticViewReconciler } from "./semantic-views";
 
 const executeFile = promisify(execFile);
 const INTERACTION_LIFETIME_MS = 5 * 60 * 1_000;
@@ -82,6 +83,8 @@ export interface TelegramTransportAdapterOptions {
     | "deletePendingInteraction"
     | "listPendingIngressCompositions"
     | "listPendingInboundMessages"
+    | "getSemanticView"
+    | "putSemanticView"
   >;
   readonly transcribeCommand?: readonly string[];
   readonly logger?: Logger;
@@ -376,6 +379,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #commands: readonly { command: string; description: string }[];
   readonly #topicsFromRoot: boolean;
   readonly #outbound: Outbound;
+  readonly #semanticViews: TelegramSemanticViewReconciler;
   readonly #interactions = new Map<string, InteractiveState>();
   readonly #draftRoutes = new Map<number, DraftRoute>();
   readonly #cards = new Map<string, ControlCard>();
@@ -419,6 +423,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       callTelegram: this.#call,
       uploadTelegram: options.api?.uploadTelegram,
     });
+    this.#semanticViews = new TelegramSemanticViewReconciler(this.#store, this.#outbound, this.#clock);
   }
 
   async start(context: TransportStartContext): Promise<void> {
@@ -566,6 +571,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
   ): Promise<UiResponse> {
     await this.#assertUiOrigin(address, context);
     signal?.throwIfAborted();
+    if (request.type === "semantic_view") {
+      await this.#semanticViews.reconcile(address, context.principal.id, request.view, context, signal);
+      return { type: "semantic_view", acknowledged: true };
+    }
     if (request.type === "notify") {
       await this.#outbound.sendMessage(address, request.message, context, {}, signal);
       return { type: "notify", acknowledged: true };
@@ -598,6 +607,43 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return { type: "select", selected: [] };
     }
     return this.#openInteraction(address, request, context, signal);
+  }
+
+  async #acknowledgeTranscription(
+    message: TgMessage,
+    address: ConversationAddress,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (message.voice === undefined && message.video_note === undefined) return;
+    try {
+      await this.#telegram(
+        "setMessageReaction",
+        {
+          chat_id: message.chat.id,
+          message_id: message.message_id,
+          reaction: [{ type: "emoji", emoji: "👀" }],
+        },
+        signal,
+      );
+    } catch (reactionError) {
+      try {
+        await this.#telegram(
+          "sendMessage",
+          {
+            chat_id: message.chat.id,
+            message_thread_id: address.thread === undefined ? undefined : Number(address.thread),
+            text: "Received. Transcribing your voice note now.",
+          },
+          signal,
+        );
+      } catch (messageError) {
+        this.#log?.warn(
+          `[telegram] voice acknowledgement failed for message ${message.message_id}: ${
+            messageError instanceof Error ? messageError.message : String(messageError)
+          } (reaction: ${reactionError instanceof Error ? reactionError.message : String(reactionError)})`,
+        );
+      }
+    }
   }
 
   async #handleMessage(message: TgMessage, update: TgUpdate, context: TransportStartContext): Promise<void> {
@@ -634,6 +680,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       }
       if (threadId !== undefined) address = telegramAddress(message, this.#account, threadId);
     }
+    await this.#acknowledgeTranscription(message, address, context.signal);
     const attachment = await this.#saveIncomingMedia(message, context.signal).catch((error) => {
       if (context.signal?.aborted) throw error;
       this.#log?.warn(
@@ -711,6 +758,52 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return;
     }
     const address = telegramAddress(query.message, this.#account);
+    const callbackContext: DeliveryContext = { principal, origin: address };
+    if (query.data.startsWith("s1.")) {
+      let callbackData: ReturnType<typeof decodeTelegramSemanticCallback>;
+      try {
+        callbackData = decodeTelegramSemanticCallback(query.data);
+      } catch {
+        await acknowledge("Invalid control.");
+        return;
+      }
+      const current = this.#store.getSemanticView(address, callbackData.viewId);
+      const messageId = String(query.message.message_id);
+      if (current === undefined || !current.receipts.some((receipt) => receipt.messageId === messageId)) {
+        await acknowledge("This control has expired.");
+        return;
+      }
+      if (current.principalId !== principal.id) {
+        await acknowledge("This control belongs to another user.", true);
+        return;
+      }
+      if (callbackData.viewVersion !== current.view.version) {
+        await this.#semanticViews.refresh(address, callbackData.viewId, callbackContext, context.signal);
+        await acknowledge("Updated to the latest controls.");
+        return;
+      }
+      const action = current.view.actions.find(
+        (candidate) => candidate.id === callbackData.actionId && candidate.enabled !== false,
+      );
+      if (action?.command === undefined) {
+        await acknowledge("This control is no longer available.");
+        return;
+      }
+      await acknowledge(action.label);
+      await context.receive(
+        {
+          id: `telegram:${this.#account}:semantic:${updateId}`,
+          sentAt: this.#clock(),
+          identity,
+          address,
+          content: { text: action.command },
+          sourceReceipt: { transport: "telegram", messageId },
+          edited: false,
+        },
+        context.signal,
+      );
+      return;
+    }
     if (query.data === STOP_CALLBACK) {
       const card = this.#cards.get(cardKey(address));
       const receipt = card?.receipts.at(-1);

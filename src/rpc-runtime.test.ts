@@ -167,6 +167,7 @@ function defaultUiResponse<Request extends UiRequest>(request: Request): UiRespo
     widget: { type: "widget", acknowledged: true },
     title: { type: "title", acknowledged: true },
     editor_text: { type: "editor_text", acknowledged: true },
+    semantic_view: { type: "semantic_view", acknowledged: true },
   };
   return responses[request.type] as UiResponseFor<Request>;
 }
@@ -312,48 +313,88 @@ describe("RpcGatewayRuntime", () => {
       args: { i: "Checking deployment result", command: "echo TOP_SECRET" },
     });
     await settle();
-    expect(
-      deliveries.some(
-        (call) => call.method === "presentUi" && call.request?.type === "status" && call.request.key === "Task",
-      ),
-    ).toBe(false);
+    expect(deliveries.some((call) => call.method === "presentUi" && call.request?.type === "semantic_view")).toBe(
+      false,
+    );
     jest.advanceTimersByTime(2_050);
     await settle();
     const visibleTaskCard = deliveries.find(
       (call) =>
         call.method === "presentUi" &&
-        call.request?.type === "status" &&
-        call.request.key === "Task" &&
-        call.request.text?.includes("Checking deployment result") === true,
+        call.request?.type === "semantic_view" &&
+        call.request.view.kind === "task" &&
+        call.request.view.sections.some(
+          (section) => section.id === "activity" && section.text.includes("Checking deployment result"),
+        ),
     );
-    expect(visibleTaskCard?.request).toMatchObject({ notification: "silent" });
+    expect(visibleTaskCard?.request).toMatchObject({
+      type: "semantic_view",
+      view: { notification: "silent", state: "active" },
+    });
     rpc.emit({ type: "tool_execution_end", toolName: "bash" });
+    await settle();
+    rpc.state = {
+      ...rpc.state,
+      todoPhases: [
+        {
+          name: "Deployment",
+          tasks: [
+            { content: "Check deployment result", status: "completed" },
+            { content: "Verify service health", status: "in_progress" },
+            { content: "Publish receipt", status: "pending" },
+          ],
+        },
+      ],
+    };
+    rpc.emit({ type: "tool_execution_start", toolName: "todo", args: { i: "Updating deployment tasks" } });
+    await settle();
+    rpc.emit({ type: "tool_execution_end", toolName: "todo" });
+    await settle();
+    jest.advanceTimersByTime(2_050);
+    await settle();
     rpc.emit({
       type: "agent_end",
       isTerminal: true,
       messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }],
     });
     await runtime.waitUntilIdle();
-    await waitFor(() => {
-      const cards = deliveries.filter(
-        (call) => call.method === "presentUi" && call.request?.type === "status" && call.request.key === "Task",
-      );
-      const last = cards.at(-1)?.request;
-      return last?.type === "status" && last.text === undefined;
-    });
+    await waitFor(() =>
+      deliveries.some(
+        (call) =>
+          call.method === "presentUi" &&
+          call.request?.type === "semantic_view" &&
+          call.request.view.kind === "result" &&
+          call.request.view.state === "completed",
+      ),
+    );
 
     expect(turns.get("lifecycle-Deploy carefully")).toMatchObject({
       state: "completed",
       prompt: "Deploy carefully",
       finishedAt: expect.any(Number),
     });
-    const taskCards = deliveries
-      .filter((call) => call.method === "presentUi" && call.request?.type === "status" && call.request.key === "Task")
-      .map((call) => (call.request && "text" in call.request ? call.request.text : undefined));
-    expect(taskCards).toContain("Looking into it\n• Checking deployment result");
-    expect(taskCards.at(-1)).toBeUndefined();
-    expect(taskCards.join("\n")).not.toContain("bash");
-    expect(taskCards.join("\n")).not.toContain("TOP_SECRET");
+    const taskViews = deliveries
+      .filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view")
+      .flatMap((call) => (call.request?.type === "semantic_view" ? [call.request.view] : []))
+      .filter((view) => view.id.startsWith("task_"));
+    expect(
+      taskViews.some((view) => view.sections.some((section) => section.text.includes("Checking deployment result"))),
+    ).toBe(true);
+    expect(taskViews.at(-1)).toMatchObject({ kind: "result", state: "completed" });
+    expect(JSON.stringify(taskViews)).not.toContain("bash");
+    expect(JSON.stringify(taskViews)).not.toContain("TOP_SECRET");
+    expect(
+      taskViews.some((view) =>
+        view.sections.some(
+          (section) =>
+            section.label === "Deployment" &&
+            section.text.includes("✓ Check deployment result") &&
+            section.text.includes("● Verify service health") &&
+            section.text.includes("○ Publish receipt"),
+        ),
+      ),
+    ).toBe(true);
+    expect(rpc.sent.filter((command) => command.type === "get_state").length).toBeGreaterThan(1);
 
     await runtime.handleInbound(message("lifecycle", "/tasks"));
     expect(deliveries.some((call) => textFromContent(call.content)?.includes("Done | Deploy carefully"))).toBe(true);
@@ -1284,7 +1325,7 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
-  test("publishes native commands and drives model selection through the home control center", async () => {
+  test("publishes native commands and exposes model selection through the home control center", async () => {
     expect(runtimeCommandMenu().map(({ command }) => command)).toEqual([
       "start",
       "home",
@@ -1296,23 +1337,39 @@ describe("RpcGatewayRuntime", () => {
     ]);
     expect(runtimeCommandMenu().map(({ command }) => command)).not.toContain("shell");
     expect(runtimeCommandMenu(true).map(({ command }) => command)).toContain("shell");
-    present = async (request) => {
-      const selected =
-        request.type !== "select"
-          ? undefined
-          : request.title === "OmpClaw control center"
-            ? ["model"]
-            : request.title.startsWith("Select model")
-              ? ["provider/model"]
-              : [];
-      return (selected === undefined ? defaultUiResponse(request) : { type: "select", selected }) as UiResponseFor<
-        typeof request
-      >;
-    };
     const runtime = createRuntime({ config, delivery: delivery() });
     await runtime.start();
     await runtime.handleInbound(message("commands", "/home"));
 
+    const home = deliveries.find(
+      (call) =>
+        call.method === "presentUi" && call.request?.type === "semantic_view" && call.request.view.id === "home",
+    )?.request;
+    expect(home).toMatchObject({
+      type: "semantic_view",
+      view: {
+        title: "OmpClaw control center",
+        actions: expect.arrayContaining([{ id: "model", label: "Model", command: "/model" }]),
+      },
+    });
+
+    await runtime.handleInbound(message("commands", "/model"));
+    const modelPage = deliveries
+      .filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view")
+      .at(-1)?.request;
+    expect(modelPage).toMatchObject({
+      type: "semantic_view",
+      view: {
+        id: "home",
+        title: "Choose a model",
+        actions: expect.arrayContaining([
+          expect.objectContaining({ label: "✓ model", command: "/model provider/model" }),
+          { id: "back", label: "Back to Home", command: "/home" },
+        ]),
+      },
+    });
+
+    await runtime.handleInbound(message("commands", "/model provider/model"));
     const rpc = FakeOmpRpcClient.instances[0];
     expect(rpc.sent).toContainEqual(
       expect.objectContaining({
@@ -1322,11 +1379,9 @@ describe("RpcGatewayRuntime", () => {
       }),
     );
     expect(
-      deliveries
-        .filter((call) => call.method === "presentUi")
-        .map((call) => (call.request?.type === "select" ? call.request.title : undefined)),
-    ).toEqual(["OmpClaw control center", "Select model · current provider/model"]);
-    expect(deliveries.some((call) => textFromContent(call.content) === "Model: provider/model")).toBe(true);
+      deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
+        ?.request,
+    ).toMatchObject({ type: "semantic_view", view: { title: "OmpClaw control center" } });
     await runtime.stop();
   });
 
@@ -1337,17 +1392,6 @@ describe("RpcGatewayRuntime", () => {
     ];
     for (const [autonomyMode, label, approvalMode] of modes) {
       deliveries = [];
-      present = async (request) => {
-        if (request.type === "select" && request.title === "OmpClaw control center") {
-          expect(request.options).toContainEqual({
-            value: "autonomy",
-            label: "Autonomy",
-            description: label,
-          });
-          return { type: "select", selected: ["autonomy"] } as UiResponseFor<typeof request>;
-        }
-        return defaultUiResponse(request);
-      };
       const runtime = createRuntime({ config: { ...config, autonomyMode }, delivery: delivery() });
       await runtime.start();
       const rpc = FakeOmpRpcClient.instances.at(-1)!;
@@ -1356,23 +1400,34 @@ describe("RpcGatewayRuntime", () => {
 
       expect(rpc.sent.slice(postStartSentCount)).toEqual([{ type: "get_state" }]);
       expect(rpc.sent.some((command) => command.type.includes("approval"))).toBe(false);
+      const home = deliveries.find(
+        (call) =>
+          call.method === "presentUi" && call.request?.type === "semantic_view" && call.request.view.id === "home",
+      )?.request;
+      expect(home).toMatchObject({
+        type: "semantic_view",
+        view: {
+          sections: expect.arrayContaining([{ id: "autonomy", label: "Autonomy", text: label }]),
+          actions: expect.arrayContaining([{ id: "autonomy", label: "Autonomy", command: "/autonomy" }]),
+        },
+      });
+      await runtime.handleInbound(message("commands", "/autonomy"));
       expect(
-        deliveries
-          .filter((call) => call.method === "presentUi")
-          .map((call) => (call.request?.type === "select" ? call.request.title : undefined)),
-      ).toEqual(["OmpClaw control center"]);
-      expect(
-        deliveries.some(
-          (call) =>
-            textFromContent(call.content) ===
-            [
-              `Autonomy: ${label} (${autonomyMode})`,
-              `OMP approval mode: ${approvalMode}`,
-              "This affects tool approval prompts, not genuine user decisions.",
-              "Changes currently require configuration plus service restart.",
-            ].join("\n"),
-        ),
-      ).toBe(true);
+        deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
+          ?.request,
+      ).toMatchObject({
+        type: "semantic_view",
+        view: {
+          title: "Autonomy",
+          summary: [
+            `Autonomy: ${label} (${autonomyMode})`,
+            `OMP approval mode: ${approvalMode}`,
+            "This affects tool approval prompts, not genuine user decisions.",
+            "Changes currently require configuration plus service restart.",
+          ].join("\n"),
+          actions: [{ id: "back", label: "Back to Home", command: "/home" }],
+        },
+      });
       await runtime.stop();
     }
   });
@@ -1410,7 +1465,13 @@ describe("RpcGatewayRuntime", () => {
       ]),
     );
     expect(sessionStates.map((state) => state.sessionFile)).toContain("/sessions/new.jsonl");
-    expect(deliveries.some((call) => textFromContent(call.content)?.startsWith("OmpClaw v"))).toBe(true);
+    expect(
+      deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
+        ?.request,
+    ).toMatchObject({
+      type: "semantic_view",
+      view: { title: "Session status", summary: expect.stringMatching(/^OmpClaw v/) },
+    });
     await runtime.stop();
   });
 });

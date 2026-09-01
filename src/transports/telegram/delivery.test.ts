@@ -36,6 +36,11 @@ function harness(call?: (method: string, payload: Record<string, unknown>) => Pr
       readonly file: { readonly field: string; readonly path: string; readonly filename?: string };
     }
   > = [];
+  const multiUploads: Array<
+    TelegramInvocation & {
+      readonly files: readonly { readonly field: string; readonly path: string; readonly filename?: string }[];
+    }
+  > = [];
   let messageId = 100;
   const outbound = new Outbound({
     token: "token",
@@ -50,8 +55,12 @@ function harness(call?: (method: string, payload: Record<string, unknown>) => Pr
       uploads.push({ method, payload: fields, file });
       return { message_id: ++messageId };
     },
+    uploadTelegramMany: async (method, fields, files) => {
+      multiUploads.push({ method, payload: fields, files });
+      return files.map(() => ({ message_id: ++messageId }));
+    },
   });
-  return { outbound, calls, uploads };
+  return { outbound, calls, uploads, multiUploads };
 }
 
 describe("Telegram outbound delivery", () => {
@@ -287,6 +296,55 @@ describe("Telegram outbound delivery", () => {
       context,
     );
     expect(uploads[0]?.payload).not.toHaveProperty("disable_notification");
+  });
+
+  test("groups consecutive photos into one Telegram album with one caption and reply", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-album-"));
+    scratch.push(directory);
+    const photos = await Promise.all(
+      ["one.png", "two.png", "three.png"].map(async (name) => {
+        const path = join(directory, name);
+        await writeFile(path, name);
+        return path;
+      }),
+    );
+    const { outbound, multiUploads, uploads } = harness();
+
+    const receipt = await outbound.send(
+      address,
+      {
+        text: "**Deployment screenshots**",
+        format: "markdown",
+        replyTo: { transport: "telegram", messageId: "12" },
+        attachments: photos.map((path) => ({
+          url: pathToFileURL(path).href,
+          name: path.split("/").at(-1),
+          mediaType: "image/png",
+        })),
+      },
+      context,
+    );
+
+    expect(uploads).toHaveLength(0);
+    expect(multiUploads).toHaveLength(1);
+    expect(multiUploads[0]).toMatchObject({
+      method: "sendMediaGroup",
+      payload: { chat_id: "42", message_thread_id: 7, reply_to_message_id: 12 },
+    });
+    expect(multiUploads[0]?.files.map(({ field, filename }) => [field, filename])).toEqual([
+      ["photo0", "one.png"],
+      ["photo1", "two.png"],
+      ["photo2", "three.png"],
+    ]);
+    const media = JSON.parse(String(multiUploads[0]?.payload.media)) as Array<Record<string, unknown>>;
+    expect(media[0]).toMatchObject({
+      type: "photo",
+      media: "attach://photo0",
+      caption: "*Deployment screenshots*",
+      parse_mode: "MarkdownV2",
+    });
+    expect(media.slice(1).every((item) => item.caption === undefined)).toBe(true);
+    expect(receipt).toEqual({ transport: "telegram", messageId: "101" });
   });
 
   test("edits persistent messages and tolerates unchanged final text", async () => {

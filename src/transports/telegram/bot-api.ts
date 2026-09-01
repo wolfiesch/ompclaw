@@ -207,6 +207,35 @@ export async function tgUpload<T>(
   return unwrapTelegram<T>(response);
 }
 
+export async function tgUploadMany<T>(
+  token: string,
+  method: string,
+  fields: Readonly<Record<string, string | number | undefined>>,
+  files: readonly Readonly<{ field: string; path: string; filename?: string }>[],
+  options: { readonly timeoutMs?: number; readonly signal?: AbortSignal } = {},
+): Promise<T> {
+  options.signal?.throwIfAborted();
+  const bytes = await Promise.all(files.map((file) => readFile(file.path, { signal: options.signal })));
+  const form = new FormData();
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined) form.set(key, String(value));
+  }
+  for (const [index, file] of files.entries()) {
+    const content = bytes[index]!;
+    const arrayBuffer = content.buffer.slice(
+      content.byteOffset,
+      content.byteOffset + content.byteLength,
+    ) as ArrayBuffer;
+    form.set(file.field, new Blob([arrayBuffer]), file.filename ?? basename(file.path));
+  }
+  const response = await fetch(`${BOT_METHOD_ROOT}${token}/${method}`, {
+    method: "POST",
+    body: form,
+    signal: requestSignal(options.timeoutMs ?? REQUEST_LIMIT_MS, options.signal),
+  });
+  return unwrapTelegram<T>(response);
+}
+
 export async function downloadFileBytes(
   token: string,
   filePath: string,

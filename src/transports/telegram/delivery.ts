@@ -9,13 +9,15 @@ import type {
   OutboundReceipt,
   Reaction,
 } from "../../gateway-types";
-import { isMissingThreadError, TgError, tg, tgUpload, type Logger, withTelegramRetry } from "./bot-api";
-import { chunkLabeled, mdToMarkdownV2, TELEGRAM_MAX_CHARS } from "./formatting";
+import { isMissingThreadError, TgError, tg, tgUpload, tgUploadMany, type Logger, withTelegramRetry } from "./bot-api";
+import { chunkLabeled, renderMarkdownParts, TELEGRAM_MAX_CHARS } from "./formatting";
 
 const DRAFT_MARKER = "draft:";
 const TYPING_MARKER = "typing:";
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const TELEGRAM_PHOTO_EXTENSIONS = new Set([".avif", ".jpeg", ".jpg", ".png", ".webp"]);
+const TELEGRAM_CAPTION_MAX_CHARS = 1_024;
+const TELEGRAM_ALBUM_MAX_ITEMS = 10;
 
 export interface TelegramRequestOptions {
   readonly signal?: AbortSignal;
@@ -31,6 +33,13 @@ export type TelegramUpload = (
   method: string,
   fields: Record<string, string | number | undefined>,
   file: Readonly<{ field: string; path: string; filename?: string }>,
+  options?: TelegramRequestOptions,
+) => Promise<unknown>;
+
+export type TelegramMultiUpload = (
+  method: string,
+  fields: Record<string, string | number | undefined>,
+  files: readonly Readonly<{ field: string; path: string; filename?: string }>[],
   options?: TelegramRequestOptions,
 ) => Promise<unknown>;
 
@@ -54,6 +63,7 @@ export interface OutboundOptions {
   readonly logger?: Logger;
   readonly callTelegram?: TelegramCall;
   readonly uploadTelegram?: TelegramUpload;
+  readonly uploadTelegramMany?: TelegramMultiUpload;
   readonly nextDraftId?: () => number;
 }
 
@@ -95,6 +105,11 @@ function messageIdFromResult(value: unknown, operation: string): number {
   throw new Error(`Telegram ${operation} returned no message_id`);
 }
 
+function messageIdsFromGroupResult(value: unknown): readonly number[] {
+  if (!Array.isArray(value) || value.length === 0) throw new Error("Telegram sendMediaGroup returned no messages");
+  return value.map((message) => messageIdFromResult(message, "sendMediaGroup"));
+}
+
 function topicId(address: ConversationAddress): number | undefined {
   if (address.thread === undefined) return undefined;
   const id = Number(address.thread);
@@ -131,14 +146,8 @@ function draftsUnavailable(error: unknown): boolean {
 }
 
 function renderText(text: string, format: OutboundContent["format"]): readonly RenderedText[] {
-  const plainParts = chunkLabeled(text, TELEGRAM_MAX_CHARS, "newline");
-  if (format !== "markdown") return plainParts.map((part) => ({ wireText: part, plainText: part }));
-  const markdownParts = chunkLabeled(mdToMarkdownV2(text), TELEGRAM_MAX_CHARS, "newline");
-  return markdownParts.map((part, index) => ({
-    wireText: part,
-    plainText: plainParts[index] ?? part,
-    parseMode: "MarkdownV2",
-  }));
+  if (format === "markdown") return renderMarkdownParts(text);
+  return chunkLabeled(text, TELEGRAM_MAX_CHARS, "newline").map((part) => ({ wireText: part, plainText: part }));
 }
 
 function renderDirectText(text: string, options: TelegramMessageOptions): readonly RenderedText[] {
@@ -179,6 +188,7 @@ export class Outbound {
   readonly #log: Logger | undefined;
   readonly #call: TelegramCall;
   readonly #upload: TelegramUpload;
+  readonly #uploadMany: TelegramMultiUpload | undefined;
   readonly #draftId: () => number;
 
   constructor(options: OutboundOptions) {
@@ -194,6 +204,12 @@ export class Outbound {
       options.uploadTelegram ??
       ((method, fields, file, request = {}) =>
         tgUpload(options.token, method, fields, file, { signal: request.signal }));
+    this.#uploadMany =
+      options.uploadTelegramMany ??
+      (options.uploadTelegram === undefined
+        ? (method, fields, files, request = {}) =>
+          tgUploadMany(options.token, method, fields, files, { signal: request.signal })
+        : undefined);
   }
 
   async send(
@@ -281,6 +297,7 @@ export class Outbound {
           context,
           undefined,
           content.notification,
+          undefined,
           signal,
         )),
       );
@@ -462,7 +479,12 @@ export class Outbound {
   ): Promise<OutboundReceipt[]> {
     const delivered: OutboundReceipt[] = [];
     let pendingReply = content.replyTo;
-    if (content.text !== undefined && content.text.length > 0) {
+    let caption: RenderedText | undefined;
+    if (content.text !== undefined && content.text.length > 0 && (content.attachments?.length ?? 0) > 0) {
+      const pieces = renderText(content.text, content.format);
+      if (pieces.length === 1 && pieces[0]!.wireText.length <= TELEGRAM_CAPTION_MAX_CHARS) caption = pieces[0];
+    }
+    if (content.text !== undefined && content.text.length > 0 && caption === undefined) {
       const pieces = renderText(content.text, content.format);
       for (const piece of pieces) {
         delivered.push(
@@ -487,6 +509,7 @@ export class Outbound {
           context,
           pendingReply,
           content.notification,
+          caption,
           signal,
         )),
       );
@@ -573,38 +596,124 @@ export class Outbound {
     _context: DeliveryContext,
     replyTo: OutboundReceipt | undefined,
     notification: OutboundContent["notification"],
+    caption: RenderedText | undefined,
     signal?: AbortSignal,
   ): Promise<OutboundReceipt[]> {
+    const prepared = await Promise.all(
+      attachments.map(async (attachment) => {
+        const path = attachmentPath(attachment.url);
+        const details = await stat(path);
+        if (!details.isFile()) throw new Error(`Telegram attachment is not a regular file: ${path}`);
+        if (details.size > MAX_ATTACHMENT_BYTES)
+          throw new Error(`Telegram attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes`);
+        return {
+          path,
+          filename: safeUploadName(attachment.name),
+          photo: photoAttachment(path, attachment.mediaType),
+        };
+      }),
+    );
     const receipts: OutboundReceipt[] = [];
     let pendingReply = replyTo;
-    for (const attachment of attachments) {
-      const path = attachmentPath(attachment.url);
-      const details = await stat(path);
-      if (!details.isFile()) throw new Error(`Telegram attachment is not a regular file: ${path}`);
-      if (details.size > MAX_ATTACHMENT_BYTES)
-        throw new Error(`Telegram attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes`);
-      const photo = photoAttachment(path, attachment.mediaType);
-      const method = photo ? "sendPhoto" : "sendDocument";
-      const field = photo ? "photo" : "document";
+    let pendingCaption = caption;
+    let index = 0;
+    while (index < prepared.length) {
+      const current = prepared[index]!;
+      let albumEnd = index;
+      while (albumEnd < prepared.length && albumEnd - index < TELEGRAM_ALBUM_MAX_ITEMS && prepared[albumEnd]!.photo) {
+        albumEnd += 1;
+      }
+      const group = this.#uploadMany === undefined ? [] : prepared.slice(index, albumEnd);
+      if (group.length >= 2) {
+        const media = (plain: boolean): string =>
+          JSON.stringify(
+            group.map((_item, groupIndex) => ({
+              type: "photo",
+              media: `attach://photo${groupIndex}`,
+              ...(groupIndex !== 0 || pendingCaption === undefined
+                ? {}
+                : {
+                  caption: plain ? pendingCaption.plainText : pendingCaption.wireText,
+                  ...(plain || pendingCaption.parseMode === undefined
+                    ? {}
+                    : { parse_mode: pendingCaption.parseMode }),
+                }),
+            })),
+          );
+        const fields: Record<string, string | number | undefined> = {
+          chat_id: address.channel,
+          message_thread_id: topicId(address),
+          reply_to_message_id: pendingReply === undefined ? undefined : messageId(pendingReply),
+          media: media(false),
+          ...(notification === "silent" ? { disable_notification: "true" } : {}),
+        };
+        let result: unknown;
+        try {
+          result = await this.#uploadManyRequest(
+            "sendMediaGroup",
+            fields,
+            group.map((item, groupIndex) => ({
+              field: `photo${groupIndex}`,
+              path: item.path,
+              filename: item.filename,
+            })),
+            signal,
+            address,
+          );
+        } catch (error) {
+          if (pendingCaption?.parseMode === undefined || !parseFailure(error)) throw error;
+          result = await this.#uploadManyRequest(
+            "sendMediaGroup",
+            { ...fields, media: media(true) },
+            group.map((item, groupIndex) => ({
+              field: `photo${groupIndex}`,
+              path: item.path,
+              filename: item.filename,
+            })),
+            signal,
+            address,
+          );
+        }
+        receipts.push(...messageIdsFromGroupResult(result).map(receipt));
+        index += group.length;
+        pendingReply = undefined;
+        pendingCaption = undefined;
+        continue;
+      }
+
+      const method = current.photo ? "sendPhoto" : "sendDocument";
+      const field = current.photo ? "photo" : "document";
       const fields: Record<string, string | number | undefined> = {
         chat_id: address.channel,
         message_thread_id: topicId(address),
         reply_to_message_id: pendingReply === undefined ? undefined : messageId(pendingReply),
+        caption: pendingCaption?.wireText,
+        parse_mode: pendingCaption?.parseMode,
         ...(notification === "silent" ? { disable_notification: "true" } : {}),
       };
-      const result = await this.#uploadRequest(
-        method,
-        fields,
-        {
-          field,
-          path,
-          filename: safeUploadName(attachment.name),
-        },
-        signal,
-        address,
-      );
+      let result: unknown;
+      try {
+        result = await this.#uploadRequest(
+          method,
+          fields,
+          { field, path: current.path, filename: current.filename },
+          signal,
+          address,
+        );
+      } catch (error) {
+        if (pendingCaption?.parseMode === undefined || !parseFailure(error)) throw error;
+        result = await this.#uploadRequest(
+          method,
+          { ...fields, caption: pendingCaption.plainText, parse_mode: undefined },
+          { field, path: current.path, filename: current.filename },
+          signal,
+          address,
+        );
+      }
       receipts.push(receipt(messageIdFromResult(result, method)));
+      index += 1;
       pendingReply = undefined;
+      pendingCaption = undefined;
     }
     return receipts;
   }
@@ -642,6 +751,32 @@ export class Outbound {
       const rootFields = { ...fields, message_thread_id: undefined };
       this.#log?.warn(`[telegram] topic ${address.thread} is unavailable; retrying attachment in the root chat`);
       return withTelegramRetry(() => this.#upload(method, rootFields, file, { signal }), { log: this.#log, signal });
+    }
+  }
+
+  async #uploadManyRequest(
+    method: string,
+    fields: Record<string, string | number | undefined>,
+    files: readonly Readonly<{ field: string; path: string; filename?: string }>[],
+    signal: AbortSignal | undefined,
+    address: ConversationAddress,
+  ): Promise<unknown> {
+    const upload = this.#uploadMany;
+    if (upload === undefined) throw new Error("Telegram media groups are unavailable");
+    try {
+      return await withTelegramRetry(() => upload(method, fields, files, { signal }), {
+        log: this.#log,
+        signal,
+      });
+    } catch (error) {
+      if (!isMissingThreadError(error) || address.thread === undefined || fields.message_thread_id === undefined)
+        throw error;
+      const rootFields = { ...fields, message_thread_id: undefined };
+      this.#log?.warn(`[telegram] topic ${address.thread} is unavailable; retrying media group in the root chat`);
+      return withTelegramRetry(() => upload(method, rootFields, files, { signal }), {
+        log: this.#log,
+        signal,
+      });
     }
   }
 

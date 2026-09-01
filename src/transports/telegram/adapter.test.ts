@@ -3,6 +3,7 @@ import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Principal } from "../../gateway-types";
+import type { SemanticView } from "../../gateway-views";
 import { TgError } from "./bot-api";
 import { TelegramTransportAdapter } from "./adapter";
 import { telegramDraftId } from "./delivery";
@@ -348,7 +349,7 @@ describe("Telegram inbound conversion", () => {
   });
 
   test("adds voice transcription beside the saved attachment", async () => {
-    const { adapter, received } = await fixture({ transcribe: true });
+    const { adapter, calls, received } = await fixture({ transcribe: true });
     await adapter.handleUpdate({
       update_id: 9,
       message: message({
@@ -358,8 +359,33 @@ describe("Telegram inbound conversion", () => {
     });
     expect(received[0]?.content.text).toBe("[Voice transcript: voice transcript]");
     expect(received[0]?.content.attachments?.length).toBe(1);
+    expect(calls.find((call) => call.method === "setMessageReaction")?.payload).toEqual({
+      chat_id: 42,
+      message_id: 10,
+      reaction: [{ type: "emoji", emoji: "👀" }],
+    });
   });
 
+  test("acknowledges a video note with a message when reactions are unavailable", async () => {
+    const { adapter, calls, received } = await fixture({
+      transcribe: true,
+      reactionError: new Error("reactions disabled"),
+    });
+    await adapter.handleUpdate({
+      update_id: 12,
+      message: message({
+        text: undefined,
+        video_note: { file_id: "video-note", file_unique_id: "video-stable", file_size: 3 },
+      }),
+    });
+
+    expect(calls.find((call) => call.method === "sendMessage")?.payload).toMatchObject({
+      chat_id: 42,
+      text: "Received. Transcribing your voice note now.",
+    });
+    expect(received[0]?.content.text).toBe("[Voice transcript: voice transcript]");
+    expect(received[0]?.content.attachments?.[0]?.mediaType).toBe("video/mp4");
+  });
   test("reuses one forum topic when an authorized root message is retried", async () => {
     const { adapter, calls, received } = await fixture({ createTopicsFromRoot: true, failFirstReceive: true });
     const update = {
@@ -449,6 +475,114 @@ describe("Telegram interactive UI", () => {
     });
     expect(received[0]).toMatchObject({ content: { text: "/stop" }, address: baseAddress });
     expect(received[0]?.composition).toBeUndefined();
+  });
+
+  test("routes a versioned semantic action from its owning principal", async () => {
+    const { adapter, calls, received } = await fixture();
+    const view: SemanticView = {
+      schemaVersion: 1,
+      id: "home",
+      kind: "home",
+      version: 1,
+      state: "waiting",
+      title: "Control center",
+      summary: "Ready",
+      sections: [{ id: "status", label: "Status", text: "Idle" }],
+      actions: [{ id: "status", label: "Status", command: "/status" }],
+      updatedAt: 1,
+    };
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view }, delivery);
+    const card = sentMessage(calls);
+    expect(callbackData(card, "Status")).toBe("s1.home.1.status");
+
+    await adapter.handleUpdate({
+      update_id: 16,
+      callback_query: {
+        id: "semantic-status",
+        from: { id: 42 },
+        data: callbackData(card, "Status"),
+        message: message({ message_id: 201 }),
+      },
+    });
+
+    expect(received[0]).toMatchObject({ content: { text: "/status" }, address: baseAddress });
+  });
+
+  test("refreshes a stale semantic callback without dispatching its action", async () => {
+    const { adapter, calls, received } = await fixture();
+    const initial: SemanticView = {
+      schemaVersion: 1,
+      id: "home",
+      kind: "home",
+      version: 1,
+      state: "waiting",
+      title: "Control center",
+      summary: "Old state",
+      sections: [{ id: "status", label: "Status", text: "Idle" }],
+      actions: [{ id: "status", label: "Status", command: "/status" }],
+      updatedAt: 1,
+    };
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view: initial }, delivery);
+    const staleCallback = callbackData(sentMessage(calls), "Status");
+    await adapter.presentUi(
+      baseAddress,
+      { type: "semantic_view", view: { ...initial, version: 2, summary: "Current state", updatedAt: 2 } },
+      delivery,
+    );
+    calls.splice(0);
+
+    await adapter.handleUpdate({
+      update_id: 17,
+      callback_query: {
+        id: "semantic-stale",
+        from: { id: 42 },
+        data: staleCallback,
+        message: message({ message_id: 201 }),
+      },
+    });
+
+    expect(received).toEqual([]);
+    expect(calls.find((entry) => entry.method === "editMessageText")?.payload.text).toContain("Current state");
+    expect(calls.findLast((entry) => entry.method === "answerCallbackQuery")?.payload.text).toBe(
+      "Updated to the latest controls.",
+    );
+  });
+
+  test("rejects a semantic action from another authorized principal", async () => {
+    const attacker: Principal = { id: "principal-attacker", roles: ["operator"] };
+    const { adapter, calls, received } = await fixture({
+      resolve: (subject) => (subject === "42" ? owner : attacker),
+    });
+    const view: SemanticView = {
+      schemaVersion: 1,
+      id: "home",
+      kind: "home",
+      version: 1,
+      state: "waiting",
+      title: "Control center",
+      summary: "Ready",
+      sections: [],
+      actions: [{ id: "status", label: "Status", command: "/status" }],
+      updatedAt: 1,
+    };
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view }, delivery);
+    const card = sentMessage(calls);
+
+    await adapter.handleUpdate({
+      update_id: 18,
+      callback_query: {
+        id: "semantic-attacker",
+        from: { id: 99 },
+        data: callbackData(card, "Status"),
+        message: message({ message_id: 201 }),
+      },
+    });
+
+    expect(received).toEqual([]);
+    expect(calls.findLast((entry) => entry.method === "answerCallbackQuery")?.payload).toMatchObject({
+      text: "This control belongs to another user.",
+      show_alert: true,
+    });
   });
 
   test("passes status notification policy to control-card sends and new chunks", async () => {

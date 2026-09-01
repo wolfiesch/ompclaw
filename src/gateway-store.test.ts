@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { GatewayStore, type AppendIngressFragmentInput } from "./gateway-store";
-import type { InboundMessage } from "./gateway-types";
+import type { ConversationAddress, InboundMessage } from "./gateway-types";
+import type { SemanticViewState, StoredSemanticView } from "./gateway-views";
 
 const directories: string[] = [];
 
@@ -20,6 +21,51 @@ afterEach(() => {
 
 const telegramOwner = { transport: "telegram", account: "default", subject: "42" } as const;
 const ownerAddress = { transport: "telegram", account: "default", channel: "42" } as const;
+
+interface SemanticViewRecordOptions {
+  readonly address?: ConversationAddress;
+  readonly principalId?: string;
+  readonly id?: string;
+  readonly version?: number;
+  readonly state?: SemanticViewState;
+  readonly contentHash?: string;
+  readonly receipts?: StoredSemanticView["receipts"];
+  readonly createdAt?: number;
+  readonly updatedAt?: number;
+}
+
+function semanticViewRecord(options: SemanticViewRecordOptions = {}): StoredSemanticView {
+  const {
+    address = ownerAddress,
+    principalId = "operator-42",
+    id = "task-1",
+    version = 0,
+    state = "active",
+    contentHash = "a".repeat(64),
+    receipts = [{ messageId: "100", index: 0 }],
+    createdAt = 100,
+    updatedAt = 100,
+  } = options;
+  return {
+    principalId,
+    address,
+    view: {
+      schemaVersion: 1,
+      id,
+      kind: "task",
+      version,
+      state,
+      title: "Deploy semantic views",
+      sections: [{ id: "progress", text: "Persisting the view", tone: "warning" }],
+      actions: [{ id: "cancel", label: "Cancel", command: "/cancel", style: "danger", enabled: true }],
+      updatedAt,
+    },
+    contentHash,
+    receipts,
+    createdAt,
+    updatedAt,
+  };
+}
 
 function claimedInbound(id: string, transport = "telegram", account = "default"): InboundMessage {
   return {
@@ -780,5 +826,158 @@ describe("GatewayStore", () => {
       "inbound message composition order must be a nonnegative integer",
     );
     restarted.close();
+  });
+
+  test("persists semantic views across restart with exact optional fields", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    first.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    const record = semanticViewRecord({ receipts: [] });
+    const recordWithUndefinedOptionals: StoredSemanticView = {
+      ...record,
+      view: { ...record.view, summary: undefined, notification: undefined },
+    };
+
+    expect(first.putSemanticView(recordWithUndefinedOptionals)).toBe(true);
+    first.close();
+
+    const restarted = new GatewayStore(path);
+    expect(restarted.getSemanticView(ownerAddress, "task-1")).toEqual(record);
+    restarted.close();
+  });
+
+  test("isolates semantic views by the complete conversation address and lists deterministically", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const topic = { ...ownerAddress, thread: "topic-1" } as const;
+    store.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    store.upsertPrincipal({ id: "operator-7", roles: ["operator"] });
+
+    expect(store.putSemanticView(semanticViewRecord({ id: "task-1", createdAt: 100 }))).toBe(true);
+    expect(
+      store.putSemanticView(
+        semanticViewRecord({
+          id: "task-1",
+          address: topic,
+          principalId: "operator-7",
+          contentHash: "b".repeat(64),
+          createdAt: 101,
+          updatedAt: 101,
+        }),
+      ),
+    ).toBe(true);
+
+    expect(store.getSemanticView(topic, "task-1")?.principalId).toBe("operator-7");
+    expect(store.getSemanticView({ ...ownerAddress, account: "other" }, "task-1")).toBeUndefined();
+    expect(store.listSemanticViews(ownerAddress).map((record) => record.address.thread)).toEqual([undefined]);
+    expect(store.listSemanticViews(topic).map((record) => record.principalId)).toEqual(["operator-7"]);
+    expect(store.listSemanticViews().map((record) => record.address.thread)).toEqual([undefined, "topic-1"]);
+    store.close();
+  });
+
+  test("enforces monotonic semantic-view versions and equal-version hash conflicts", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    store.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    const initial = semanticViewRecord();
+
+    expect(store.putSemanticView(initial)).toBe(true);
+    expect(store.putSemanticView(initial)).toBe(false);
+    expect(store.putSemanticView(semanticViewRecord({ version: 1, updatedAt: 101 }))).toBe(true);
+    expect(
+      store.putSemanticView(
+        semanticViewRecord({
+          version: 1,
+          receipts: [{ messageId: "101", index: 0 }],
+          updatedAt: 102,
+        }),
+      ),
+    ).toBe(true);
+    expect(store.getSemanticView(ownerAddress, "task-1")?.receipts).toEqual([{ messageId: "101", index: 0 }]);
+    expect(store.putSemanticView(initial)).toBe(false);
+    expect(() =>
+      store.putSemanticView(
+        semanticViewRecord({
+          version: 1,
+          contentHash: "b".repeat(64),
+          updatedAt: 101,
+        }),
+      ),
+    ).toThrow("conflicting content at the same version");
+    expect(store.getSemanticView(ownerAddress, "task-1")?.view.version).toBe(1);
+    store.close();
+  });
+
+  test("rejects invalid semantic records and address ownership changes", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    store.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    store.upsertPrincipal({ id: "operator-7", roles: ["operator"] });
+
+    expect(() =>
+      store.putSemanticView(
+        semanticViewRecord({
+          id: "not/a-safe-id",
+        }),
+      ),
+    ).toThrow("opaque identifier");
+    expect(() =>
+      store.putSemanticView(
+        semanticViewRecord({
+          contentHash: "not-a-digest",
+        }),
+      ),
+    ).toThrow("SHA-256");
+    expect(() => store.putSemanticView(semanticViewRecord({ principalId: "missing-principal" }))).toThrow(
+      "principal does not exist",
+    );
+
+    expect(store.putSemanticView(semanticViewRecord())).toBe(true);
+    expect(() => store.putSemanticView(semanticViewRecord({ principalId: "operator-7" }))).toThrow(
+      "owned by a different principal",
+    );
+    store.close();
+  });
+
+  test("rejects corrupt stored semantic view JSON", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    first.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    first.putSemanticView(semanticViewRecord());
+    first.close();
+
+    const database = new Database(path);
+    database
+      .query(
+        `UPDATE semantic_views
+         SET view_json = ?
+         WHERE transport = ? AND account = ? AND channel = ? AND thread = ? AND view_id = ?`,
+      )
+      .run("{", ownerAddress.transport, ownerAddress.account, ownerAddress.channel, "", "task-1");
+    database.close();
+
+    const restarted = new GatewayStore(path);
+    expect(() => restarted.getSemanticView(ownerAddress, "task-1")).toThrow(
+      "corrupt JSON stored for semantic view definition",
+    );
+    restarted.close();
+  });
+
+  test("deletes semantic views only at their addressed key", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const topic = { ...ownerAddress, thread: "topic-1" } as const;
+    store.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    store.putSemanticView(semanticViewRecord());
+    store.putSemanticView(
+      semanticViewRecord({
+        address: topic,
+        contentHash: "b".repeat(64),
+        createdAt: 101,
+        updatedAt: 101,
+      }),
+    );
+
+    expect(store.deleteSemanticView(ownerAddress, "task-1")).toBe(true);
+    expect(store.deleteSemanticView(ownerAddress, "task-1")).toBe(false);
+    expect(store.getSemanticView(topic, "task-1")).toBeDefined();
+    expect(store.listSemanticViews().map((record) => record.address.thread)).toEqual(["topic-1"]);
+    store.close();
   });
 });
