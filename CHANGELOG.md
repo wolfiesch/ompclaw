@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Refuse new transactional release builds when the state filesystem has less than 4 GiB free, and report actionable storage headroom through `doctor`.
+
 ## 0.9.1 (2026-09-01)
 
 ### Fixed
