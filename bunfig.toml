@@ -1,0 +1,15 @@
+telemetry = false
+
+[install]
+exact = true
+saveTextLockfile = true
+
+[test]
+pathIgnorePatterns = [
+  "**/node_modules/**",
+  "**/.git/**",
+  "**/dist/**",
+]
+
+[run]
+bun = true

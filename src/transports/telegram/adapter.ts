@@ -738,7 +738,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
           const url = new URL(attachment.url);
           if (url.protocol === "file:") paths.add(resolve(fileURLToPath(url)));
         } catch {
-          continue;
+          // Ignore malformed attachment URLs while preserving valid inbox paths.
         }
       }
     }

@@ -1,0 +1,21 @@
+* text=auto eol=lf
+
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.webp -text
+*.ico -text
+*.pdf -text
+*.zip -text
+*.gz -text
+*.tgz -text
+*.db -text
+*.sqlite -text
+bun.lock text eol=lf
+
+*.sh text eol=lf
+*.py text eol=lf
+*.ps1 text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf

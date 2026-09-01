@@ -196,15 +196,18 @@ export async function createTelegramAdapterHarness(
       } catch (error) {
         didStopThrow = true;
         stopError = error;
-      } finally {
-        activeHarnesses.delete(harness);
-        try {
-          await rm(stateDir, { recursive: true, force: true });
-        } catch (error) {
-          if (!didStopThrow) throw error;
-        }
+      }
+      activeHarnesses.delete(harness);
+      let cleanupError: unknown;
+      let didCleanupThrow = false;
+      try {
+        await rm(stateDir, { recursive: true, force: true });
+      } catch (error) {
+        didCleanupThrow = true;
+        cleanupError = error;
       }
       if (didStopThrow) throw stopError;
+      if (didCleanupThrow) throw cleanupError;
     },
   };
   activeHarnesses.add(harness);

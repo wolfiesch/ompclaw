@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { OmpRpcClient, RpcCommandError } from "./rpc-client";
+import { OmpRpcClient, type RpcCommandError } from "./rpc-client";
 
 const clients: OmpRpcClient[] = [];
 
