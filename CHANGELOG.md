@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.10.0 (2026-09-01)
+
 ### Added
 
 - Add `omp.autonomyMode`: `inherit` preserves existing OMP approval resolution; `autopilot`, `balanced`, and `review` generate `yolo`, `write`, and `always-ask`, respectively, with read-only Telegram Home state.
