@@ -171,7 +171,12 @@ export async function createTelegramAdapterHarness(
     resolveIdentity: (identity) => options.resolve?.(identity.subject)
       ?? (identity.subject === "42" ? TELEGRAM_TEST_OWNER : undefined),
   };
-  await adapter.start(context);
+  try {
+    await adapter.start(context);
+  } catch (error) {
+    await rm(stateDir, { recursive: true, force: true });
+    throw error;
+  }
 
   const harness: TelegramAdapterHarness = {
     adapter,
@@ -184,9 +189,22 @@ export async function createTelegramAdapterHarness(
     stateDir,
     warnings,
     async dispose() {
-      activeHarnesses.delete(harness);
-      await adapter.stop();
-      await rm(stateDir, { recursive: true, force: true });
+      let stopError: unknown;
+      let didStopThrow = false;
+      try {
+        await adapter.stop();
+      } catch (error) {
+        didStopThrow = true;
+        stopError = error;
+      } finally {
+        activeHarnesses.delete(harness);
+        try {
+          await rm(stateDir, { recursive: true, force: true });
+        } catch (error) {
+          if (!didStopThrow) throw error;
+        }
+      }
+      if (didStopThrow) throw stopError;
     },
   };
   activeHarnesses.add(harness);

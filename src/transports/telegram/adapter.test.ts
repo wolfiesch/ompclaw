@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Principal } from "../../gateway-types";
@@ -61,11 +61,33 @@ describe("Telegram transport lifecycle", () => {
     await adapter.stop();
   });
 
-  test("rejects invalid bot credentials instead of starting an unhealthy poller", async () => {
+  test("removes its temporary state directory when startup fails", async () => {
+    const prefix = "ompclaw adapter ";
+    const entriesBefore = new Set(await readdir(tmpdir()));
     await expect(fixture({
+      pendingAttachmentName: "startup-failure.bin",
       commands: [{ command: "home", description: "Open control center" }],
       setCommandsError: new TgError("Unauthorized", 401),
     })).rejects.toThrow("Unauthorized");
+    const leakedPaths = (await readdir(tmpdir()))
+      .filter((entry) => entry.startsWith(prefix) && !entriesBefore.has(entry))
+      .map((entry) => join(tmpdir(), entry));
+    scratch.push(...leakedPaths);
+    expect(leakedPaths).toEqual([]);
+  });
+
+  test("removes temporary state and unregisters when polling stop fails", async () => {
+    const harness = await fixture();
+    const stopError = new Error("poller stop failed");
+    harness.poller.stop = () => { throw stopError; };
+
+    const result = await harness.dispose().then(
+      () => new Error("harness disposal unexpectedly resolved"),
+      (error) => error,
+    );
+    expect(result).toBe(stopError);
+    await expect(access(harness.stateDir)).rejects.toThrow();
+    await expect(disposeTelegramAdapterHarnesses()).resolves.toBeUndefined();
   });
 
   test("waits for an in-flight polled update before shutdown completes", async () => {
