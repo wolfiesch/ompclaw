@@ -4,7 +4,12 @@ import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { GatewayConfig } from "./gateway-config";
-import { GatewayUpdateCoordinator, gatewayUpdatePaths, readUpdateRequest } from "./gateway-update";
+import {
+  GatewayUpdateCoordinator,
+  gatewayUpdatePaths,
+  readUpdateRequest,
+  withGatewayUpdateLock,
+} from "./gateway-update";
 
 export interface ServiceInstallResult {
   path: string;
@@ -115,17 +120,19 @@ export async function prepareServiceArguments(
 ): Promise<string[]> {
   if (!config.updates.enabled) return buildServiceArguments(paths);
   const updates = new GatewayUpdateCoordinator({ config: config.updates, stateDir: config.stateDir });
-  const pending = readUpdateRequest(updates.paths.request);
-  if (pending !== undefined && pending.status !== "notified") {
-    throw new Error(
-      `Cannot install the OmpClaw service while update ${pending.id} is ${pending.status}; let the active supervisor finish it before retrying`,
-    );
-  }
-  const staged = await updates.stage("HEAD");
-  const supervisorPath = join(updates.paths.root, "ompclaw-supervisor");
-  replaceFileAtomically(join(staged.release.path, "ompclaw-supervisor"), supervisorPath, 0o700);
-  updates.bootstrap(staged.release);
-  return buildManagedServiceArguments(config, paths);
+  return withGatewayUpdateLock(updates.paths.lock, async () => {
+    const pending = readUpdateRequest(updates.paths.request);
+    if (pending !== undefined && pending.status !== "notified") {
+      throw new Error(
+        `Cannot install the OmpClaw service while update ${pending.id} is ${pending.status}; let the active supervisor finish it before retrying`,
+      );
+    }
+    const staged = await updates.stage("HEAD");
+    const supervisorPath = join(updates.paths.root, "ompclaw-supervisor");
+    replaceFileAtomically(join(staged.release.path, "ompclaw-supervisor"), supervisorPath, 0o700);
+    updates.bootstrap(staged.release);
+    return buildManagedServiceArguments(config, paths);
+  });
 }
 
 export function renderSystemdUnit(

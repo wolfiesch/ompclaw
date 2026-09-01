@@ -18,6 +18,7 @@ import type { GatewayUpdatesConfig } from "./gateway-config";
 import type { GatewayDelivery } from "./gateway-tools";
 import type { ConversationAddress, Principal } from "./gateway-types";
 import { isRecord } from "./type-guards";
+import { acquireLock, releaseLock, startLockHeartbeat } from "./transports/telegram/bot-api";
 
 const UPDATE_SCHEMA = 1;
 const RELEASE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -76,6 +77,7 @@ export interface GatewayUpdatePaths {
   readonly request: string;
   readonly result: string;
   readonly ready: string;
+  readonly lock: string;
 }
 
 export type GatewayUpdateCommandRunner = (argv: readonly string[], cwd: string, signal?: AbortSignal) => Promise<string>;
@@ -170,28 +172,30 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
   }
 
   async arm(releaseId: string, origin: GatewayUpdateOrigin): Promise<{ update: string }> {
-    if (!this.#activationEnabled()) {
-      throw new Error("OmpClaw update activation requires a supervisor-managed gateway process");
-    }
-    const candidate = readReleaseManifest(join(this.#paths.releases, requireReleaseId(releaseId)));
-    const previous = currentGatewayRelease(this.#paths);
-    if (candidate.id === previous.id) throw new Error(`Release ${candidate.id} is already active`);
-    const existing = readJsonIfPresent(this.#paths.request, parseUpdateRequest);
-    if (existing !== undefined && existing.status !== "notified") {
-      throw new Error(`Update ${existing.id} is already ${existing.status}`);
-    }
-    rmSync(this.#paths.result, { force: true });
-    const request: GatewayUpdateRequest = {
-      schema: UPDATE_SCHEMA,
-      id: randomUUID(),
-      status: "armed",
-      candidate,
-      previous,
-      origin,
-      requestedAt: this.#now().toISOString(),
-    };
-    writeJsonAtomic(this.#paths.request, request);
-    return { update: `armed | ${candidate.id} | request ${request.id}` };
+    return withGatewayUpdateLock(this.#paths.lock, async () => {
+      if (!this.#activationEnabled()) {
+        throw new Error("OmpClaw update activation requires a supervisor-managed gateway process");
+      }
+      const candidate = readReleaseManifest(join(this.#paths.releases, requireReleaseId(releaseId)));
+      const previous = currentGatewayRelease(this.#paths);
+      if (candidate.id === previous.id) throw new Error(`Release ${candidate.id} is already active`);
+      const existing = readJsonIfPresent(this.#paths.request, parseUpdateRequest);
+      if (existing !== undefined && existing.status !== "notified") {
+        throw new Error(`Update ${existing.id} is already ${existing.status}`);
+      }
+      rmSync(this.#paths.result, { force: true });
+      const request: GatewayUpdateRequest = {
+        schema: UPDATE_SCHEMA,
+        id: randomUUID(),
+        status: "armed",
+        candidate,
+        previous,
+        origin,
+        requestedAt: this.#now().toISOString(),
+      };
+      writeJsonAtomic(this.#paths.request, request);
+      return { update: `armed | ${candidate.id} | request ${request.id}` };
+    });
   }
 
   async commitArmed(): Promise<void> {
@@ -270,6 +274,22 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
   }
 }
 
+export async function withGatewayUpdateLock<T>(
+  lockPath: string,
+  action: () => T | Promise<T>,
+): Promise<T> {
+  const lock = acquireLock(lockPath);
+  if (!lock.ok) throw new Error(`Another OmpClaw update operation is running in process ${lock.holder}`);
+  let stopHeartbeat: (() => void) | undefined;
+  try {
+    stopHeartbeat = startLockHeartbeat(lockPath);
+    return await action();
+  } finally {
+    stopHeartbeat?.();
+    releaseLock(lockPath);
+  }
+}
+
 export function gatewayUpdatePaths(stateDir: string): GatewayUpdatePaths {
   const root = resolve(stateDir, "updates");
   return {
@@ -278,6 +298,7 @@ export function gatewayUpdatePaths(stateDir: string): GatewayUpdatePaths {
     current: join(root, "current"),
     request: join(root, "request.json"),
     result: join(root, "result.json"),
+    lock: join(root, "operation.lock"),
     ready: join(root, "ready"),
   };
 }

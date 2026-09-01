@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { parseGatewayConfig } from "./gateway-config";
-import { gatewayUpdatePaths } from "./gateway-update";
+import { gatewayUpdatePaths, withGatewayUpdateLock } from "./gateway-update";
 import {
   buildManagedServiceArguments,
   buildServiceArguments,
@@ -129,6 +129,30 @@ describe("systemd service generation", () => {
         configPath: join(directory, "config.json"),
         envFile: join(directory, "ompclaw.env"),
       })).rejects.toThrow("while update pending-request is committed");
+
+      expect(readdirSync(updatePaths.releases)).toEqual([]);
+    } finally {
+      rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("serializes service preparation with update activation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-service-lock-"));
+    try {
+      const stateDir = join(directory, "state");
+      const updatePaths = gatewayUpdatePaths(stateDir);
+      const config = parseGatewayConfig({
+        workspace: directory,
+        stateDir,
+        updates: { enabled: true, repository: directory },
+      });
+
+      await withGatewayUpdateLock(updatePaths.lock, async () => {
+        await expect(prepareServiceArguments(config, {
+          configPath: join(directory, "config.json"),
+          envFile: join(directory, "ompclaw.env"),
+        })).rejects.toThrow("Another OmpClaw update operation is running");
+      });
 
       expect(readdirSync(updatePaths.releases)).toEqual([]);
     } finally {

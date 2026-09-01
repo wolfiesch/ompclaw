@@ -9,6 +9,7 @@ import {
   readUpdateRequest,
   readUpdateResult,
   writeUpdateResult,
+  withGatewayUpdateLock,
   type GatewayUpdateRelease,
 } from "./gateway-update";
 import { GatewayUpdateSupervisor, type ManagedGatewayProcess } from "./gateway-update-supervisor";
@@ -78,6 +79,29 @@ describe("transactional gateway updates", () => {
     await coordinator.commitArmed();
     expect(readUpdateRequest(coordinator.paths.request)?.status).toBe("committed");
     expect(currentGatewayRelease(coordinator.paths).id).toBe(previous.id);
+  });
+
+  test("serializes activation with service update operations", async () => {
+    const root = temporaryDirectory();
+    const repository = join(root, "repository");
+    const stateDir = join(root, "state");
+    mkdirSync(repository, { recursive: true });
+    const coordinator = new GatewayUpdateCoordinator({
+      config: { enabled: true, repository, healthTimeoutMs: 30_000 },
+      stateDir,
+    });
+    const previous = createRelease(stateDir, "0.7.0-aaaaaaaaaaaa", COMMIT_A);
+    const candidate = createRelease(stateDir, "0.8.0-bbbbbbbbbbbb", COMMIT_B);
+    coordinator.bootstrap(previous);
+
+    await withGatewayUpdateLock(coordinator.paths.lock, async () => {
+      await expect(coordinator.arm(candidate.id, {
+        address: { transport: "telegram", account: "default", channel: "42" },
+        principal: { id: "operator-42", roles: ["operator"] },
+      })).rejects.toThrow("Another OmpClaw update operation is running");
+    });
+
+    expect(readUpdateRequest(coordinator.paths.request)).toBeUndefined();
   });
 
   test("discards an armed release when the activation turn is not delivered", async () => {
