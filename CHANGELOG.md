@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - Add `omp.autonomyMode`: `inherit` preserves existing OMP approval resolution; `autopilot`, `balanced`, and `review` generate `yolo`, `write`, and `always-ask`, respectively, with read-only Telegram Home state.
 - Add a reusable credential-free Telegram scenario harness, a guarded live Bot API canary for dedicated test bots, and an ephemeral SSH dispatcher for running the complete check on a macOS worker without transferring credentials or state.
+- Add guided first-use Telegram setup with private credential files, stale-update-safe discovery, expiring local pairing codes, explicit identity confirmation, and optional service installation after `doctor` succeeds.
 
 ## 0.9.2 (2026-09-01)
 

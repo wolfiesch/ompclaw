@@ -6,7 +6,7 @@
 
 ## Before you start
 
-Use the [user quickstart](../README.md#user-quickstart) for package installation, token-free configuration, private environment file creation, `telegram-allow`, `doctor`, and foreground or service startup.
+Use the [user quickstart](../README.md#user-quickstart) for package installation and the recommended `setup` command. The manual path remains available for WebSocket and advanced configuration.
 
 The following operating assumptions are intentional:
 
@@ -16,6 +16,59 @@ The following operating assumptions are intentional:
 - A token authorizes a WebSocket credential only after that credential's identity resolves to a principal.
 - Telegram uses Bot API long polling. Do not configure a webhook for the same bot token.
 - WebSocket is intended to bind to loopback by default. The only HTTP route is the unauthenticated health response.
+
+## First-use setup and recovery
+
+Run setup from the OMP workspace that the gateway should control:
+
+```bash
+ompclaw setup
+```
+
+The command accepts the Telegram token from `TELEGRAM_BOT_TOKEN` or reads it
+from an interactive terminal without echo. It verifies `getMe`, rejects active
+webhooks and writes new `~/.config/ompclaw/config.json` and
+`~/.config/ompclaw/ompclaw.env` files with mode `0600`. It refuses to replace
+either file when one already exists. Setup temporarily owns the same per-account
+polling lock used by the runtime. A running gateway or another setup listener
+therefore blocks discovery instead of competing for Telegram updates.
+
+After setup prints that the listener is ready, send the bot a direct, non-topic
+message from the account to authorize. Messages already queued when the listener
+starts are ignored. The bot acknowledges that local approval is still required.
+Setup shows the Telegram identity locally, stores only a salted hash of a newly
+generated code, and prints the code and a POSIX-shell approval command locally.
+It then runs the full `doctor` preflight. Pairing codes expire after ten minutes
+and are exhausted after five invalid local attempts.
+
+Pass `--install-service` to install and start the service after `doctor`
+succeeds:
+
+```bash
+ompclaw setup --install-service
+```
+
+If the two-minute listener expires, use the generated files to retry discovery:
+
+```bash
+ompclaw pairing-listen \
+  --config ~/.config/ompclaw/config.json \
+  --env-file ~/.config/ompclaw/ompclaw.env
+```
+
+The command prints a new code and local approval command. Operational commands:
+
+```text
+ompclaw pairing-list
+ompclaw pairing-approve <code> [principal-id]
+ompclaw pairing-reject <code>
+ompclaw pairing-clear
+```
+
+`pairing-list` never returns a code or code hash. `pairing-clear` removes all
+pairing request records without changing approved principal bindings.
+Use `telegram-allow` only for deliberate manual binding or legacy recovery when
+the numeric Telegram user ID has been independently verified.
 
 ## Architecture and persistence
 
@@ -227,14 +280,19 @@ OmpClaw presents routine Telegram turns as a conversation rather than a command 
 
 These behaviors need no additional configuration. OMP still controls the response content, reasoning mode, tools, approvals, memory, and session history.
 
-Authorizing a user is an explicit local database operation:
+Pairing is an explicit local authorization operation. With the gateway stopped,
+listen for one direct message and then run the approval command printed locally:
 
 ```bash
-ompclaw telegram-allow <your-numeric-telegram-user-id> \
-  --config ~/.config/ompclaw/config.json
+ompclaw pairing-listen \
+  --config ~/.config/ompclaw/config.json \
+  --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
-It creates or updates an `operator` principal and binds the exact Telegram identity for the configured account. To use a custom principal or roles, create it with `principal-add` and bind the Telegram identity with `identity-bind`.
+Approving the code creates or updates an `operator` principal and binds the exact
+Telegram identity for the configured account. To use a custom principal ID, pass
+it after the code. Use `principal-add` and `identity-bind` for custom roles or
+non-Telegram identities.
 
 Existing forum topics get separate sessions when `topicSessions.enabled` is true. Non-topic Telegram chats and WebSocket credentials continue to share the gateway's root OMP session. Set `createFromRoot` to true to turn an authorized root message into a newly named topic and route that same turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Telegram requires the bot to be a supergroup administrator with permission to manage topics. Topic creation is idempotent across update retries.
 

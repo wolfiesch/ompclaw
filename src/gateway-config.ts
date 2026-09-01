@@ -11,6 +11,8 @@ const MAX_TRANSPORT_CREDENTIALS = 128;
 const GATEWAY_SECRET_ENV = /^OMPCLAW_[A-Z][A-Z0-9_]*$/;
 const TELEGRAM_SECRET_ENV = "TELEGRAM_BOT_TOKEN";
 
+export const DEFAULT_GATEWAY_STATE_DIR = resolve(homedir(), ".omp", "agent", "ompclaw");
+
 export interface GatewayOmpConfig {
   readonly command: string;
   readonly model?: string;
@@ -138,12 +140,16 @@ export function loadGatewayConfig(options: LoadGatewayConfigOptions = {}): Gatew
 /** Parse a JSON value for callers that already bound file loading. */
 export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()): GatewayConfig {
   const root = object(value, "OmpClaw config");
-  rejectUnknown(root, ["workspace", "stateDir", "profile", "omp", "transports", "automation", "learning", "updates"], "OmpClaw config");
+  rejectUnknown(
+    root,
+    ["workspace", "stateDir", "profile", "omp", "transports", "automation", "learning", "updates"],
+    "OmpClaw config",
+  );
 
-  const workspace = root.workspace === undefined ? resolve(cwd) : expandGatewayPath(string(root.workspace, "workspace"), cwd);
-  const stateDir = root.stateDir === undefined
-    ? resolve(homedir(), ".omp", "agent", "ompclaw")
-    : expandGatewayPath(string(root.stateDir, "stateDir"), cwd);
+  const workspace =
+    root.workspace === undefined ? resolve(cwd) : expandGatewayPath(string(root.workspace, "workspace"), cwd);
+  const stateDir =
+    root.stateDir === undefined ? DEFAULT_GATEWAY_STATE_DIR : expandGatewayPath(string(root.stateDir, "stateDir"), cwd);
   const profile = root.profile === undefined ? "ompclaw" : identifier(root.profile, "profile");
   const omp = parseOmp(root.omp, cwd);
   const transports = parseTransports(root.transports);
@@ -160,11 +166,11 @@ export function resolveGatewaySecrets(config: GatewayConfig, env: NodeJS.Process
   const telegramToken = telegram?.enabled ? requiredEnv(env, telegram.tokenEnv) : undefined;
   const webSocketCredentials = config.transports.websocket?.enabled
     ? config.transports.websocket.credentials.map((credential) => ({
-      token: requiredEnv(env, credential.tokenEnv),
-      subject: credential.subject,
-      channel: credential.channel,
-      ...(credential.thread === undefined ? {} : { thread: credential.thread }),
-    }))
+        token: requiredEnv(env, credential.tokenEnv),
+        subject: credential.subject,
+        channel: credential.channel,
+        ...(credential.thread === undefined ? {} : { thread: credential.thread }),
+      }))
     : [];
   return {
     ...(telegramToken === undefined ? {} : { telegramToken }),
@@ -244,11 +250,17 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
     ],
     "omp",
   );
-  const configFiles = stringArray(omp.configFiles, "omp.configFiles", MAX_OMP_ARGS).map((path) => expandGatewayPath(path, cwd));
+  const configFiles = stringArray(omp.configFiles, "omp.configFiles", MAX_OMP_ARGS).map((path) =>
+    expandGatewayPath(path, cwd),
+  );
   const args = stringArray(omp.args, "omp.args", MAX_OMP_ARGS);
   const autonomyMode = omp.autonomyMode === undefined ? "inherit" : parseAutonomyMode(omp.autonomyMode);
-  const busyInputMode = omp.busyInputMode === undefined ? "steer" : nonEmptyString(omp.busyInputMode, "omp.busyInputMode");
-  if (autonomyMode !== "inherit" && args.some((arg) => arg === "--approval-mode" || arg.startsWith("--approval-mode="))) {
+  const busyInputMode =
+    omp.busyInputMode === undefined ? "steer" : nonEmptyString(omp.busyInputMode, "omp.busyInputMode");
+  if (
+    autonomyMode !== "inherit" &&
+    args.some((arg) => arg === "--approval-mode" || arg.startsWith("--approval-mode="))
+  ) {
     throw new Error("omp.autonomyMode conflicts with --approval-mode in omp.args");
   }
   if (busyInputMode !== "steer" && busyInputMode !== "followup") {
@@ -258,7 +270,9 @@ function parseOmp(value: unknown, cwd: string): GatewayOmpConfig {
     command: omp.command === undefined ? "omp" : nonEmptyString(omp.command, "omp.command"),
     ...(omp.model === undefined ? {} : { model: nonEmptyString(omp.model, "omp.model") }),
     ...(omp.resume === undefined ? {} : { resume: expandGatewayPath(string(omp.resume, "omp.resume"), cwd) }),
-    ...(omp.sessionDir === undefined ? {} : { sessionDir: expandGatewayPath(string(omp.sessionDir, "omp.sessionDir"), cwd) }),
+    ...(omp.sessionDir === undefined
+      ? {}
+      : { sessionDir: expandGatewayPath(string(omp.sessionDir, "omp.sessionDir"), cwd) }),
     configFiles,
     args,
     autonomyMode,
@@ -297,12 +311,21 @@ function parseTransports(value: unknown): GatewayConfig["transports"] {
 
 function parseTelegram(value: unknown): GatewayTelegramConfig {
   const telegram = object(value, "transports.telegram");
-  rejectUnknown(telegram, ["enabled", "account", "tokenEnv", "topicSessions", "transcribeCommand"], "transports.telegram");
+  rejectUnknown(
+    telegram,
+    ["enabled", "account", "tokenEnv", "topicSessions", "transcribeCommand"],
+    "transports.telegram",
+  );
   const tokenEnv = secretEnvName(telegram.tokenEnv, "transports.telegram.tokenEnv", true);
-  const topicSessions = telegram.topicSessions === undefined
-    ? { enabled: false, createFromRoot: false }
-    : parseTelegramTopicSessions(telegram.topicSessions);
-  const transcribeCommand = stringArray(telegram.transcribeCommand, "transports.telegram.transcribeCommand", MAX_OMP_ARGS);
+  const topicSessions =
+    telegram.topicSessions === undefined
+      ? { enabled: false, createFromRoot: false }
+      : parseTelegramTopicSessions(telegram.topicSessions);
+  const transcribeCommand = stringArray(
+    telegram.transcribeCommand,
+    "transports.telegram.transcribeCommand",
+    MAX_OMP_ARGS,
+  );
   if (transcribeCommand.length > 0 && !transcribeCommand.some((part) => part.includes("{file}"))) {
     throw new Error("transports.telegram.transcribeCommand must include a {file} placeholder");
   }
@@ -319,7 +342,11 @@ function parseTelegramTopicSessions(value: unknown): GatewayTelegramTopicSession
   const topicSessions = object(value, "transports.telegram.topicSessions");
   rejectUnknown(topicSessions, ["enabled", "createFromRoot"], "transports.telegram.topicSessions");
   const enabled = boolean(topicSessions.enabled, "transports.telegram.topicSessions.enabled");
-  const createFromRoot = boolean(topicSessions.createFromRoot, "transports.telegram.topicSessions.createFromRoot", false);
+  const createFromRoot = boolean(
+    topicSessions.createFromRoot,
+    "transports.telegram.topicSessions.createFromRoot",
+    false,
+  );
   if (createFromRoot && !enabled) {
     throw new Error("transports.telegram.topicSessions.createFromRoot requires topicSessions.enabled");
   }
@@ -329,16 +356,24 @@ function parseTelegramTopicSessions(value: unknown): GatewayTelegramTopicSession
 function parseWebSocket(value: unknown): GatewayWebSocketConfig {
   const websocket = object(value, "transports.websocket");
   rejectUnknown(websocket, ["enabled", "hostname", "port", "account", "credentials"], "transports.websocket");
-  const credentials = array(websocket.credentials, "transports.websocket.credentials", MAX_TRANSPORT_CREDENTIALS).map((item, index) => {
-    const credential = object(item, `transports.websocket.credentials[${index}]`);
-    rejectUnknown(credential, ["tokenEnv", "subject", "channel", "thread"], `transports.websocket.credentials[${index}]`);
-    return {
-      tokenEnv: secretEnvName(credential.tokenEnv, `transports.websocket.credentials[${index}].tokenEnv`, false),
-      subject: nonEmptyString(credential.subject, `transports.websocket.credentials[${index}].subject`),
-      channel: nonEmptyString(credential.channel, `transports.websocket.credentials[${index}].channel`),
-      ...(credential.thread === undefined ? {} : { thread: nonEmptyString(credential.thread, `transports.websocket.credentials[${index}].thread`) }),
-    };
-  });
+  const credentials = array(websocket.credentials, "transports.websocket.credentials", MAX_TRANSPORT_CREDENTIALS).map(
+    (item, index) => {
+      const credential = object(item, `transports.websocket.credentials[${index}]`);
+      rejectUnknown(
+        credential,
+        ["tokenEnv", "subject", "channel", "thread"],
+        `transports.websocket.credentials[${index}]`,
+      );
+      return {
+        tokenEnv: secretEnvName(credential.tokenEnv, `transports.websocket.credentials[${index}].tokenEnv`, false),
+        subject: nonEmptyString(credential.subject, `transports.websocket.credentials[${index}].subject`),
+        channel: nonEmptyString(credential.channel, `transports.websocket.credentials[${index}].channel`),
+        ...(credential.thread === undefined
+          ? {}
+          : { thread: nonEmptyString(credential.thread, `transports.websocket.credentials[${index}].thread`) }),
+      };
+    },
+  );
   if (credentials.length === 0) throw new Error("transports.websocket.credentials must not be empty");
   const port = websocket.port;
   if (typeof port !== "number" || !Number.isSafeInteger(port) || port < 0 || port > 65_535) {
@@ -373,7 +408,8 @@ function parseLearning(value: unknown): GatewayLearningConfig {
   }
   const learning = object(value, "learning");
   rejectUnknown(learning, ["enabled", "autoCapture", "minToolCalls", "memoryModel"], "learning");
-  const memoryModel = learning.memoryModel === undefined ? "online" : nonEmptyString(learning.memoryModel, "learning.memoryModel");
+  const memoryModel =
+    learning.memoryModel === undefined ? "online" : nonEmptyString(learning.memoryModel, "learning.memoryModel");
   if (!["online", "qwen3-1.7b", "llama3.2:3b", "gemma-3-1b", "qwen2.5-1.5b", "lfm2-1.2b"].includes(memoryModel)) {
     throw new Error("learning.memoryModel is not a supported OMP memory model");
   }
@@ -390,9 +426,10 @@ function parseUpdates(value: unknown, cwd: string): GatewayUpdatesConfig {
   const updates = object(value, "updates");
   rejectUnknown(updates, ["enabled", "repository", "healthTimeoutMs"], "updates");
   const enabled = boolean(updates.enabled, "updates.enabled", false);
-  const repository = updates.repository === undefined
-    ? undefined
-    : expandGatewayPath(string(updates.repository, "updates.repository"), cwd);
+  const repository =
+    updates.repository === undefined
+      ? undefined
+      : expandGatewayPath(string(updates.repository, "updates.repository"), cwd);
   if (enabled && repository === undefined) throw new Error("updates.repository is required when updates.enabled");
   return {
     enabled,
@@ -460,13 +497,16 @@ function secretEnvName(value: unknown, label: string, telegram: boolean): string
   const name = nonEmptyString(value, label);
   if (name === TELEGRAM_SECRET_ENV && telegram) return name;
   if (!GATEWAY_SECRET_ENV.test(name)) {
-    throw new Error(`${label} must name an OMPCLAW_ environment variable${telegram ? ` or ${TELEGRAM_SECRET_ENV}` : ""}`);
+    throw new Error(
+      `${label} must name an OMPCLAW_ environment variable${telegram ? ` or ${TELEGRAM_SECRET_ENV}` : ""}`,
+    );
   }
   return name;
 }
 
 function requiredEnv(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name];
-  if (typeof value !== "string" || value.length === 0) throw new Error(`Required gateway credential environment variable ${name} is not set`);
+  if (typeof value !== "string" || value.length === 0)
+    throw new Error(`Required gateway credential environment variable ${name} is not set`);
   return value;
 }

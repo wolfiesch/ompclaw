@@ -27,6 +27,7 @@ import {
   Poller,
   releaseLock,
   startLockHeartbeat,
+  telegramPollLockPath,
   tg,
   TgError,
   type Logger,
@@ -423,7 +424,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   async start(context: TransportStartContext): Promise<void> {
     if (this.#context !== undefined) throw new Error("Telegram transport is already started");
     await mkdir(this.#inboxDir, { recursive: true, mode: 0o700 });
-    const lock = join(this.#stateDir, `telegram-${this.#account.replace(/[^A-Za-z0-9._-]/g, "_")}.poll.lock`);
+    const lock = telegramPollLockPath(this.#stateDir, this.#account);
     const ownership = this.#claimLock(lock);
     if (!ownership.ok) throw new Error(`Telegram account is already polled by process ${ownership.holder}`);
     this.#lockPath = lock;
