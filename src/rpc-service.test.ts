@@ -91,7 +91,7 @@ describe("systemd service generation", () => {
     }
   });
 
-  test("blocks service bootstrap while an update activation is pending", async () => {
+  test("blocks service reconfiguration while an update activation is pending", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ompclaw-service-pending-"));
     try {
       const stateDir = join(directory, "state");
@@ -120,18 +120,23 @@ describe("systemd service generation", () => {
         requestedAt: "2026-09-01T00:00:00.000Z",
         committedAt: "2026-09-01T00:00:01.000Z",
       }));
-      const config = parseGatewayConfig({
-        workspace: directory,
-        stateDir,
-        updates: { enabled: true, repository: directory },
-      });
+      const configs = [
+        parseGatewayConfig({
+          workspace: directory,
+          stateDir,
+          updates: { enabled: true, repository: directory },
+        }),
+        parseGatewayConfig({ workspace: directory, stateDir }),
+      ];
 
-      await expect(prepareServiceArguments(config, {
-        configPath: join(directory, "config.json"),
-        envFile: join(directory, "ompclaw.env"),
-      })).rejects.toThrow("while update pending-request is committed");
+      for (const config of configs) {
+        await expect(prepareServiceArguments(config, {
+          configPath: join(directory, "config.json"),
+          envFile: join(directory, "ompclaw.env"),
+        })).rejects.toThrow("while update pending-request is committed");
+      }
 
-      expect(readdirSync(updatePaths.releases)).toEqual([]);
+      expect(readdirSync(updatePaths.root)).toEqual(["request.json"]);
     } finally {
       rmSync(directory, { force: true, recursive: true });
     }
@@ -142,18 +147,23 @@ describe("systemd service generation", () => {
     try {
       const stateDir = join(directory, "state");
       const updatePaths = gatewayUpdatePaths(stateDir);
-      const config = parseGatewayConfig({
-        workspace: directory,
-        stateDir,
-        updates: { enabled: true, repository: directory },
-      });
+      const configs = [
+        parseGatewayConfig({
+          workspace: directory,
+          stateDir,
+          updates: { enabled: true, repository: directory },
+        }),
+        parseGatewayConfig({ workspace: directory, stateDir }),
+      ];
 
       await withGatewayUpdateLock(updatePaths.lock, async () => {
-        await expect(installRpcService(
-          config,
-          join(directory, "config.json"),
-          join(directory, "ompclaw.env"),
-        )).rejects.toThrow("Another OmpClaw update operation is running");
+        for (const config of configs) {
+          await expect(installRpcService(
+            config,
+            join(directory, "config.json"),
+            join(directory, "ompclaw.env"),
+          )).rejects.toThrow("Another OmpClaw update operation is running");
+        }
       });
 
       expect(readdirSync(updatePaths.root)).toEqual([]);

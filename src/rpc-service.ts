@@ -118,14 +118,15 @@ export async function prepareServiceArguments(
   config: GatewayConfig,
   paths: GatewayServicePaths,
 ): Promise<string[]> {
-  if (!config.updates.enabled) return buildServiceArguments(paths);
-  const updates = new GatewayUpdateCoordinator({ config: config.updates, stateDir: config.stateDir });
-  const pending = readUpdateRequest(updates.paths.request);
+  const updatePaths = gatewayUpdatePaths(config.stateDir);
+  const pending = readUpdateRequest(updatePaths.request);
   if (pending !== undefined && pending.status !== "notified") {
     throw new Error(
       `Cannot install the OmpClaw service while update ${pending.id} is ${pending.status}; let the active supervisor finish it before retrying`,
     );
   }
+  if (!config.updates.enabled) return buildServiceArguments(paths);
+  const updates = new GatewayUpdateCoordinator({ config: config.updates, stateDir: config.stateDir });
   const staged = await updates.stage("HEAD");
   const supervisorPath = join(updates.paths.root, "ompclaw-supervisor");
   replaceFileAtomically(join(staged.release.path, "ompclaw-supervisor"), supervisorPath, 0o700);
@@ -178,7 +179,6 @@ export async function installRpcService(
   configPath: string,
   envFile: string,
 ): Promise<ServiceInstallResult> {
-  if (!config.updates.enabled) return installRpcServiceUnlocked(config, configPath, envFile);
   const lockPath = gatewayUpdatePaths(config.stateDir).lock;
   return withGatewayUpdateLock(lockPath, () => installRpcServiceUnlocked(config, configPath, envFile));
 }
