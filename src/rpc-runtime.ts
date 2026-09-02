@@ -75,6 +75,7 @@ export interface RpcGatewayRuntimeOptions {
   readonly turnStore?: RpcRuntimeStore;
   readonly updates?: GatewayUpdateControl;
   readonly now?: () => number;
+  readonly readyTimeoutMs?: number;
   readonly createRpcClient?: (options: OmpRpcClientOptions) => RpcClient;
 }
 
@@ -643,9 +644,15 @@ export class RpcGatewayRuntime {
       )
         delete childEnv[key];
     }
+    const clientOptions = {
+      argv,
+      cwd: config.cwd,
+      env: childEnv,
+      ...(this.#options.readyTimeoutMs === undefined ? {} : { readyTimeoutMs: this.#options.readyTimeoutMs }),
+    };
     const rpc = this.#options.createRpcClient
-      ? this.#options.createRpcClient({ argv, cwd: config.cwd, env: childEnv })
-      : new OmpRpcClient({ argv, cwd: config.cwd, env: childEnv });
+      ? this.#options.createRpcClient(clientOptions)
+      : new OmpRpcClient(clientOptions);
     rpc.onFrame((frame) => {
       const handled = this.#frameQueue.then(() => this.#handleRpcFrame(frame));
       this.#frameQueue = handled.catch((error: unknown) => {

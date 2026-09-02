@@ -257,6 +257,19 @@ describe("RpcGatewayRuntime", () => {
     expect(source).not.toMatch(/from "\.\/(?:access|api|bridge|control|inbox|outbound)"/);
   });
 
+  test("passes the configured startup readiness budget to OMP", async () => {
+    const runtime = createRuntime({
+      config,
+      delivery: delivery(),
+      readyTimeoutMs: 45_000,
+    });
+
+    await runtime.start();
+    await runtime.stop();
+
+    expect(FakeOmpRpcClient.instances[0]?.options.readyTimeoutMs).toBe(45_000);
+  });
+
   test("persists queued, running, tool, terminal, and restart-interrupted task states", async () => {
     jest.useFakeTimers();
     const turns = new Map<string, TurnLifecycle>([
