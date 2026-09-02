@@ -49,7 +49,7 @@ export interface GatewayScheduledJobStore {
   deleteScheduledJob(id: string, principalId: string): boolean;
 }
 
-export type GatewaySchedulerTimer = ReturnType<typeof setTimeout> | number;
+export type GatewaySchedulerTimer = Parameters<typeof clearTimeout>[0];
 
 export interface GatewaySchedulerOptions {
   readonly store: GatewayScheduledJobStore;
@@ -94,7 +94,7 @@ export class GatewayScheduler implements GatewayAutomationControl {
     };
     this.#log = logger;
     this.#setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
-    this.#clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer as never));
+    this.#clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
   }
   start(): void {
     if (this.#started || this.#options.enabled === false) return;
