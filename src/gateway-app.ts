@@ -57,8 +57,8 @@ export interface GatewayApplicationStore
   migrateTelegramUpdateCheckpoint?(account: string): boolean;
   putPendingInteraction: GatewayStore["putPendingInteraction"];
   deletePendingInteraction: GatewayStore["deletePendingInteraction"];
- getSemanticView: GatewayStore["getSemanticView"];
- putSemanticView: GatewayStore["putSemanticView"];
+  getSemanticView: GatewayStore["getSemanticView"];
+  putSemanticView: GatewayStore["putSemanticView"];
 }
 
 export interface GatewayRuntime {
@@ -257,7 +257,8 @@ export class GatewayApplication {
         sessionFile: this.#sessionFile,
         onSessionState: (session) => this.#recordSessionState(session),
         ...(scheduler === undefined ? {} : { automation: scheduler }),
-        ...(updates === undefined ? {} : { updates, readyTimeoutMs: this.#config.updates.healthTimeoutMs }),
+        ...(updates === undefined ? {} : { updates }),
+        readyTimeoutMs: this.#config.updates.healthTimeoutMs,
         ...(isTurnLifecycleStore(store) ? { turnStore: store } : {}),
       });
       this.#runtime = runtime;

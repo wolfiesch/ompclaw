@@ -980,4 +980,15 @@ describe("GatewayStore", () => {
     expect(store.listSemanticViews().map((record) => record.address.thread)).toEqual(["topic-1"]);
     store.close();
   });
+
+  test("initializes SQLite with WAL mode and enforces foreign keys", () => {
+    const path = temporaryDatabase();
+    const store = new GatewayStore(path);
+    const database = new Database(path);
+    const journalMode = database.query("PRAGMA journal_mode").get() as { journal_mode: string };
+    expect(journalMode.journal_mode.toLowerCase()).toBe("wal");
+    database.close();
+    expect(() => store.bindIdentity(telegramOwner, "nonexistent-principal")).toThrow(/FOREIGN KEY/i);
+    store.close();
+  });
 });

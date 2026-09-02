@@ -124,35 +124,35 @@ export type PairingRequestState = "pending" | "approved" | "rejected" | "expired
  * from pairing service methods or rendered to an operator.
  */
 export interface StoredPairingRequest {
- readonly identity: TransportIdentity;
- readonly address: ConversationAddress;
- readonly codeHash: string;
- readonly codeSalt: string;
- readonly state: PairingRequestState;
- readonly failedAttempts: number;
- readonly maxAttempts: number;
- readonly createdAt: number;
- readonly expiresAt: number;
- readonly resolvedAt?: number;
- readonly principalId?: string;
+  readonly identity: TransportIdentity;
+  readonly address: ConversationAddress;
+  readonly codeHash: string;
+  readonly codeSalt: string;
+  readonly state: PairingRequestState;
+  readonly failedAttempts: number;
+  readonly maxAttempts: number;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  readonly resolvedAt?: number;
+  readonly principalId?: string;
 }
 
 export interface StorePairingRequestInput {
- readonly identity: TransportIdentity;
- readonly address: ConversationAddress;
- readonly codeHash: string;
- readonly codeSalt: string;
- readonly maxAttempts: number;
- readonly createdAt: number;
- readonly expiresAt: number;
+  readonly identity: TransportIdentity;
+  readonly address: ConversationAddress;
+  readonly codeHash: string;
+  readonly codeSalt: string;
+  readonly maxAttempts: number;
+  readonly createdAt: number;
+  readonly expiresAt: number;
 }
 
 export type PairingResolution =
- | { readonly status: "approved"; readonly request: StoredPairingRequest }
- | {
-  readonly status: "unavailable" | "expired" | "exhausted" | "identity-conflict";
-  readonly request?: StoredPairingRequest;
- };
+  | { readonly status: "approved"; readonly request: StoredPairingRequest }
+  | {
+      readonly status: "unavailable" | "expired" | "exhausted" | "identity-conflict";
+      readonly request?: StoredPairingRequest;
+    };
 
 export const LEGACY_TELEGRAM_STATE_MIGRATION = "legacy-telegram-state-v1";
 export const TELEGRAM_TOPIC_SESSION_MIGRATION = "telegram-topic-session-isolation-v1";
@@ -222,24 +222,24 @@ function validateAddress(address: ConversationAddress): void {
 }
 
 function validatePairingRequestInput(input: StorePairingRequestInput): void {
- validateIdentity(input.identity);
- validateAddress(input.address);
- if (input.identity.transport !== input.address.transport || input.identity.account !== input.address.account) {
-  throw new Error("pairing identity and address must share transport and account");
- }
- if (!/^[a-f0-9]{64}$/i.test(input.codeHash)) throw new Error("pairing code hash must be a SHA-256 hex digest");
- if (!/^[a-f0-9]{32,}$/i.test(input.codeSalt) || input.codeSalt.length % 2 !== 0) {
-  throw new Error("pairing code salt must be hexadecimal");
- }
- if (!Number.isSafeInteger(input.maxAttempts) || input.maxAttempts < 1 || input.maxAttempts > 5) {
-  throw new Error("pairing maximum attempts must be between one and five");
- }
- if (!Number.isSafeInteger(input.createdAt) || input.createdAt < 0) {
-  throw new Error("pairing created timestamp must be a safe nonnegative integer");
- }
- if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= input.createdAt) {
-  throw new Error("pairing expiry must follow creation");
- }
+  validateIdentity(input.identity);
+  validateAddress(input.address);
+  if (input.identity.transport !== input.address.transport || input.identity.account !== input.address.account) {
+    throw new Error("pairing identity and address must share transport and account");
+  }
+  if (!/^[a-f0-9]{64}$/i.test(input.codeHash)) throw new Error("pairing code hash must be a SHA-256 hex digest");
+  if (!/^[a-f0-9]{32,}$/i.test(input.codeSalt) || input.codeSalt.length % 2 !== 0) {
+    throw new Error("pairing code salt must be hexadecimal");
+  }
+  if (!Number.isSafeInteger(input.maxAttempts) || input.maxAttempts < 1 || input.maxAttempts > 5) {
+    throw new Error("pairing maximum attempts must be between one and five");
+  }
+  if (!Number.isSafeInteger(input.createdAt) || input.createdAt < 0) {
+    throw new Error("pairing created timestamp must be a safe nonnegative integer");
+  }
+  if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= input.createdAt) {
+    throw new Error("pairing expiry must follow creation");
+  }
 }
 
 function validateReceipt(value: unknown, context: string): void {
@@ -436,8 +436,8 @@ function decodePrincipal(row: SqlRow): Principal {
 }
 
 function decodeStoredPairingRequest(row: SqlRow): StoredPairingRequest {
- const context = "pairing request";
- const state = storedString(row, "state", context);
+  const context = "pairing request";
+  const state = storedString(row, "state", context);
   if (
     state !== "pending" &&
     state !== "approved" &&
@@ -445,53 +445,53 @@ function decodeStoredPairingRequest(row: SqlRow): StoredPairingRequest {
     state !== "expired" &&
     state !== "exhausted"
   ) {
-  throw new Error("corrupt stored pairing request: state is invalid");
- }
+    throw new Error("corrupt stored pairing request: state is invalid");
+  }
 
- const thread = storedString(row, "thread", context);
- const identity: TransportIdentity = {
-  transport: storedString(row, "transport", context),
-  account: storedString(row, "account", context),
-  subject: storedString(row, "subject", context),
- };
- const address: ConversationAddress = {
-  transport: identity.transport,
-  account: identity.account,
-  channel: storedString(row, "channel", context),
-  ...(thread === "" ? {} : { thread }),
- };
- const request: StoredPairingRequest = {
-  identity,
-  address,
-  codeHash: storedString(row, "code_hash", context),
-  codeSalt: storedString(row, "code_salt", context),
-  state,
-  failedAttempts: storedCount(row, "failed_attempts", context),
-  maxAttempts: storedCount(row, "max_attempts", context),
-  createdAt: storedTimestamp(row, "created_at", context),
-  expiresAt: storedTimestamp(row, "expires_at", context),
-  ...(row.resolved_at === null ? {} : { resolvedAt: storedTimestamp(row, "resolved_at", context) }),
-  ...(row.principal_id === null ? {} : { principalId: storedString(row, "principal_id", context) }),
- };
- validatePairingRequestInput({
-  identity: request.identity,
-  address: request.address,
-  codeHash: request.codeHash,
-  codeSalt: request.codeSalt,
-  maxAttempts: request.maxAttempts,
-  createdAt: request.createdAt,
-  expiresAt: request.expiresAt,
- });
- if (request.failedAttempts > request.maxAttempts) {
-  throw new Error("corrupt stored pairing request: failed attempts exceed maximum");
- }
- if (request.state === "pending" && (request.resolvedAt !== undefined || request.principalId !== undefined)) {
-  throw new Error("corrupt stored pairing request: pending request is resolved");
- }
- if (request.state === "approved" && (request.resolvedAt === undefined || request.principalId === undefined)) {
-  throw new Error("corrupt stored pairing request: approved request lacks principal");
- }
- return request;
+  const thread = storedString(row, "thread", context);
+  const identity: TransportIdentity = {
+    transport: storedString(row, "transport", context),
+    account: storedString(row, "account", context),
+    subject: storedString(row, "subject", context),
+  };
+  const address: ConversationAddress = {
+    transport: identity.transport,
+    account: identity.account,
+    channel: storedString(row, "channel", context),
+    ...(thread === "" ? {} : { thread }),
+  };
+  const request: StoredPairingRequest = {
+    identity,
+    address,
+    codeHash: storedString(row, "code_hash", context),
+    codeSalt: storedString(row, "code_salt", context),
+    state,
+    failedAttempts: storedCount(row, "failed_attempts", context),
+    maxAttempts: storedCount(row, "max_attempts", context),
+    createdAt: storedTimestamp(row, "created_at", context),
+    expiresAt: storedTimestamp(row, "expires_at", context),
+    ...(row.resolved_at === null ? {} : { resolvedAt: storedTimestamp(row, "resolved_at", context) }),
+    ...(row.principal_id === null ? {} : { principalId: storedString(row, "principal_id", context) }),
+  };
+  validatePairingRequestInput({
+    identity: request.identity,
+    address: request.address,
+    codeHash: request.codeHash,
+    codeSalt: request.codeSalt,
+    maxAttempts: request.maxAttempts,
+    createdAt: request.createdAt,
+    expiresAt: request.expiresAt,
+  });
+  if (request.failedAttempts > request.maxAttempts) {
+    throw new Error("corrupt stored pairing request: failed attempts exceed maximum");
+  }
+  if (request.state === "pending" && (request.resolvedAt !== undefined || request.principalId !== undefined)) {
+    throw new Error("corrupt stored pairing request: pending request is resolved");
+  }
+  if (request.state === "approved" && (request.resolvedAt === undefined || request.principalId === undefined)) {
+    throw new Error("corrupt stored pairing request: approved request lacks principal");
+  }
+  return request;
 }
 
 function decodeConversationBinding(row: SqlRow): ConversationBinding {
@@ -771,20 +771,20 @@ const SCHEDULED_JOB_FIELDS = [
 ].join(", ");
 
 const PAIRING_REQUEST_FIELDS = [
- "transport",
- "account",
- "subject",
- "channel",
- "thread",
- "code_hash",
- "code_salt",
- "state",
- "failed_attempts",
- "max_attempts",
- "created_at",
- "expires_at",
- "resolved_at",
- "principal_id",
+  "transport",
+  "account",
+  "subject",
+  "channel",
+  "thread",
+  "code_hash",
+  "code_salt",
+  "state",
+  "failed_attempts",
+  "max_attempts",
+  "created_at",
+  "expires_at",
+  "resolved_at",
+  "principal_id",
 ].join(", ");
 
 function validateScheduledJob(job: ScheduledJob): void {
@@ -892,8 +892,9 @@ export class GatewayStore implements GatewaySemanticViewStore {
 
     this.#database.exec(`
       PRAGMA foreign_keys = ON;
-      PRAGMA synchronous = FULL;
-
+      PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
+      PRAGMA synchronous = NORMAL;
       CREATE TABLE IF NOT EXISTS principals (
         id TEXT PRIMARY KEY NOT NULL,
         roles_json TEXT NOT NULL
@@ -2310,26 +2311,26 @@ export class GatewayStore implements GatewaySemanticViewStore {
     });
   }
 
- #readPairingRequest(identity: TransportIdentity): StoredPairingRequest | undefined {
-  const row = this.#database
-   .query(
-    `SELECT ${PAIRING_REQUEST_FIELDS}
+  #readPairingRequest(identity: TransportIdentity): StoredPairingRequest | undefined {
+    const row = this.#database
+      .query(
+        `SELECT ${PAIRING_REQUEST_FIELDS}
          FROM pairing_requests
          WHERE transport = ? AND account = ? AND subject = ?`,
-   )
-   .get(identity.transport, identity.account, identity.subject) as SqlRow | null;
-  return row === null ? undefined : decodeStoredPairingRequest(row);
- }
+      )
+      .get(identity.transport, identity.account, identity.subject) as SqlRow | null;
+    return row === null ? undefined : decodeStoredPairingRequest(row);
+  }
 
- #expirePairingRequests(now: number): number {
-  return this.#database
-   .query(
-    `UPDATE pairing_requests
+  #expirePairingRequests(now: number): number {
+    return this.#database
+      .query(
+        `UPDATE pairing_requests
          SET state = 'expired', resolved_at = ?
          WHERE state = 'pending' AND expires_at <= ?`,
-   )
-   .run(now, now).changes;
- }
+      )
+      .run(now, now).changes;
+  }
 
   #readSemanticView(address: ConversationAddress, viewId: string): StoredSemanticView | undefined {
     const row = this.#database
