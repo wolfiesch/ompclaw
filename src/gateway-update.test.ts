@@ -266,6 +266,12 @@ describe("transactional gateway updates", () => {
 
     expect(sent).toEqual([`OmpClaw update ${candidate.id} is active.`]);
     expect(readUpdateRequest(coordinator.paths.request)?.status).toBe("notified");
+    expect(readUpdateResult(coordinator.paths.result)).toMatchObject({
+      requestId: request.id,
+      status: "succeeded",
+      releaseId: candidate.id,
+      previousReleaseId: previous.id,
+    });
   });
 
   test("hands off to the candidate supervisor only after gateway readiness", async () => {

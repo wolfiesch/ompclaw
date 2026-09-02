@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Initialize SQLite storage with WAL journal mode and busy timeout to avoid database locking under concurrent operations.
+- Forward the configured startup readiness budget to the OMP RPC runtime across all gateway startup configurations.
+- Retain transactional update outcome records across service activations.
+
 ## 0.10.1 (2026-09-01)
 
 ### Fixed

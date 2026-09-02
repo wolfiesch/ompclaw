@@ -452,6 +452,7 @@ describe("GatewayApplication", () => {
     await waitFor(() => store.bindings.length === 1);
 
     expect(runtimeOptions?.sessionFile).toBeUndefined();
+    expect(runtimeOptions?.readyTimeoutMs).toBe(30_000);
     expect(store.checkpoint.get("omp/session_file")).toBe("/sessions/one");
     expect(store.bindings).toEqual([
       {
