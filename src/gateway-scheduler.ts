@@ -49,6 +49,8 @@ export interface GatewayScheduledJobStore {
   deleteScheduledJob(id: string, principalId: string): boolean;
 }
 
+export type GatewaySchedulerTimer = ReturnType<typeof setTimeout> | number;
+
 export interface GatewaySchedulerOptions {
   readonly store: GatewayScheduledJobStore;
   readonly dispatch: (job: ScheduledJob, scheduledFor: number) => Promise<void>;
@@ -57,8 +59,8 @@ export interface GatewaySchedulerOptions {
   readonly retryDelayMs?: number;
   readonly maxAttempts?: number;
   readonly now?: () => number;
-  readonly setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
-  readonly clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  readonly setTimer?: (callback: () => void, delayMs: number) => GatewaySchedulerTimer;
+  readonly clearTimer?: (timer: GatewaySchedulerTimer) => void;
   readonly onPermanentFailure?: (job: ScheduledJob, error: Error) => Promise<void> | void;
 }
 
@@ -77,7 +79,9 @@ export class ScheduledDispatchBusyError extends Error {
 export class GatewayScheduler implements GatewayAutomationControl {
   readonly #options: Required<Pick<GatewaySchedulerOptions, "pollIntervalMs" | "retryDelayMs" | "maxAttempts">> & GatewaySchedulerOptions;
   readonly #log: GatewaySchedulerLogger;
-  #timer: ReturnType<typeof setTimeout> | undefined;
+  readonly #setTimer: (callback: () => void, delayMs: number) => GatewaySchedulerTimer;
+  readonly #clearTimer: (timer: GatewaySchedulerTimer) => void;
+  #timer: GatewaySchedulerTimer | undefined;
   #started = false;
   #running = false;
 
@@ -89,8 +93,9 @@ export class GatewayScheduler implements GatewayAutomationControl {
       maxAttempts: boundedInteger(options.maxAttempts ?? 3, "scheduler max attempts", 1, 10),
     };
     this.#log = logger;
+    this.#setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.#clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer as never));
   }
-
   start(): void {
     if (this.#started || this.#options.enabled === false) return;
     this.#started = true;
@@ -99,7 +104,7 @@ export class GatewayScheduler implements GatewayAutomationControl {
 
   stop(): void {
     this.#started = false;
-    if (this.#timer !== undefined) (this.#options.clearTimer ?? clearTimeout)(this.#timer);
+    if (this.#timer !== undefined) this.#clearTimer(this.#timer);
     this.#timer = undefined;
   }
 
@@ -327,13 +332,13 @@ export class GatewayScheduler implements GatewayAutomationControl {
 
   #wake(): void {
     if (!this.#started) return;
-    if (this.#timer !== undefined) (this.#options.clearTimer ?? clearTimeout)(this.#timer);
+    if (this.#timer !== undefined) this.#clearTimer(this.#timer);
     this.#schedule(0);
   }
 
   #schedule(delayMs: number): void {
     if (!this.#started) return;
-    this.#timer = (this.#options.setTimer ?? setTimeout)(() => {
+    this.#timer = this.#setTimer(() => {
       this.#timer = undefined;
       void this.runDue().catch((error) => this.#log.error(`Scheduled job poll failed: ${String(error)}`)).finally(() => {
         this.#schedule(this.#options.pollIntervalMs);

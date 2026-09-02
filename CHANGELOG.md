@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.10.1 (2026-09-01)
+
+### Fixed
+
+- Include missing production modules (`gateway-ingress-composer`, `gateway-views`, `rpc-semantic-views`, and `transports/telegram/semantic-views`) in the published npm package files list.
+- Normalize scheduler timer typing across Node and Bun environments.
+
 ## 0.10.0 (2026-09-01)
 
 ### Added
