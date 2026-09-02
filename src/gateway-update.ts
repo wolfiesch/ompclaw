@@ -275,7 +275,6 @@ export class GatewayUpdateCoordinator implements GatewayUpdateControl {
             origin: request.origin.address,
           });
           writeJsonAtomic(this.#paths.request, { ...request, status: "notified" } satisfies GatewayUpdateRequest);
-          rmSync(this.#paths.result, { force: true });
           rmSync(join(this.#paths.ready, `${request.id}.json`), { force: true });
           return;
         } catch {
