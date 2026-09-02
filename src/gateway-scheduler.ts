@@ -49,7 +49,7 @@ export interface GatewayScheduledJobStore {
   deleteScheduledJob(id: string, principalId: string): boolean;
 }
 
-export type GatewaySchedulerTimer = Parameters<typeof clearTimeout>[0];
+export type GatewaySchedulerTimer = NonNullable<Parameters<typeof clearTimeout>[0]>;
 
 export interface GatewaySchedulerOptions {
   readonly store: GatewayScheduledJobStore;
