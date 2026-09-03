@@ -192,15 +192,32 @@ export function summarizeMessage(message: unknown): string {
   return text ? `${role}: ${text}` : "";
 }
 
-export function activityForTool(toolName: string): string {
+interface ToolActivity {
+  readonly emoji: string;
+  readonly label: string;
+}
+
+function toolActivity(toolName: string): ToolActivity {
   const name = toolName.toLowerCase();
-  if (/(?:read|grep|glob|search|web|browser|lsp|recall|memory_get)/.test(name)) return "Reviewing context";
-  if (/(?:edit|write|resolve|patch|ast)/.test(name)) return "Making changes";
-  if (/(?:bash|eval|test|check|diagnostic|debug)/.test(name)) return "Checking the result";
-  if (/(?:task|agent|hub|todo)/.test(name)) return "Coordinating the work";
-  if (/(?:memory|mnemopi|retain|remember)/.test(name)) return "Updating memory";
-  if (/(?:ask|confirm)/.test(name)) return "Waiting for your input";
-  return "Working";
+  if (/(?:browser|web)/.test(name)) return { emoji: "🌐", label: "Browsing the web" };
+  if (/(?:memory|mnemopi|retain|remember|recall)/.test(name)) return { emoji: "🧠", label: "Updating memory" };
+  if (/(?:read|grep|glob|search|lsp)/.test(name)) return { emoji: "📖", label: "Reviewing context" };
+  if (/(?:edit|write|resolve|patch|ast)/.test(name)) return { emoji: "✍️", label: "Making changes" };
+  if (/(?:test|check|diagnostic|debug)/.test(name)) return { emoji: "🧪", label: "Checking the result" };
+  if (/(?:bash|eval)/.test(name)) return { emoji: "🖥️", label: "Running a command" };
+  if (/todo/.test(name)) return { emoji: "📋", label: "Updating the plan" };
+  if (/(?:task|agent|hub)/.test(name)) return { emoji: "🧭", label: "Coordinating the work" };
+  if (/(?:ask|confirm)/.test(name)) return { emoji: "✋", label: "Waiting for your input" };
+  return { emoji: "⚙️", label: "Working" };
+}
+
+export function activityForTool(toolName: string): string {
+  const activity = toolActivity(toolName);
+  return `${activity.emoji} ${activity.label}`;
+}
+
+function activityForDetail(toolName: string, detail: string): string {
+  return `${toolActivity(toolName).emoji} ${detail}`;
 }
 
 export function conciseActivity(value: unknown): string | undefined {
@@ -214,10 +231,11 @@ export function conciseActivity(value: unknown): string | undefined {
 }
 
 export function activityForFrame(frame: RpcRecord): string {
+  const toolName = typeof frame.toolName === "string" ? frame.toolName : undefined;
   const intent = conciseActivity(frame.intent);
-  if (intent !== undefined) return intent;
+  if (intent !== undefined) return toolName === undefined ? intent : activityForDetail(toolName, intent);
   const args = isRecord(frame.args) ? frame.args : undefined;
   const described = conciseActivity(args?.i);
-  if (described !== undefined) return described;
-  return activityForTool(typeof frame.toolName === "string" ? frame.toolName : "tool");
+  if (described !== undefined) return toolName === undefined ? described : activityForDetail(toolName, described);
+  return activityForTool(toolName ?? "tool");
 }

@@ -64,15 +64,24 @@ describe("rpc-commands", () => {
     expect(review).toContain("always-ask");
   });
 
-  test("derives descriptive tool activity and frame descriptions", () => {
-    expect(activityForTool("read")).toBe("Reviewing context");
-    expect(activityForTool("edit")).toBe("Making changes");
-    expect(activityForTool("bash")).toBe("Checking the result");
-    expect(activityForTool("unknown")).toBe("Working");
+  test("derives emoji-coded tool activity and preserves descriptive frame details", () => {
+    expect(activityForTool("read")).toBe("📖 Reviewing context");
+    expect(activityForTool("browser")).toBe("🌐 Browsing the web");
+    expect(activityForTool("edit")).toBe("✍️ Making changes");
+    expect(activityForTool("bash")).toBe("🖥️ Running a command");
+    expect(activityForTool("test")).toBe("🧪 Checking the result");
+    expect(activityForTool("todo")).toBe("📋 Updating the plan");
+    expect(activityForTool("task")).toBe("🧭 Coordinating the work");
+    expect(activityForTool("retain")).toBe("🧠 Updating memory");
+    expect(activityForTool("ask")).toBe("✋ Waiting for your input");
+    expect(activityForTool("unknown")).toBe("⚙️ Working");
 
     expect(activityForFrame({ intent: "Inspecting configuration" })).toBe("Inspecting configuration");
-    expect(activityForFrame({ args: { i: "Running tests" } })).toBe("Running tests");
-    expect(activityForFrame({ toolName: "read" })).toBe("Reviewing context");
+    expect(activityForFrame({ toolName: "read", intent: "Inspecting configuration" })).toBe(
+      "📖 Inspecting configuration",
+    );
+    expect(activityForFrame({ toolName: "bash", args: { i: "Running tests" } })).toBe("🖥️ Running tests");
+    expect(activityForFrame({ toolName: "read" })).toBe("📖 Reviewing context");
   });
 
   test("summarizes messages and values", () => {

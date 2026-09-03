@@ -337,7 +337,7 @@ describe("RpcGatewayRuntime", () => {
         call.request?.type === "semantic_view" &&
         call.request.view.kind === "task" &&
         call.request.view.sections.some(
-          (section) => section.id === "activity" && section.text.includes("Checking deployment result"),
+          (section) => section.id === "activity" && section.text.includes("🖥️ Checking deployment result"),
         ),
     );
     expect(visibleTaskCard?.request).toMatchObject({
