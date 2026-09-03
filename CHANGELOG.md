@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
 - Correlate message replies to semantic view task cards, decision prompts, and turn results as structured targets (`task_card`, `decision`, `turn_result`, `interaction`) in the OMP prompt envelope.
 - Preserve inbound reply context and target metadata across composed multipart ingress fragments.
 
+### Changed
+
+- Decompose OMP RPC runtime into focused rpc-prompt and rpc-commands modules.
+
 ### Fixed
 
 - Initialize SQLite storage with WAL journal mode and busy timeout to avoid database locking under concurrent operations.
