@@ -64,7 +64,7 @@ describe("rpc-commands", () => {
     expect(review).toContain("always-ask");
   });
 
-  test("derives emoji-coded tool activity and preserves descriptive frame details", () => {
+  test("derives category activity and allows only bounded safe tool previews", () => {
     expect(activityForTool("read")).toBe("📖 Reviewing context");
     expect(activityForTool("browser")).toBe("🌐 Browsing the web");
     expect(activityForTool("edit")).toBe("✍️ Making changes");
@@ -77,10 +77,15 @@ describe("rpc-commands", () => {
     expect(activityForTool("unknown")).toBe("⚙️ Working");
 
     expect(activityForFrame({ intent: "Inspecting configuration" })).toBe("Inspecting configuration");
-    expect(activityForFrame({ toolName: "read", intent: "Inspecting configuration" })).toBe(
-      "📖 Inspecting configuration",
+    expect(activityForFrame({ toolName: "read", args: { path: "/tmp/project/src/rpc-runtime.ts" } })).toBe(
+      "📖 Reviewing context · src/rpc-runtime.ts",
     );
-    expect(activityForFrame({ toolName: "bash", args: { i: "Running tests" } })).toBe("🖥️ Running tests");
+    expect(activityForFrame({ toolName: "browser", args: { url: "https://example.com/private/path" } })).toBe(
+      "🌐 Browsing the web · example.com",
+    );
+    expect(activityForFrame({ toolName: "bash", args: { i: "Running echo TOP_SECRET", command: "echo TOP_SECRET" } })).toBe(
+      "🖥️ Running a command",
+    );
     expect(activityForFrame({ toolName: "read" })).toBe("📖 Reviewing context");
   });
 

@@ -255,9 +255,9 @@ export function conciseActivity(value: unknown): string | undefined {
 
 export function activityForFrame(frame: RpcRecord): string {
   const toolName = typeof frame.toolName === "string" ? frame.toolName : undefined;
-  const intent = conciseActivity(frame.intent) ?? conciseActivity(isRecord(frame.args) ? frame.args.i : undefined);
-  if (toolName === undefined) return intent ?? activityForTool("tool");
-  if (intent !== undefined) return `${toolActivity(toolName).emoji} ${intent}`;
+  if (toolName === undefined) {
+    return conciseActivity(frame.intent) ?? conciseActivity(isRecord(frame.args) ? frame.args.i : undefined) ?? activityForTool("tool");
+  }
   const preview = safeToolPreview(toolName, isRecord(frame.args) ? frame.args : undefined);
   return preview === undefined ? activityForTool(toolName) : `${activityForTool(toolName)} · ${preview}`;
 }

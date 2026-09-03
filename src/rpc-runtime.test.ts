@@ -337,7 +337,7 @@ describe("RpcGatewayRuntime", () => {
         call.request?.type === "semantic_view" &&
         call.request.view.kind === "task" &&
         call.request.view.sections.some(
-          (section) => section.id === "activity" && section.text.includes("🖥️ Checking deployment result"),
+          (section) => section.id === "activity" && section.text.includes("🖥️ Running a command"),
         ),
     );
     expect(visibleTaskCard?.request).toMatchObject({
@@ -410,9 +410,9 @@ describe("RpcGatewayRuntime", () => {
       .filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view")
       .flatMap((call) => (call.request?.type === "semantic_view" ? [call.request.view] : []))
       .filter((view) => view.id.startsWith("task_"));
-    expect(
-      taskViews.some((view) => view.sections.some((section) => section.text.includes("Checking deployment result"))),
-    ).toBe(true);
+    expect(taskViews.some((view) => view.sections.some((section) => section.text.includes("🖥️ Running a command")))).toBe(
+      true,
+    );
     expect(taskViews.at(-1)).toMatchObject({ kind: "result", state: "completed" });
     expect(JSON.stringify(taskViews)).not.toContain("bash");
     expect(JSON.stringify(taskViews)).not.toContain("TOP_SECRET");
