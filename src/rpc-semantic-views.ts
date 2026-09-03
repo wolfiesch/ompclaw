@@ -6,7 +6,12 @@ import type { TurnLifecycle } from "./gateway-store";
 import type { SemanticView, SemanticViewState } from "./gateway-views";
 
 const MAX_SUMMARY_CHARS = 512;
-const MAX_ACTIVITY_ITEMS = 8;
+const MAX_ACTIVITY_ITEMS = 4;
+
+export interface TaskSemanticActivity {
+  readonly text: string;
+  readonly state: "active" | "completed";
+}
 
 export interface TaskSemanticTodo {
   readonly content: string;
@@ -39,20 +44,30 @@ function taskState(state: TurnLifecycle["state"]): SemanticViewState {
   return "cancelled";
 }
 
-function taskLabel(state: TurnLifecycle["state"]): string {
-  if (state === "queued") return "Queued";
-  if (state === "running") return "Working";
-  if (state === "completed") return "Completed";
-  if (state === "failed") return "Failed";
-  if (state === "stopped") return "Stopped";
-  return "Interrupted";
+function elapsedText(startedAt: number, endedAt: number): string {
+  const seconds = Math.max(0, Math.floor((endedAt - startedAt) / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`;
+}
+
+function taskTitle(lifecycle: TurnLifecycle, heartbeat: boolean): string {
+  const elapsed = elapsedText(lifecycle.createdAt, lifecycle.finishedAt ?? lifecycle.updatedAt);
+  if (lifecycle.state === "queued") return "🔵 Queued";
+  if (lifecycle.state === "running") return `${heartbeat ? "⏳ Still working" : "🟡 Working"} · ${elapsed}`;
+  if (lifecycle.state === "completed") return `✅ Completed · ${elapsed}`;
+  if (lifecycle.state === "failed") return `⚠️ Failed · ${elapsed}`;
+  if (lifecycle.state === "stopped") return `⏹ Stopped · ${elapsed}`;
+  return `⚠️ Interrupted · ${elapsed}`;
 }
 
 export function taskSemanticView(
   lifecycle: TurnLifecycle,
-  activities: readonly string[],
+  activities: readonly TaskSemanticActivity[],
   version: number,
   todoPhases: readonly TaskSemanticTodoPhase[] = [],
+  heartbeat = false,
 ): SemanticView {
   const terminal =
     lifecycle.state === "completed" ||
@@ -61,8 +76,9 @@ export function taskSemanticView(
     lifecycle.state === "interrupted";
   const activityLines = activities
     .slice(-MAX_ACTIVITY_ITEMS)
-    .map((activity) => activity.trim())
-    .filter(Boolean);
+    .map((activity) => ({ ...activity, text: activity.text.trim() }))
+    .filter((activity) => activity.text.length > 0);
+  const completedCount = activities.filter((activity) => activity.state === "completed").length;
   const todoSections = todoPhases.map((phase, index) => ({
     id: `todo_${index}`,
     label: phase.name,
@@ -83,37 +99,45 @@ export function taskSemanticView(
       .join("\n"),
     tone: "default" as const,
   }));
+  const collapsedSuccess = lifecycle.state === "completed";
   return {
     schemaVersion: 1,
     id: `task_${createHash("sha256").update(lifecycle.id).digest("hex").slice(0, 19)}`,
     kind: terminal ? "result" : "task",
     version,
     state: taskState(lifecycle.state),
-    title: terminal ? "Task result" : "Task",
+    title: taskTitle(lifecycle, heartbeat),
     summary: boundedSummary(lifecycle.prompt),
     sections: [
-      {
-        id: "status",
-        label: "Status",
-        text: taskLabel(lifecycle.state),
-        tone: lifecycle.state === "failed" ? "danger" : lifecycle.state === "completed" ? "success" : "default",
-      },
-      ...todoSections,
-      ...(activityLines.length === 0
-        ? []
-        : [
+      ...(collapsedSuccess
+        ? [
             {
-              id: "activity",
-              label: "Activity",
-              text: activityLines.map((activity) => `• ${activity}`).join("\n"),
-              tone: "muted" as const,
+              id: "progress",
+              label: "Progress",
+              text: `${completedCount} ${completedCount === 1 ? "action" : "actions"} completed`,
+              tone: "success" as const,
             },
+          ]
+        : [
+            ...todoSections,
+            ...(activityLines.length === 0
+              ? []
+              : [
+                  {
+                    id: "activity",
+                    label: "Recent activity",
+                    text: activityLines
+                      .map((activity) => `${activity.state === "completed" ? "✓" : "→"} ${activity.text}`)
+                      .join("\n"),
+                    tone: "muted" as const,
+                  },
+                ]),
           ]),
       ...(lifecycle.error === undefined
         ? []
         : [{ id: "error", label: "Error", text: "Use /status for details.", tone: "danger" as const }]),
     ],
-    actions: terminal ? [] : [{ id: "stop", label: "Stop", command: "/stop", style: "danger", enabled: true }],
+    actions: terminal ? [] : [{ id: "stop", label: "🛑 Stop", command: "/stop", style: "danger", enabled: true }],
     updatedAt: lifecycle.updatedAt,
     notification: "silent",
   };
@@ -260,6 +284,7 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
   const model = `${state?.model?.provider ?? "?"}/${state?.model?.id ?? "?"}`;
   const session = state?.sessionName?.trim() || state?.sessionId || "Starting";
   const status = state?.isStreaming ? "Running" : state?.isCompacting ? "Compacting" : "Idle";
+  const statusEmoji = state?.isStreaming ? "🟡" : state?.isCompacting ? "🟣" : "🟢";
   const context = state?.contextUsage?.percent;
   const contextText =
     typeof context === "number" && Number.isFinite(context) ? `${Math.round(context)}% context` : undefined;
@@ -270,27 +295,30 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
     kind: "home",
     version: input.version,
     state: state?.isStreaming || state?.isCompacting ? "active" : "waiting",
-    title: "OmpClaw control center",
+    title: `${statusEmoji} OmpClaw · ${status}`,
     summary: session,
     sections: [
-      { id: "session", label: "Session", text: [status, contextText, queueText].filter(Boolean).join(" · ") },
+      { id: "session", label: "Session", text: [contextText, queueText].filter(Boolean).join(" · ") || "Ready" },
       { id: "model", label: "Model", text: model },
-      { id: "autonomy", label: "Autonomy", text: input.autonomyLabel },
-      { id: "reasoning", label: "Reasoning", text: state?.thinkingLevel ?? "inherit" },
-      { id: "fast", label: "Fast mode", text: state?.fastModeEnabled ? "On" : "Off", tone: "muted" },
-      { id: "compaction", label: "Auto-compaction", text: state?.autoCompactionEnabled ? "On" : "Off", tone: "muted" },
+      { id: "mode", label: "Mode", text: `${input.autonomyLabel} · ${state?.thinkingLevel ?? "inherit"}` },
+      {
+        id: "controls",
+        label: "Controls",
+        text: `Fast ${state?.fastModeEnabled ? "on" : "off"} · Auto-compact ${state?.autoCompactionEnabled ? "on" : "off"}`,
+        tone: "muted",
+      },
     ],
     actions: [
-      { id: "status", label: "Status", command: "/status" },
-      { id: "model", label: "Model", command: "/model" },
-      { id: "autonomy", label: "Autonomy", command: "/autonomy" },
-      { id: "thinking", label: "Reasoning", command: "/thinking" },
-      { id: "fast", label: "Fast mode", command: "/fast" },
-      { id: "autocompact", label: "Auto-compaction", command: "/autocompact" },
-      { id: "tasks", label: "Tasks", command: "/tasks" },
-      { id: "jobs", label: "Scheduled jobs", command: "/jobs" },
-      { id: "new", label: "New session", command: "/new", style: "primary" },
-      ...(state?.isStreaming ? [{ id: "stop", label: "Stop", command: "/stop", style: "danger" as const }] : []),
+      { id: "status", label: "📊 Status", command: "/status" },
+      { id: "model", label: "🤖 Model", command: "/model" },
+      { id: "autonomy", label: "🛡 Autonomy", command: "/autonomy" },
+      { id: "thinking", label: "🧠 Reasoning", command: "/thinking" },
+      { id: "fast", label: "⚡ Fast mode", command: "/fast" },
+      { id: "autocompact", label: "🗜 Auto-compact", command: "/autocompact" },
+      { id: "tasks", label: "📋 Tasks", command: "/tasks" },
+      { id: "jobs", label: "🗓 Jobs", command: "/jobs" },
+      { id: "new", label: "✨ New session", command: "/new", style: "primary" },
+      ...(state?.isStreaming ? [{ id: "stop", label: "🛑 Stop", command: "/stop", style: "danger" as const }] : []),
     ],
     updatedAt: input.updatedAt,
   };

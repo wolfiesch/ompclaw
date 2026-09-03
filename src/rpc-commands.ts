@@ -215,9 +215,32 @@ export function activityForTool(toolName: string): string {
   const activity = toolActivity(toolName);
   return `${activity.emoji} ${activity.label}`;
 }
+function safePathPreview(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const segments = value
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean);
+  const projectRoot = segments.findLastIndex((segment) => ["src", "docs", "test", "tests"].includes(segment));
+  const preview = projectRoot >= 0 ? segments.slice(projectRoot).join("/") : segments.at(-1);
+  return preview === undefined || preview.length === 0 ? undefined : preview.slice(0, 80);
+}
 
-function activityForDetail(toolName: string, detail: string): string {
-  return `${toolActivity(toolName).emoji} ${detail}`;
+function safeHostPreview(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    return new URL(value).hostname || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeToolPreview(toolName: string, args: RpcRecord | undefined): string | undefined {
+  const name = toolName.toLowerCase();
+  if (/(?:browser|web)/.test(name)) return safeHostPreview(args?.url);
+  if (/(?:read|grep|glob|edit|write|resolve|patch|ast|lsp)/.test(name))
+    return safePathPreview(args?.path ?? args?.file);
+  return undefined;
 }
 
 export function conciseActivity(value: unknown): string | undefined {
@@ -232,10 +255,9 @@ export function conciseActivity(value: unknown): string | undefined {
 
 export function activityForFrame(frame: RpcRecord): string {
   const toolName = typeof frame.toolName === "string" ? frame.toolName : undefined;
-  const intent = conciseActivity(frame.intent);
-  if (intent !== undefined) return toolName === undefined ? intent : activityForDetail(toolName, intent);
-  const args = isRecord(frame.args) ? frame.args : undefined;
-  const described = conciseActivity(args?.i);
-  if (described !== undefined) return toolName === undefined ? described : activityForDetail(toolName, described);
-  return activityForTool(toolName ?? "tool");
+  if (toolName === undefined) {
+    return conciseActivity(frame.intent) ?? conciseActivity(isRecord(frame.args) ? frame.args.i : undefined) ?? activityForTool("tool");
+  }
+  const preview = safeToolPreview(toolName, isRecord(frame.args) ? frame.args : undefined);
+  return preview === undefined ? activityForTool(toolName) : `${activityForTool(toolName)} · ${preview}`;
 }

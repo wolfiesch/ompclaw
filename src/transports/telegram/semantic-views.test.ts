@@ -114,13 +114,12 @@ describe("Telegram semantic views", () => {
     const second = renderTelegramSemanticView(semanticView());
 
     expect(first).toEqual({
-      text: "Gateway status\n[active]\n\nOne active session\n\nActivity\n[muted] Waiting for input\n\nHealth\n[success] Connected",
-      plainFallbackText:
-        "Gateway status\n[active]\n\nOne active session\n\nActivity\n[muted] Waiting for input\n\nHealth\n[success] Connected",
+      text: "Gateway status\n\nOne active session\n\nActivity\nWaiting for input\n\nHealth\n✅ Connected",
+      plainFallbackText: "Gateway status\n\nOne active session\n\nActivity\nWaiting for input\n\nHealth\n✅ Connected",
       replyMarkup: {
         inline_keyboard: [
           [{ text: "Resume", callback_data: "s1.home.1.resume" }],
-          [{ text: "! Stop", callback_data: "s1.home.1.stop" }],
+          [{ text: "⚠️ Stop", callback_data: "s1.home.1.stop" }],
         ],
       },
       notification: "silent",

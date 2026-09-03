@@ -337,12 +337,21 @@ describe("RpcGatewayRuntime", () => {
         call.request?.type === "semantic_view" &&
         call.request.view.kind === "task" &&
         call.request.view.sections.some(
-          (section) => section.id === "activity" && section.text.includes("🖥️ Checking deployment result"),
+          (section) => section.id === "activity" && section.text.includes("🖥️ Running a command"),
         ),
     );
     expect(visibleTaskCard?.request).toMatchObject({
       type: "semantic_view",
       view: { notification: "silent", state: "active" },
+    });
+
+    jest.advanceTimersByTime(45_000);
+    await settle();
+    expect(
+      deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
+        ?.request,
+    ).toMatchObject({
+      view: { title: expect.stringContaining("⏳ Still working") },
     });
     rpc.emit({ type: "tool_execution_end", toolName: "bash" });
     await settle();
@@ -380,6 +389,17 @@ describe("RpcGatewayRuntime", () => {
           call.request.view.state === "completed",
       ),
     );
+    const completedCard = deliveries
+      .filter(
+        (call) =>
+          call.method === "presentUi" &&
+          call.request?.type === "semantic_view" &&
+          call.request.view.kind === "result",
+      )
+      .at(-1)?.request;
+    expect(completedCard).toMatchObject({
+      view: { sections: [{ id: "progress", label: "Progress", tone: "success" }] },
+    });
 
     expect(turns.get("lifecycle-Deploy carefully")).toMatchObject({
       state: "completed",
@@ -390,9 +410,9 @@ describe("RpcGatewayRuntime", () => {
       .filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view")
       .flatMap((call) => (call.request?.type === "semantic_view" ? [call.request.view] : []))
       .filter((view) => view.id.startsWith("task_"));
-    expect(
-      taskViews.some((view) => view.sections.some((section) => section.text.includes("Checking deployment result"))),
-    ).toBe(true);
+    expect(taskViews.some((view) => view.sections.some((section) => section.text.includes("🖥️ Running a command")))).toBe(
+      true,
+    );
     expect(taskViews.at(-1)).toMatchObject({ kind: "result", state: "completed" });
     expect(JSON.stringify(taskViews)).not.toContain("bash");
     expect(JSON.stringify(taskViews)).not.toContain("TOP_SECRET");
@@ -1406,8 +1426,8 @@ describe("RpcGatewayRuntime", () => {
     expect(home).toMatchObject({
       type: "semantic_view",
       view: {
-        title: "OmpClaw control center",
-        actions: expect.arrayContaining([{ id: "model", label: "Model", command: "/model" }]),
+        title: "🟢 OmpClaw · Idle",
+        actions: expect.arrayContaining([{ id: "model", label: "🤖 Model", command: "/model" }]),
       },
     });
 
@@ -1439,7 +1459,7 @@ describe("RpcGatewayRuntime", () => {
     expect(
       deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
         ?.request,
-    ).toMatchObject({ type: "semantic_view", view: { title: "OmpClaw control center" } });
+    ).toMatchObject({ type: "semantic_view", view: { title: "🟢 OmpClaw · Idle" } });
     await runtime.stop();
   });
 
@@ -1465,8 +1485,8 @@ describe("RpcGatewayRuntime", () => {
       expect(home).toMatchObject({
         type: "semantic_view",
         view: {
-          sections: expect.arrayContaining([{ id: "autonomy", label: "Autonomy", text: label }]),
-          actions: expect.arrayContaining([{ id: "autonomy", label: "Autonomy", command: "/autonomy" }]),
+          sections: expect.arrayContaining([{ id: "mode", label: "Mode", text: `${label} · inherit` }]),
+          actions: expect.arrayContaining([{ id: "autonomy", label: "🛡 Autonomy", command: "/autonomy" }]),
         },
       });
 

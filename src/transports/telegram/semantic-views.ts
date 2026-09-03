@@ -75,11 +75,11 @@ function assertCallback(value: TelegramSemanticCallback): void {
 }
 
 function sectionText(view: SemanticView): readonly string[] {
-  const sections: string[] = [`${view.title}\n[${view.state}]`];
+  const sections: string[] = [view.title];
   if (view.summary !== undefined) sections.push(view.summary);
   for (const section of view.sections) {
-    const text =
-      section.tone === undefined || section.tone === "default" ? section.text : `[${section.tone}] ${section.text}`;
+    const prefix = section.tone === "success" ? "✅ " : section.tone === "danger" ? "⚠️ " : "";
+    const text = `${prefix}${section.text}`;
     sections.push(section.label === undefined ? text : `${section.label}\n${text}`);
   }
   return sections;
@@ -131,7 +131,7 @@ function telegramActionRows(view: SemanticView): TelegramSemanticInlineButton[][
   for (const action of view.actions) {
     if (action.enabled === false) continue;
     const button = {
-      text: action.style === "danger" ? `! ${action.label}` : action.label,
+      text: action.style === "danger" && !action.label.startsWith("🛑") ? `⚠️ ${action.label}` : action.label,
       callback_data: encodeTelegramSemanticCallback({
         schemaVersion: view.schemaVersion,
         viewId: view.id,

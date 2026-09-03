@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.11.0 (2026-09-03)
+
 ### Added
 
 - Add Telegram Deep Reply Context: extract Telegram Bot API 7.0+ text quotes, external reply origin metadata, and synthesized media descriptions for captionless replies.
