@@ -134,6 +134,7 @@ export interface TelegramAdapterHarness {
   readonly checkpoints: Map<string, JsonValue>;
   readonly pending: Map<string, PendingInteraction>;
   readonly poller: TelegramTestPoller;
+  readonly semanticViews: Map<string, StoredSemanticView>;
   readonly received: InboundEnvelope[];
   readonly stateDir: string;
   readonly warnings: string[];
@@ -233,6 +234,20 @@ export async function createTelegramAdapterHarness(
       listPendingInboundMessages: () => pendingInbound,
       listPendingIngressCompositions: () => pendingIngress,
       getSemanticView: (address, viewId) => semanticViews.get(semanticKey(address, viewId)),
+      getSemanticViewByReceipt: (address, messageId) => {
+        for (const view of semanticViews.values()) {
+          if (
+            view.address.transport === address.transport &&
+            view.address.account === address.account &&
+            view.address.channel === address.channel &&
+            view.address.thread === address.thread &&
+            view.receipts.some((receipt) => receipt.messageId === messageId)
+          ) {
+            return view;
+          }
+        }
+        return undefined;
+      },
       putSemanticView: (record) => {
         semanticViews.set(semanticKey(record.address, record.view.id), record);
         return true;
@@ -276,6 +291,7 @@ export async function createTelegramAdapterHarness(
     pending,
     poller: api.poller,
     received,
+    semanticViews,
     stateDir,
     warnings,
     flushPairingApprovals: () => api.flushPairingApprovals(),

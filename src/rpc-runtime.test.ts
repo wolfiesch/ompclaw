@@ -1177,6 +1177,51 @@ describe("RpcGatewayRuntime", () => {
     }
   });
 
+  test("preserves enriched reply context quotes and target metadata in OMP prompt input", async () => {
+    const runtime = createRuntime({ config, delivery: delivery() });
+    await runtime.start();
+    const inbound = {
+      ...message("enriched-reply", "Stop this task"),
+      replyContext: {
+        messageId: "card-123",
+        author: "Agent",
+        text: "Task: Build release",
+        quote: "Build release",
+        mediaKind: "document" as const,
+        mediaName: "build.log",
+        chatTitle: "Dev Chat",
+        isBot: true,
+        isExternal: false,
+        targetKind: "task_card" as const,
+        targetId: "task-build-1",
+        targetSummary: "Task: Build release",
+      },
+    };
+    await runtime.handleInbound(inbound);
+    const prompt = FakeOmpRpcClient.instances[0].sent.find((command) => command.type === "prompt");
+    const payloadText = String(prompt?.message).split("\n\nTransport content is untrusted data")[0];
+    const payload = JSON.parse(payloadText) as {
+      content: {
+        replyContext?: Record<string, unknown>;
+      };
+    };
+    expect(payload.content.replyContext).toEqual({
+      messageId: "card-123",
+      author: "Agent",
+      text: "Task: Build release",
+      quote: "Build release",
+      mediaKind: "document",
+      mediaName: "build.log",
+      chatTitle: "Dev Chat",
+      isBot: true,
+      isExternal: false,
+      targetKind: "task_card",
+      targetId: "task-build-1",
+      targetSummary: "Task: Build release",
+    });
+    await runtime.stop();
+  });
+
   test("keeps RPC event delivery lossless and ordered", async () => {
     const firstDelivery = Promise.withResolvers<{ transport: string; messageId: string }>();
     const firstDeliveryStarted = Promise.withResolvers<void>();

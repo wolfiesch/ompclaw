@@ -133,6 +133,18 @@ describe("GatewayCore", () => {
       gateway.receive({ ...valid, replyContext: { messageId: 42 } } as unknown as InboundEnvelope),
     ).rejects.toThrow(InvalidInboundReplyContextError);
     await expect(
+      gateway.receive({
+        ...valid,
+        replyContext: { messageId: "42", mediaKind: "invalid-kind" },
+      } as unknown as InboundEnvelope),
+    ).rejects.toThrow(InvalidInboundReplyContextError);
+    await expect(
+      gateway.receive({
+        ...valid,
+        replyContext: { messageId: "42", targetKind: "invalid-target" },
+      } as unknown as InboundEnvelope),
+    ).rejects.toThrow(InvalidInboundReplyContextError);
+    await expect(
       gateway.receive({ ...valid, composition: { kind: "media", order: -1 } } as unknown as InboundEnvelope),
     ).rejects.toThrow(InvalidInboundCompositionError);
 
@@ -261,6 +273,33 @@ describe("GatewayCore", () => {
       origin: address("telegram"),
     });
     await gateway.stop();
+  });
+
+  test("delivers enriched replyContext intact to inbound handler", async () => {
+    let receivedMessage: InboundMessage | undefined;
+    const gateway = new GatewayCore({
+      identityResolver: () => SERVER_PRINCIPAL,
+      onInbound: async (message) => {
+        receivedMessage = message;
+      },
+    });
+    const richReply = {
+      messageId: "123",
+      author: "Operator",
+      text: "Original message text",
+      quote: "Quoted slice",
+      isBot: false,
+      chatTitle: "Dev Group",
+      mediaKind: "photo" as const,
+      mediaName: "screenshot.png",
+      isExternal: false,
+      targetKind: "task_card" as const,
+      targetId: "task-abc",
+      targetSummary: "Task running tests",
+    };
+
+    await gateway.receive({ ...envelope("telegram"), replyContext: richReply });
+    expect(receivedMessage?.replyContext).toEqual(richReply);
   });
 
   test("routes same-origin send, update, reactions, and UI to the address transport", async () => {

@@ -33,6 +33,10 @@ export interface InboundContent {
   readonly attachments?: readonly MessageAttachment[];
 }
 
+export type InboundReplyMediaKind = "photo" | "document" | "voice" | "audio" | "video" | "animation" | "sticker";
+
+export type InboundReplyTargetKind = "task_card" | "decision" | "turn_result" | "interaction" | "user" | "external";
+
 /**
  * Reply data supplied by the transport. It is untrusted message content, not
  * authenticated metadata about the sender.
@@ -41,7 +45,15 @@ export interface InboundReplyContext {
   readonly messageId: string;
   readonly author?: string;
   readonly text?: string;
+  readonly quote?: string;
   readonly isBot?: boolean;
+  readonly chatTitle?: string;
+  readonly mediaKind?: InboundReplyMediaKind;
+  readonly mediaName?: string;
+  readonly isExternal?: boolean;
+  readonly targetKind?: InboundReplyTargetKind;
+  readonly targetId?: string;
+  readonly targetSummary?: string;
 }
 
 export interface InboundCompositionHint {

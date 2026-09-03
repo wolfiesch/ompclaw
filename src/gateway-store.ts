@@ -242,6 +242,25 @@ function validatePairingRequestInput(input: StorePairingRequestInput): void {
   }
 }
 
+const VALID_REPLY_MEDIA_KINDS: Record<string, true> = {
+  photo: true,
+  document: true,
+  voice: true,
+  audio: true,
+  video: true,
+  animation: true,
+  sticker: true,
+};
+
+const VALID_REPLY_TARGET_KINDS: Record<string, true> = {
+  task_card: true,
+  decision: true,
+  turn_result: true,
+  interaction: true,
+  user: true,
+  external: true,
+};
+
 function validateReceipt(value: unknown, context: string): void {
   if (!isRecord(value)) throw new Error(`${context} must be an object`);
   requiredText(value.transport, `${context} transport`);
@@ -306,8 +325,38 @@ function validateInboundMessage(value: unknown): asserts value is InboundMessage
     if (value.replyContext.text !== undefined && typeof value.replyContext.text !== "string") {
       throw new Error("inbound message replyContext text must be a string");
     }
+    if (value.replyContext.quote !== undefined && typeof value.replyContext.quote !== "string") {
+      throw new Error("inbound message replyContext quote must be a string");
+    }
     if (value.replyContext.isBot !== undefined && typeof value.replyContext.isBot !== "boolean") {
       throw new Error("inbound message replyContext isBot must be boolean");
+    }
+    if (value.replyContext.chatTitle !== undefined && typeof value.replyContext.chatTitle !== "string") {
+      throw new Error("inbound message replyContext chatTitle must be a string");
+    }
+    if (
+      value.replyContext.mediaKind !== undefined &&
+      (typeof value.replyContext.mediaKind !== "string" || !VALID_REPLY_MEDIA_KINDS[value.replyContext.mediaKind])
+    ) {
+      throw new Error("inbound message replyContext mediaKind is invalid");
+    }
+    if (value.replyContext.mediaName !== undefined && typeof value.replyContext.mediaName !== "string") {
+      throw new Error("inbound message replyContext mediaName must be a string");
+    }
+    if (value.replyContext.isExternal !== undefined && typeof value.replyContext.isExternal !== "boolean") {
+      throw new Error("inbound message replyContext isExternal must be boolean");
+    }
+    if (
+      value.replyContext.targetKind !== undefined &&
+      (typeof value.replyContext.targetKind !== "string" || !VALID_REPLY_TARGET_KINDS[value.replyContext.targetKind])
+    ) {
+      throw new Error("inbound message replyContext targetKind is invalid");
+    }
+    if (value.replyContext.targetId !== undefined && typeof value.replyContext.targetId !== "string") {
+      throw new Error("inbound message replyContext targetId must be a string");
+    }
+    if (value.replyContext.targetSummary !== undefined && typeof value.replyContext.targetSummary !== "string") {
+      throw new Error("inbound message replyContext targetSummary must be a string");
     }
   }
   if (value.composition !== undefined) {
@@ -1890,6 +1939,13 @@ export class GatewayStore implements GatewaySemanticViewStore {
     validateAddress(address);
     if (!isSemanticViewIdentifier(viewId)) throw new Error("semantic view id must be a bounded opaque identifier");
     return this.#readSemanticView(address, viewId);
+  }
+
+  getSemanticViewByReceipt(address: ConversationAddress, messageId: string): StoredSemanticView | undefined {
+    validateAddress(address);
+    requiredText(messageId, "receipt messageId");
+    const views = this.listSemanticViews(address);
+    return views.find((entry) => entry.receipts.some((receipt) => receipt.messageId === messageId));
   }
 
   putSemanticView(record: StoredSemanticView): boolean {
