@@ -72,6 +72,27 @@ export interface TurnLifecycle {
   readonly finishedAt?: number;
   readonly error?: string;
 }
+export type TurnTimelineEventKind =
+  | "queued"
+  | "started"
+  | "tool_started"
+  | "tool_completed"
+  | "completed"
+  | "stopped"
+  | "failed"
+  | "interrupted";
+
+export interface TurnTimelineEvent {
+  readonly turnId: string;
+  readonly at: number;
+  readonly kind: TurnTimelineEventKind;
+  readonly text: string;
+}
+
+export interface GatewayTurnTimelineStore {
+  appendTurnTimelineEvent(event: TurnTimelineEvent): void;
+  listTurnTimelineEvents(turnId: string, limit?: number): TurnTimelineEvent[];
+}
 
 export interface GatewayTurnLifecycleStore {
   putTurnLifecycle(turn: TurnLifecycle): void;
@@ -691,6 +712,20 @@ function decodeTurnLifecycle(row: SqlRow): TurnLifecycle {
   };
 }
 
+function decodeTurnTimelineEvent(row: SqlRow): TurnTimelineEvent {
+  const context = "turn timeline event";
+  const kind = storedString(row, "kind", context);
+  if (!["queued", "started", "tool_started", "tool_completed", "completed", "stopped", "failed", "interrupted"].includes(kind)) {
+    throw new Error("corrupt turn timeline event: invalid kind");
+  }
+  return {
+    turnId: storedString(row, "turn_id", context),
+    at: storedTimestamp(row, "occurred_at", context),
+    kind: kind as TurnTimelineEventKind,
+    text: storedString(row, "text", context),
+  };
+}
+
 function encodeSemanticViewJson(value: unknown, context: string): string {
   const encoded = JSON.stringify(value);
   if (typeof encoded !== "string") throw new Error(`${context} must be JSON-serializable`);
@@ -777,6 +812,21 @@ function validateTurnLifecycle(turn: TurnLifecycle): void {
   }
   if (turn.currentTool !== undefined) requiredText(turn.currentTool, "turn lifecycle current tool");
   if (turn.error !== undefined) requiredText(turn.error, "turn lifecycle error");
+}
+
+function validateTurnTimelineEvent(event: TurnTimelineEvent): void {
+  requiredText(event.turnId, "turn timeline event turn id");
+  requiredText(event.text, "turn timeline event text");
+  if (
+    !["queued", "started", "tool_started", "tool_completed", "completed", "stopped", "failed", "interrupted"].includes(
+      event.kind,
+    )
+  ) {
+    throw new Error("turn timeline event kind is invalid");
+  }
+  if (!Number.isSafeInteger(event.at) || event.at < 0) {
+    throw new Error("turn timeline event timestamp must be a safe nonnegative integer");
+  }
 }
 
 const TURN_LIFECYCLE_FIELDS = [
@@ -1113,6 +1163,17 @@ export class GatewayStore implements GatewaySemanticViewStore {
 
       CREATE INDEX IF NOT EXISTS turn_lifecycles_address_created
         ON turn_lifecycles (transport, account, channel, thread, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS turn_timeline_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        turn_id TEXT NOT NULL REFERENCES turn_lifecycles(id) ON DELETE CASCADE,
+        occurred_at INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('queued', 'started', 'tool_started', 'tool_completed', 'completed', 'stopped', 'failed', 'interrupted')),
+        text TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS turn_timeline_events_turn_recent
+        ON turn_timeline_events (turn_id, id DESC);
 
       CREATE TABLE IF NOT EXISTS semantic_views (
         transport TEXT NOT NULL,
@@ -1933,6 +1994,33 @@ export class GatewayStore implements GatewaySemanticViewStore {
       )
       .all(address.transport, address.account, address.channel, address.thread ?? "", limit) as SqlRow[];
     return rows.map(decodeTurnLifecycle);
+  }
+
+  appendTurnTimelineEvent(event: TurnTimelineEvent): void {
+    validateTurnTimelineEvent(event);
+    this.#database
+      .query(
+        `INSERT INTO turn_timeline_events (turn_id, occurred_at, kind, text)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(event.turnId, event.at, event.kind, event.text.slice(0, 1_000));
+  }
+
+  listTurnTimelineEvents(turnId: string, limit = 8): TurnTimelineEvent[] {
+    requiredText(turnId, "turn timeline event turn id");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("turn timeline event limit must be an integer from 1 to 100");
+    }
+    const rows = this.#database
+      .query(
+        `SELECT turn_id, occurred_at, kind, text
+         FROM turn_timeline_events
+         WHERE turn_id = ?
+         ORDER BY id DESC
+         LIMIT ?`,
+      )
+      .all(turnId, limit) as SqlRow[];
+    return rows.map(decodeTurnTimelineEvent).reverse();
   }
 
   getSemanticView(address: ConversationAddress, viewId: string): StoredSemanticView | undefined {

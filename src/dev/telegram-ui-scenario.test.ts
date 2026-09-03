@@ -77,7 +77,7 @@ describe("Telegram UI scenario golden", () => {
           "✓ Checking release gates",
           "→ Running focused tests",
         ].join("\n"),
-        buttons: [["🛑 Stop"]],
+        buttons: [["✏️ Add instruction", "➕ Add follow-up"], ["🛑 Stop"]],
       },
     ]);
   });

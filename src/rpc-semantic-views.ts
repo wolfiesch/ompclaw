@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AutonomyMode } from "./rpc-config";
 import type { RpcSessionState } from "./rpc-protocol";
-import type { ScheduledJob } from "./gateway-store";
-import type { TurnLifecycle } from "./gateway-store";
+import type { ScheduledJob, TurnLifecycle, TurnTimelineEvent } from "./gateway-store";
 import type { SemanticView, SemanticViewState } from "./gateway-views";
 
 const MAX_SUMMARY_CHARS = 512;
@@ -137,9 +136,100 @@ export function taskSemanticView(
         ? []
         : [{ id: "error", label: "Error", text: "Use /status for details.", tone: "danger" as const }]),
     ],
-    actions: terminal ? [] : [{ id: "stop", label: "🛑 Stop", command: "/stop", style: "danger", enabled: true }],
+    actions: terminal
+      ? []
+      : [
+          {
+            id: "steer",
+            label: "✏️ Add instruction",
+
+            input: {
+              title: "Steer this task",
+              prompt: "Reply with the correction or instruction to apply now.",
+              command: "/steer",
+            },
+          },
+          {
+            id: "followup",
+            label: "➕ Add follow-up",
+            input: {
+              title: "Queue a follow-up",
+              prompt: "Reply with work to do after this task finishes.",
+              command: "/followup",
+            },
+          },
+          { id: "stop", label: "🛑 Stop", command: "/stop", style: "danger", enabled: true },
+        ],
     updatedAt: lifecycle.updatedAt,
     notification: "silent",
+  };
+}
+export interface TaskHistoryEntry {
+  readonly lifecycle: TurnLifecycle;
+  readonly events: readonly TurnTimelineEvent[];
+}
+
+function taskHistoryState(state: TurnLifecycle["state"]): string {
+  if (state === "queued") return "Queued";
+  if (state === "running") return "Working";
+  if (state === "completed") return "Completed";
+  if (state === "stopped") return "Stopped";
+  if (state === "failed") return "Failed";
+  return "Interrupted";
+}
+
+export function taskHistorySemanticView(
+  entries: readonly TaskHistoryEntry[],
+  version: number,
+  updatedAt: number,
+): SemanticView {
+  const visible = entries.slice(0, 8);
+  return {
+    schemaVersion: 1,
+    id: "tasks",
+    kind: "task",
+    version,
+    state: entries.some((entry) => entry.lifecycle.state === "queued" || entry.lifecycle.state === "running")
+      ? "active"
+      : "waiting",
+    title: "Task timeline",
+    summary: entries.length === 0 ? "No persisted tasks for this conversation." : `${entries.length} recent task${entries.length === 1 ? "" : "s"}`,
+    sections: visible.map((entry, index) => {
+      const eventLines = entry.events.slice(-3).map((event) => `• ${event.text}`);
+      return {
+        id: `task${index}`,
+        label: `${taskHistoryState(entry.lifecycle.state)} · ${boundedSummary(entry.lifecycle.prompt).slice(0, 80)}`,
+        text: [
+          entry.lifecycle.currentTool ? `Current activity · ${entry.lifecycle.currentTool}` : undefined,
+          ...eventLines,
+          entry.lifecycle.error ? `Recovery · ${boundedSummary(entry.lifecycle.error)}` : undefined,
+        ]
+          .filter((line): line is string => line !== undefined)
+          .join("\n") || "No recorded activity.",
+        tone:
+          entry.lifecycle.state === "completed"
+            ? ("success" as const)
+            : entry.lifecycle.state === "failed" || entry.lifecycle.state === "interrupted"
+              ? ("danger" as const)
+              : ("default" as const),
+      };
+    }),
+    actions: [
+      ...visible.flatMap((entry, index) =>
+        entry.lifecycle.state === "failed" || entry.lifecycle.state === "interrupted" || entry.lifecycle.state === "stopped"
+          ? [
+              {
+                id: `retry${index}`,
+                label: `Retry · ${boundedSummary(entry.lifecycle.prompt).slice(0, 32)}`,
+                command: `/task_retry ${entry.lifecycle.id}`,
+                style: "primary" as const,
+              },
+            ]
+          : [],
+      ),
+      { id: "back", label: "Back to Home", command: "/home" },
+    ],
+    updatedAt,
   };
 }
 

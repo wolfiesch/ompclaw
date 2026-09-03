@@ -430,7 +430,44 @@ describe("RpcGatewayRuntime", () => {
     expect(rpc.sent.filter((command) => command.type === "get_state").length).toBeGreaterThan(1);
 
     await runtime.handleInbound(message("lifecycle", "/tasks"));
-    expect(deliveries.some((call) => textFromContent(call.content)?.includes("Done | Deploy carefully"))).toBe(true);
+    expect(
+      deliveries.some(
+        (call) =>
+          call.method === "presentUi" &&
+          call.request?.type === "semantic_view" &&
+          call.request.view.id === "tasks" &&
+          call.request.view.sections.some((section) => section.label?.includes("Deploy carefully")),
+      ),
+    ).toBe(true);
+    await runtime.stop();
+  });
+
+  test("retries an interrupted task through its timeline action", async () => {
+    const retryable: TurnLifecycle = {
+      id: "retryable",
+      principalId: "principal-retry",
+      address: { transport: "test", account: "account", channel: "retry" },
+      prompt: "Finish the deployment",
+      state: "interrupted",
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+    };
+    const turns = new Map<string, TurnLifecycle>([[retryable.id, retryable]]);
+    const turnStore: GatewayTurnLifecycleStore = {
+      putTurnLifecycle: (turn) => turns.set(turn.id, turn),
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: (address) =>
+        [...turns.values()].filter((turn) => JSON.stringify(turn.address) === JSON.stringify(address)),
+    };
+    const runtime = createRuntime({ config, delivery: delivery(), turnStore });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    await runtime.handleInbound(message("retry", "/task_retry retryable"));
+    expect(rpc.sent).toContainEqual({
+      type: "prompt",
+      message: expect.stringContaining("Resume this unfinished task. Original request:\\nFinish the deployment"),
+    });
     await runtime.stop();
   });
 

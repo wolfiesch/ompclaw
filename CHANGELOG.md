@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Add Telegram decision controls for approve, reject, clarification, and task pause; clarification returns the user’s reply as a live correction rather than approving the pending action.
+- Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
+- Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
+
 ## 0.11.0 (2026-09-03)
 
 ### Added

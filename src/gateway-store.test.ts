@@ -551,6 +551,18 @@ describe("GatewayStore", () => {
       createdAt: 100,
       updatedAt: 200,
     });
+    first.appendTurnTimelineEvent({
+      turnId: "turn-running",
+      at: 150,
+      kind: "queued",
+      text: "Task received",
+    });
+    first.appendTurnTimelineEvent({
+      turnId: "turn-running",
+      at: 200,
+      kind: "tool_started",
+      text: "Running tests",
+    });
     first.putTurnLifecycle({
       id: "turn-complete",
       principalId: "operator-42",
@@ -576,6 +588,10 @@ describe("GatewayStore", () => {
         updatedAt: 500,
         finishedAt: 500,
       },
+    ]);
+    expect(restarted.listTurnTimelineEvents("turn-running")).toEqual([
+      { turnId: "turn-running", at: 150, kind: "queued", text: "Task received" },
+      { turnId: "turn-running", at: 200, kind: "tool_started", text: "Running tests" },
     ]);
     expect(restarted.listTurnLifecycles({ ...ownerAddress, thread: "topic-1" })).toEqual([
       expect.objectContaining({ id: "turn-complete", state: "completed" }),

@@ -54,6 +54,7 @@ import {
 } from "./bot-api";
 import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } from "./delivery";
 import { MAX_INBOUND_ATTACHMENT_BYTES, saveInboxAttachment } from "./inbox";
+import type { SemanticViewActionInput } from "../../gateway-views";
 import { decodeTelegramSemanticCallback, TelegramSemanticViewReconciler } from "./semantic-views";
 
 const executeFile = promisify(execFile);
@@ -1005,6 +1006,22 @@ export class TelegramTransportAdapter implements TransportAdapter {
       const action = current.view.actions.find(
         (candidate) => candidate.id === callbackData.actionId && candidate.enabled !== false,
       );
+      if (action?.input !== undefined) {
+        await acknowledge("Reply with your instruction.");
+        void this.#collectSemanticInput(
+          address,
+          identity,
+          action.input,
+          callbackContext,
+          updateId,
+          context,
+        ).catch((error) =>
+          this.#log?.warn(
+            `[telegram] semantic input failed: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+        return;
+      }
       if (action?.command === undefined) {
         await acknowledge("This control is no longer available.");
         return;
@@ -1072,7 +1089,49 @@ export class TelegramTransportAdapter implements TransportAdapter {
       await acknowledge("This prompt belongs to another user.", true);
       return;
     }
+    const stopRequested = state.request.type === "confirm" && action === "stop";
     await this.#applyInteractionAction(state, action, query, acknowledge);
+    if (!stopRequested) return;
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:interaction-stop:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: "/stop" },
+        sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
+        edited: false,
+      },
+      context.signal,
+    );
+  }
+
+  async #collectSemanticInput(
+    address: ConversationAddress,
+    identity: TransportIdentity,
+    input: SemanticViewActionInput,
+    deliveryContext: DeliveryContext,
+    updateId: number,
+    context: TransportStartContext,
+  ): Promise<void> {
+    const response = await this.#openInteraction(
+      address,
+      { type: "input", title: input.title, prompt: input.prompt },
+      deliveryContext,
+      context.signal,
+    );
+    if (response.type !== "input" || response.cancelled || !response.value.trim()) return;
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:semantic-input:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: `${input.command} ${response.value.trim()}` },
+        edited: false,
+      },
+      context.signal,
+    );
   }
 
   async #handleDraftStop(
@@ -1259,14 +1318,18 @@ export class TelegramTransportAdapter implements TransportAdapter {
     if (request.type === "confirm") {
       state.prompt = await this.#outbound.sendMessage(
         state.address,
-        `${request.title}\n\n${request.message}`,
+        `${request.title}\n\n${request.message}\n\nChoose how to proceed.`,
         state.context,
         {
           replyMarkup: {
             inline_keyboard: [
               [
-                { text: request.confirmLabel ?? "Confirm", callback_data: callback(state.id, "accept") },
-                { text: request.cancelLabel ?? "Cancel", callback_data: callback(state.id, "reject") },
+                { text: request.confirmLabel ?? "Approve", callback_data: callback(state.id, "accept") },
+                { text: request.cancelLabel ?? "Reject", callback_data: callback(state.id, "reject") },
+              ],
+              [
+                { text: "Clarify", callback_data: callback(state.id, "clarify") },
+                { text: "⚠️ Pause task", callback_data: callback(state.id, "stop") },
               ],
             ],
           },
@@ -1353,12 +1416,23 @@ export class TelegramTransportAdapter implements TransportAdapter {
     acknowledge: (text?: string, alert?: boolean) => Promise<unknown>,
   ): Promise<void> {
     if (state.request.type === "confirm") {
-      if (action !== "accept" && action !== "reject") {
+      if (action === "clarify") {
+        this.#finishInteraction(state, { type: "confirm", confirmed: false });
+        await this.#outbound.sendMessage(
+          state.address,
+          "Reply with the clarification. I’ll send it as a correction; this approval will not proceed.",
+          state.context,
+          { replyMarkup: { force_reply: true, selective: true } },
+        );
+        await acknowledge("Reply with clarification.");
+        return;
+      }
+      if (action !== "accept" && action !== "reject" && action !== "stop") {
         await acknowledge("Invalid response.");
         return;
       }
       this.#finishInteraction(state, { type: "confirm", confirmed: action === "accept" });
-      await acknowledge(action === "accept" ? "Confirmed" : "Cancelled");
+      await acknowledge(action === "accept" ? "Approved" : action === "stop" ? "Pausing…" : "Rejected");
       return;
     }
     if (state.request.type !== "select") {

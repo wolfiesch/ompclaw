@@ -14,8 +14,10 @@ import type { GatewayUpdateControl } from "./gateway-update";
 import type {
   GatewaySemanticViewStore,
   GatewayTurnLifecycleStore,
+  GatewayTurnTimelineStore,
   TurnLifecycle,
   TurnLifecycleState,
+  TurnTimelineEventKind,
 } from "./gateway-store";
 import type { SemanticView } from "./gateway-views";
 import {
@@ -49,6 +51,7 @@ import {
   informationSemanticView,
   scheduledJobsSemanticView,
   sessionChoiceSemanticView,
+  taskHistorySemanticView,
   taskSemanticView,
   type TaskSemanticActivity,
   type TaskSemanticTodoPhase,
@@ -83,7 +86,8 @@ export interface RpcRuntimeLogger {
   error(message: string): void;
 }
 
-type RpcRuntimeStore = GatewayTurnLifecycleStore & Partial<Pick<GatewaySemanticViewStore, "getSemanticView">>;
+type RpcRuntimeStore = GatewayTurnLifecycleStore &
+  Partial<Pick<GatewaySemanticViewStore, "getSemanticView"> & GatewayTurnTimelineStore>;
 
 export interface RpcGatewayRuntimeOptions {
   readonly config: RpcRuntimeConfig;
@@ -177,17 +181,6 @@ function taskTodoPhases(value: unknown): readonly TaskSemanticTodoPhase[] {
   });
 }
 
-function lifecycleLabel(state: TurnLifecycleState): string {
-  const labels: Record<TurnLifecycleState, string> = {
-    queued: "Queued",
-    running: "Working",
-    completed: "Done",
-    stopped: "Stopped",
-    failed: "Failed",
-    interrupted: "Interrupted",
-  };
-  return labels[state];
-}
 
 
 /** One persistent OMP RPC session served through authenticated gateway transports. */
@@ -607,6 +600,7 @@ export class RpcGatewayRuntime {
     }
     if (frame.type === "agent_start") {
       await this.#setTurnLifecycle("running");
+      this.#recordTurnTimeline("started", "Agent started");
       if (this.#status.state) this.#status.state.isStreaming = true;
       const active = this.#activeTurn;
       if (active) this.#startTypingHeartbeat(active);
@@ -618,6 +612,7 @@ export class RpcGatewayRuntime {
       this.#status.currentTool = activity;
       const active = this.#activeTurn;
       if (active) active.activities.push({ toolName, text: activity, state: "active" });
+      this.#recordTurnTimeline("tool_started", activity);
       await this.#setTurnLifecycle("running", { currentTool: activity });
       return;
     }
@@ -631,6 +626,7 @@ export class RpcGatewayRuntime {
       if (active && activityIndex !== undefined && activityIndex >= 0) {
         const activity = active.activities[activityIndex]!;
         active.activities[activityIndex] = { ...activity, state: "completed" };
+        this.#recordTurnTimeline("tool_completed", activity.text);
       }
       if (toolName === "todo") {
         try {
@@ -821,7 +817,8 @@ export class RpcGatewayRuntime {
         );
       else if (name === "retry") await this.#retryCommand(args, reply);
       else if (name === "queue") await this.#queueCommand(args, reply);
-      else if (name === "tasks") await reply(this.#tasksText(delivery.address));
+      else if (name === "tasks") await this.#tasksCommand(delivery);
+      else if (name === "task_retry") await this.#taskRetryCommand(delivery, args, reply);
       else if (name === "stats") await reply(valueText(await this.#requestData({ type: "get_session_stats" })));
       else if (name === "todos") await reply(this.#todosText());
       else if (name === "subagents") await this.#subagentsCommand(reply);
@@ -1332,6 +1329,21 @@ export class RpcGatewayRuntime {
     return this.#options.now?.() ?? Date.now();
   }
 
+  #recordTurnTimeline(kind: TurnTimelineEventKind, text: string): void {
+    const turn = this.#activeTurn?.lifecycle;
+    if (!turn) return;
+    try {
+      this.#options.turnStore?.appendTurnTimelineEvent?.({
+        turnId: turn.id,
+        at: this.#now(),
+        kind,
+        text: text.slice(0, 1_000),
+      });
+    } catch (error) {
+      this.#log.warn(`[ompclaw rpc] Unable to persist task timeline: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   async #startTurn(
     delivery: GatewayTurnTarget,
     message: InboundMessage,
@@ -1360,6 +1372,7 @@ export class RpcGatewayRuntime {
       activities: [],
       ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
     };
+    this.#recordTurnTimeline("queued", "Task received");
     this.#queueSourceReaction(this.#activeTurn, "👀");
     this.#startTypingHeartbeat(this.#activeTurn);
     this.#startTaskHeartbeat(this.#activeTurn);
@@ -1389,6 +1402,17 @@ export class RpcGatewayRuntime {
     };
     active.lifecycle = updated;
     this.#options.turnStore?.putTurnLifecycle(updated);
+    if (terminal) {
+      const text =
+        state === "failed"
+          ? `Task failed${change.error ? `: ${change.error.slice(0, 240)}` : ""}`
+          : state === "interrupted"
+            ? `Task interrupted${change.error ? `: ${change.error.slice(0, 240)}` : ""}`
+            : state === "stopped"
+              ? "Task stopped"
+              : "Task completed";
+      this.#recordTurnTimeline(state, text);
+    }
     if (state === "queued") return;
     if (terminal && !active.statusVisible) {
       clearTimeout(active.statusTimer);
@@ -1483,16 +1507,51 @@ export class RpcGatewayRuntime {
     );
   }
 
-  #tasksText(address: ConversationAddress): string {
-    const turns = this.#options.turnStore?.listTurnLifecycles(address, 10) ?? [];
-    if (turns.length === 0) return "No persisted tasks for this conversation.";
-    return turns
-      .map((turn) => {
-        const activity = turn.currentTool ? ` | ${turn.currentTool} ` : "";
-        const error = turn.error ? " | Use /status for details." : "";
-        return `${lifecycleLabel(turn.state)} | ${turn.prompt}${activity}${error} `;
-      })
-      .join("\n");
+  async #tasksCommand(delivery: GatewayTurnTarget): Promise<void> {
+    const turns = this.#options.turnStore?.listTurnLifecycles(delivery.address, 20) ?? [];
+    const now = this.#now();
+    await this.#presentSemanticView(
+      delivery,
+      taskHistorySemanticView(
+        turns.map((lifecycle) => ({
+          lifecycle,
+          events: this.#options.turnStore?.listTurnTimelineEvents?.(lifecycle.id, 6) ?? [],
+        })),
+        now,
+        now,
+      ),
+    );
+  }
+
+  async #taskRetryCommand(
+    delivery: GatewayTurnTarget,
+    id: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const previous = this.#options.turnStore
+      ?.listTurnLifecycles(delivery.address, 100)
+      .find((candidate) => candidate.id === id && candidate.principalId === delivery.deliveryContext.principal.id);
+    if (previous === undefined) {
+      await reply("That task is no longer available in this conversation.");
+      return;
+    }
+    if (previous.state !== "failed" && previous.state !== "interrupted" && previous.state !== "stopped") {
+      await reply("Only stopped, failed, or interrupted tasks can be retried.");
+      return;
+    }
+    if (this.#currentTurnBusy()) {
+      await reply("Wait for the current task to finish before retrying another task.");
+      return;
+    }
+    await this.handleInbound({
+      id: `task-retry:${previous.id}:${this.#now()}`,
+      sentAt: this.#now(),
+      identity: delivery.identity,
+      address: delivery.address,
+      principal: delivery.deliveryContext.principal,
+      content: { text: `Resume this unfinished task. Original request:\n${previous.prompt}` },
+      edited: false,
+    });
   }
 
   #terminalState(messages: unknown): "completed" | "stopped" | "failed" {

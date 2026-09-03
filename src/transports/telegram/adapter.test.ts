@@ -708,6 +708,29 @@ describe("Telegram interactive UI", () => {
     expect(pending.size).toBe(0);
   });
 
+  test("offers clarify and pause controls for a decision", async () => {
+    const { adapter, calls, received } = await fixture();
+    const answer = adapter.presentUi(
+      baseAddress,
+      { type: "confirm", title: "Deploy", message: "Ship this build?" },
+      delivery,
+    );
+    await flush();
+    const prompt = sentMessage(calls);
+    expect(callbackData(prompt, "Clarify")).toContain("clarify");
+    await adapter.handleUpdate({
+      update_id: 12,
+      callback_query: {
+        id: "pause",
+        from: { id: 42 },
+        data: callbackData(prompt, "⚠️ Pause task"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    await expect(answer).resolves.toEqual({ type: "confirm", confirmed: false });
+    expect(received).toEqual([expect.objectContaining({ content: { text: "/stop" } })]);
+  });
+
   test("accepts text input only as a reply to the correlated prompt", async () => {
     const { adapter, calls } = await fixture();
     const answer = adapter.presentUi(
@@ -780,6 +803,51 @@ describe("Telegram interactive UI", () => {
     });
 
     expect(received[0]).toMatchObject({ content: { text: "/status" }, address: baseAddress });
+  });
+
+  test("routes a semantic prompt action through a correlated instruction reply", async () => {
+    const { adapter, calls, received } = await fixture();
+    const view: SemanticView = {
+      schemaVersion: 1,
+      id: "task-1",
+      kind: "task",
+      version: 1,
+      state: "active",
+      title: "Working",
+      sections: [],
+      actions: [
+        {
+          id: "steer",
+          label: "Add instruction",
+          input: { title: "Steer task", prompt: "Reply with a correction.", command: "/steer" },
+        },
+      ],
+      updatedAt: 1,
+    };
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view }, delivery);
+    const card = sentMessage(calls);
+    await adapter.handleUpdate({
+      update_id: 17,
+      callback_query: {
+        id: "semantic-steer",
+        from: { id: 42 },
+        data: callbackData(card, "Add instruction"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    await flush();
+    await adapter.handleUpdate({
+      update_id: 18,
+      message: message({
+        message_id: 44,
+        text: "Use the staging environment.",
+        reply_to_message: message({ message_id: 202 }),
+      }),
+    });
+    await flush();
+    expect(received).toEqual([
+      expect.objectContaining({ content: { text: "/steer Use the staging environment." } }),
+    ]);
   });
 
   test("refreshes a stale semantic callback without dispatching its action", async () => {

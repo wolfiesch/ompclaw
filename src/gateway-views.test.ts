@@ -6,7 +6,7 @@ import {
   type SemanticView,
   type StoredSemanticView,
 } from "./gateway-views";
-import { scheduledJobsSemanticView, sessionChoiceSemanticView } from "./rpc-semantic-views";
+import { scheduledJobsSemanticView, sessionChoiceSemanticView, taskHistorySemanticView, taskSemanticView } from "./rpc-semantic-views";
 
 function semanticView(overrides: Partial<SemanticView> = {}): SemanticView {
   return {
@@ -78,6 +78,34 @@ describe("semantic views", () => {
         }),
       ),
     ).toThrow("action ids must be unique");
+  });
+
+  test("keeps prompt-backed actions bounded to simple gateway slash commands", () => {
+    const view = semanticView({
+      actions: [
+        {
+          id: "steer",
+          label: "Add instruction",
+          input: { title: "Steer", prompt: "Reply with an instruction.", command: "/steer" },
+        },
+      ],
+    });
+    expect(normalizeSemanticView(view).actions[0]).toMatchObject({
+      input: { title: "Steer", prompt: "Reply with an instruction.", command: "/steer" },
+    });
+    expect(() =>
+      validateSemanticView(
+        semanticView({
+          actions: [
+            {
+              id: "unsafe",
+              label: "Unsafe",
+              input: { title: "Unsafe", prompt: "No.", command: "/steer now" },
+            },
+          ],
+        }),
+      ),
+    ).toThrow("simple slash command");
   });
 
   test("rejects malformed durable records before persistence", () => {
@@ -160,5 +188,36 @@ describe("runtime semantic projections", () => {
       "/job_delete job-1",
       "/home",
     ]);
+  });
+
+  test("projects task steering and recovery into durable cards", () => {
+    const lifecycle = {
+      id: "task-1",
+      principalId: "operator-42",
+      address: { transport: "telegram", account: "default", channel: "42" },
+      prompt: "Deploy the service",
+      state: "interrupted" as const,
+      createdAt: 10,
+      updatedAt: 20,
+      finishedAt: 20,
+      error: "OMP restarted",
+    };
+    const active = taskSemanticView({ ...lifecycle, state: "running", finishedAt: undefined }, [], 7);
+    expect(active.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "steer", input: expect.objectContaining({ command: "/steer" }) }),
+        expect.objectContaining({ id: "followup", input: expect.objectContaining({ command: "/followup" }) }),
+      ]),
+    );
+    const timeline = taskHistorySemanticView(
+      [{ lifecycle, events: [{ turnId: "task-1", at: 10, kind: "queued", text: "Task received" }] }],
+      8,
+      20,
+    );
+    validateSemanticView(timeline);
+    expect(timeline.actions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ command: "/task_retry task-1" })]),
+    );
+    expect(timeline.sections[0]?.text).toContain("Task received");
   });
 });
