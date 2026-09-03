@@ -99,9 +99,7 @@ export class InvalidInboundReplyContextError extends Error {
   readonly name = "InvalidInboundReplyContextError";
 
   constructor(readonly replyContext: unknown) {
-    super(
-      "Inbound envelope replyContext must contain a non-empty messageId and optional string author/text and boolean isBot",
-    );
+    super("Inbound envelope replyContext must contain a non-empty messageId and optional valid reply metadata");
   }
 }
 
@@ -188,6 +186,25 @@ export class GatewayLifecycleError extends Error {
 
 type GatewayState = "idle" | "starting" | "started" | "stopping";
 
+const VALID_REPLY_MEDIA_KINDS: Record<string, true> = {
+  photo: true,
+  document: true,
+  voice: true,
+  audio: true,
+  video: true,
+  animation: true,
+  sticker: true,
+};
+
+const VALID_REPLY_TARGET_KINDS: Record<string, true> = {
+  task_card: true,
+  decision: true,
+  turn_result: true,
+  interaction: true,
+  user: true,
+  external: true,
+};
+
 function isInboundReplyContext(value: unknown): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const replyContext = value as Record<string, unknown>;
@@ -196,7 +213,17 @@ function isInboundReplyContext(value: unknown): boolean {
     replyContext.messageId.length > 0 &&
     (replyContext.author === undefined || typeof replyContext.author === "string") &&
     (replyContext.text === undefined || typeof replyContext.text === "string") &&
-    (replyContext.isBot === undefined || typeof replyContext.isBot === "boolean")
+    (replyContext.quote === undefined || typeof replyContext.quote === "string") &&
+    (replyContext.isBot === undefined || typeof replyContext.isBot === "boolean") &&
+    (replyContext.chatTitle === undefined || typeof replyContext.chatTitle === "string") &&
+    (replyContext.mediaKind === undefined ||
+      (typeof replyContext.mediaKind === "string" && VALID_REPLY_MEDIA_KINDS[replyContext.mediaKind] === true)) &&
+    (replyContext.mediaName === undefined || typeof replyContext.mediaName === "string") &&
+    (replyContext.isExternal === undefined || typeof replyContext.isExternal === "boolean") &&
+    (replyContext.targetKind === undefined ||
+      (typeof replyContext.targetKind === "string" && VALID_REPLY_TARGET_KINDS[replyContext.targetKind] === true)) &&
+    (replyContext.targetId === undefined || typeof replyContext.targetId === "string") &&
+    (replyContext.targetSummary === undefined || typeof replyContext.targetSummary === "string")
   );
 }
 

@@ -296,6 +296,8 @@ function composeMessage(record: IngressCompositionRecord): InboundMessage {
     .map((fragment) => fragment.content.text)
     .filter((text): text is string => text !== undefined && text.length > 0);
   const attachments = fragments.flatMap((fragment) => fragment.content.attachments ?? []);
+  const replyContext =
+    last.replyContext ?? fragments.findLast((fragment) => fragment.replyContext !== undefined)?.replyContext;
   return {
     ...last,
     id: record.id,
@@ -303,6 +305,7 @@ function composeMessage(record: IngressCompositionRecord): InboundMessage {
       ...(textParts.length === 0 ? {} : { text: textParts.join("\n\n") }),
       ...(attachments.length === 0 ? {} : { attachments }),
     },
+    ...(replyContext === undefined ? {} : { replyContext }),
   };
 }
 

@@ -287,15 +287,175 @@ describe("Telegram inbound conversion", () => {
     });
     expect(received[0]?.replyContext).toEqual({
       messageId: "3",
-      author: "Ada",
+      author: "Ada (@ada)",
       text: "x".repeat(1_000),
       isBot: false,
+      isExternal: false,
     });
     expect(received[1]?.replyContext).toEqual({
       messageId: "4",
       author: "@replybot",
       text: "Quoted caption",
       isBot: true,
+      isExternal: false,
+    });
+  });
+
+  test("extracts quotes and synthesizes media descriptors for captionless replies", async () => {
+    const { adapter, received } = await fixture();
+    await adapter.handleUpdate({
+      update_id: 11,
+      message: message({
+        message_id: 20,
+        quote: { text: "quoted slice of message", position: 42, is_manual: true },
+        reply_to_message: message({
+          message_id: 5,
+          text: "Full original text",
+          from: { id: 11, first_name: "Bob", last_name: "Builder", is_bot: false },
+        }),
+      }),
+    });
+    await adapter.handleUpdate({
+      update_id: 12,
+      message: message({
+        message_id: 21,
+        reply_to_message: message({
+          message_id: 6,
+          text: undefined,
+          photo: [{ file_id: "p1", file_unique_id: "u1", width: 100, height: 100 }],
+        }),
+      }),
+    });
+    await adapter.handleUpdate({
+      update_id: 13,
+      message: message({
+        message_id: 22,
+        reply_to_message: message({
+          message_id: 7,
+          text: undefined,
+          caption: "Check this invoice",
+          document: { file_id: "d1", file_unique_id: "u2", file_name: "invoice.pdf" },
+        }),
+      }),
+    });
+    await adapter.handleUpdate({
+      update_id: 14,
+      message: message({
+        message_id: 23,
+        reply_to_message: message({
+          message_id: 8,
+          text: undefined,
+          voice: { file_id: "v1", file_unique_id: "u3" },
+        }),
+      }),
+    });
+    expect(received[0]?.replyContext).toEqual({
+      messageId: "5",
+      author: "Bob Builder",
+      text: "Full original text",
+      quote: "quoted slice of message",
+      isBot: false,
+      isExternal: false,
+    });
+    expect(received[1]?.replyContext).toEqual({
+      messageId: "6",
+      author: "Wolfgang",
+      text: "[Photo]",
+      mediaKind: "photo",
+      isExternal: false,
+    });
+    expect(received[2]?.replyContext).toEqual({
+      messageId: "7",
+      author: "Wolfgang",
+      text: "[Document: invoice.pdf] Check this invoice",
+      mediaKind: "document",
+      mediaName: "invoice.pdf",
+      isExternal: false,
+    });
+    expect(received[3]?.replyContext).toEqual({
+      messageId: "8",
+      author: "Wolfgang",
+      text: "[Voice note]",
+      mediaKind: "voice",
+      isExternal: false,
+    });
+  });
+  test("extracts external reply context and origin metadata", async () => {
+    const { adapter, received } = await fixture();
+    await adapter.handleUpdate({
+      update_id: 15,
+      message: message({
+        message_id: 30,
+        reply_to_message: undefined,
+        external_reply: {
+          origin: {
+            type: "user",
+            date: 1_700_000,
+            sender_user: { id: 99, first_name: "Carol", username: "carol_dev", is_bot: false },
+          },
+          chat: { id: -100, type: "supergroup", title: "External Group" },
+          message_id: 55,
+          document: { file_id: "doc1", file_unique_id: "u9", file_name: "patch.diff" },
+          quote: { text: "diff --git a/foo b/foo" },
+        },
+      }),
+    });
+    expect(received[0]?.replyContext).toEqual({
+      messageId: "55",
+      author: "Carol (@carol_dev)",
+      text: "[Document: patch.diff]",
+      quote: "diff --git a/foo b/foo",
+      chatTitle: "External Group",
+      mediaKind: "document",
+      mediaName: "patch.diff",
+      isBot: false,
+      isExternal: true,
+    });
+  });
+
+  test("correlates replies to semantic view task cards and decision cards", async () => {
+    const { adapter, received, semanticViews } = await fixture();
+    const address = { transport: "telegram", account: "primary", channel: "42" } as const;
+    semanticViews.set(["telegram", "primary", "42", "", "task-build-1"].join("\0"), {
+      principalId: "operator-42",
+      address,
+      view: {
+        schemaVersion: 1,
+        id: "task-build-1",
+        kind: "task",
+        version: 1,
+        state: "active",
+        title: "Build Pipeline",
+        summary: "Running integration tests",
+      },
+      contentHash: "a".repeat(64),
+      receipts: [{ messageId: "123", index: 0 }],
+      createdAt: 100,
+      updatedAt: 100,
+    });
+
+    await adapter.handleUpdate({
+      update_id: 16,
+      message: message({
+        message_id: 31,
+        reply_to_message: message({
+          message_id: 123,
+          from: { id: 10, username: "ompclawbot", is_bot: true },
+          text: "Build Pipeline\nRunning integration tests",
+        }),
+        text: "stop this task",
+      }),
+    });
+
+    expect(received[0]?.replyContext).toEqual({
+      messageId: "123",
+      author: "@ompclawbot",
+      text: "Build Pipeline\nRunning integration tests",
+      isBot: true,
+      isExternal: false,
+      targetKind: "task_card",
+      targetId: "task-build-1",
+      targetSummary: "Build Pipeline: Running integration tests",
     });
   });
 

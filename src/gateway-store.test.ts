@@ -980,6 +980,30 @@ describe("GatewayStore", () => {
     expect(store.listSemanticViews().map((record) => record.address.thread)).toEqual(["topic-1"]);
     store.close();
   });
+  test("looks up semantic views by receipt message id within an address", () => {
+    const store = new GatewayStore(temporaryDatabase());
+    const topic = { ...ownerAddress, thread: "topic-1" } as const;
+    store.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    store.putSemanticView(
+      semanticViewRecord({
+        id: "task-1",
+        receipts: [{ messageId: "msg-101", index: 0 }],
+      }),
+    );
+    store.putSemanticView(
+      semanticViewRecord({
+        id: "task-2",
+        address: topic,
+        receipts: [{ messageId: "msg-102", index: 0 }],
+      }),
+    );
+
+    expect(store.getSemanticViewByReceipt(ownerAddress, "msg-101")?.view.id).toBe("task-1");
+    expect(store.getSemanticViewByReceipt(ownerAddress, "msg-102")).toBeUndefined();
+    expect(store.getSemanticViewByReceipt(topic, "msg-102")?.view.id).toBe("task-2");
+    expect(store.getSemanticViewByReceipt(ownerAddress, "missing")).toBeUndefined();
+    store.close();
+  });
 
   test("initializes SQLite with WAL mode and enforces foreign keys", () => {
     const path = temporaryDatabase();

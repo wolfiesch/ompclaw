@@ -59,6 +59,7 @@ export interface GatewayApplicationStore
   deletePendingInteraction: GatewayStore["deletePendingInteraction"];
   getSemanticView: GatewayStore["getSemanticView"];
   putSemanticView: GatewayStore["putSemanticView"];
+  getSemanticViewByReceipt: GatewayStore["getSemanticViewByReceipt"];
 }
 
 export interface GatewayRuntime {

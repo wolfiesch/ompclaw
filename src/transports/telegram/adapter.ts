@@ -11,6 +11,8 @@ import type {
   ConversationAddress,
   DeliveryContext,
   InboundEnvelope,
+  InboundReplyMediaKind,
+  InboundReplyTargetKind,
   MessageAttachment,
   OutboundContent,
   OutboundReceipt,
@@ -33,11 +35,21 @@ import {
   tg,
   TgError,
   type Logger,
+  type TgAnimation,
+  type TgAudio,
   type TgCallbackQuery,
+  type TgChat,
+  type TgDocument,
   type TgFileBase,
   type TgMessage,
   type TgMessageGenerationStopped,
+  type TgPhotoSize,
+  type TgSticker,
   type TgUpdate,
+  type TgUser,
+  type TgVideo,
+  type TgVideoNote,
+  type TgVoice,
   withTelegramRetry,
 } from "./bot-api";
 import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } from "./delivery";
@@ -95,6 +107,7 @@ export interface TelegramTransportAdapterOptions {
     | "listPendingIngressCompositions"
     | "listPendingInboundMessages"
     | "getSemanticView"
+    | "getSemanticViewByReceipt"
     | "putSemanticView"
   >;
   readonly pairing?: Pick<
@@ -184,28 +197,147 @@ function updateMessage(update: TgUpdate): TgMessage | undefined {
 }
 
 const REPLY_CONTEXT_TEXT_LIMIT = 1_000;
+const REPLY_CONTEXT_QUOTE_LIMIT = 1_000;
+const REPLY_CONTEXT_AUTHOR_LIMIT = 128;
 
-function truncateReplyText(text: string): string {
-  return text.length <= REPLY_CONTEXT_TEXT_LIMIT ? text : Array.from(text).slice(0, REPLY_CONTEXT_TEXT_LIMIT).join("");
-}
-
-function replyContextFrom(message: TgMessage): InboundEnvelope["replyContext"] | undefined {
-  const reply = message.reply_to_message;
-  if (!reply) return undefined;
-  const author = reply.from?.first_name || (reply.from?.username === undefined ? undefined : `@${reply.from.username}`);
-  const text = reply.text ?? reply.caption;
-  return {
-    messageId: String(reply.message_id),
-    ...(author === undefined ? {} : { author }),
-    ...(text === undefined ? {} : { text: truncateReplyText(text) }),
-    ...(reply.from?.is_bot === undefined ? {} : { isBot: reply.from.is_bot }),
-  };
+function truncateReplyText(text: string, limit = REPLY_CONTEXT_TEXT_LIMIT): string {
+  return text.length <= limit ? text : Array.from(text).slice(0, limit).join("");
 }
 
 function safeFilename(candidate: string): string {
   const leaf = basename(candidate.replaceAll("\\", "/"));
   const cleaned = leaf.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "");
   return (cleaned || "attachment.bin").slice(0, 180);
+}
+
+function resolveUserAuthor(user: TgUser | undefined): string | undefined {
+  if (!user) return undefined;
+  const fullName = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
+  const handle = user.username ? `@${user.username}` : undefined;
+  let result: string | undefined;
+  if (fullName && handle) {
+    result = `${fullName} (${handle})`;
+  } else {
+    result = fullName || handle;
+  }
+  return result ? truncateReplyText(result, REPLY_CONTEXT_AUTHOR_LIMIT) : undefined;
+}
+
+function resolveChatAuthor(chat: TgChat | undefined): string | undefined {
+  if (!chat) return undefined;
+  const title = chat.title?.trim();
+  return title ? truncateReplyText(title, REPLY_CONTEXT_AUTHOR_LIMIT) : undefined;
+}
+
+interface MediaDescriptor {
+  readonly mediaKind?: InboundReplyMediaKind;
+  readonly mediaName?: string;
+  readonly placeholder: string;
+}
+
+function describeMedia(item: {
+  photo?: readonly TgPhotoSize[];
+  document?: TgDocument;
+  voice?: TgVoice;
+  audio?: TgAudio;
+  video?: TgVideo;
+  animation?: TgAnimation;
+  video_note?: TgVideoNote;
+  sticker?: TgSticker;
+}): MediaDescriptor | undefined {
+  if (item.photo && item.photo.length > 0) {
+    return { mediaKind: "photo", placeholder: "[Photo]" };
+  }
+  if (item.document) {
+    const mediaName = safeFilename(item.document.file_name ?? "attachment");
+    return { mediaKind: "document", mediaName, placeholder: `[Document: ${mediaName}]` };
+  }
+  if (item.voice) {
+    return { mediaKind: "voice", placeholder: "[Voice note]" };
+  }
+  if (item.audio) {
+    const mediaName = safeFilename(item.audio.file_name ?? "audio.mp3");
+    return { mediaKind: "audio", mediaName, placeholder: `[Audio: ${mediaName}]` };
+  }
+  if (item.video) {
+    const mediaName = safeFilename(item.video.file_name ?? "video.mp4");
+    return { mediaKind: "video", mediaName, placeholder: `[Video: ${mediaName}]` };
+  }
+  if (item.animation) {
+    const mediaName = item.animation.file_name ? safeFilename(item.animation.file_name) : undefined;
+    return {
+      mediaKind: "animation",
+      ...(mediaName ? { mediaName } : {}),
+      placeholder: mediaName ? `[GIF: ${mediaName}]` : "[GIF / Animation]",
+    };
+  }
+  if (item.video_note) {
+    return { mediaKind: "video", placeholder: "[Video message]" };
+  }
+  if (item.sticker) {
+    return { mediaKind: "sticker", placeholder: "[Sticker]" };
+  }
+  return undefined;
+}
+
+function replyContextFrom(message: TgMessage): InboundEnvelope["replyContext"] | undefined {
+  const reply = message.reply_to_message;
+  if (reply) {
+    const author = resolveUserAuthor(reply.from) ?? resolveChatAuthor(reply.sender_chat);
+    const media = describeMedia(reply);
+    let text: string | undefined;
+    if (reply.text) {
+      text = truncateReplyText(reply.text);
+    } else if (reply.caption) {
+      text = media ? truncateReplyText(`${media.placeholder} ${reply.caption}`) : truncateReplyText(reply.caption);
+    } else if (media) {
+      text = media.placeholder;
+    }
+    const quote = message.quote?.text ? truncateReplyText(message.quote.text, REPLY_CONTEXT_QUOTE_LIMIT) : undefined;
+    return {
+      messageId: String(reply.message_id),
+      ...(author === undefined ? {} : { author }),
+      ...(text === undefined ? {} : { text }),
+      ...(quote === undefined ? {} : { quote }),
+      ...(reply.from?.is_bot === undefined ? {} : { isBot: reply.from.is_bot }),
+      ...(reply.chat?.title === undefined ? {} : { chatTitle: reply.chat.title }),
+      ...(media?.mediaKind === undefined ? {} : { mediaKind: media.mediaKind }),
+      ...(media?.mediaName === undefined ? {} : { mediaName: media.mediaName }),
+      isExternal: false,
+    };
+  }
+
+  const external = message.external_reply;
+  if (external) {
+    const origin = external.origin;
+    let author: string | undefined;
+    if (origin.sender_user) {
+      author = resolveUserAuthor(origin.sender_user);
+    } else if (origin.sender_user_name) {
+      author = truncateReplyText(origin.sender_user_name, REPLY_CONTEXT_AUTHOR_LIMIT);
+    } else if (origin.sender_chat) {
+      author = resolveChatAuthor(origin.sender_chat);
+    } else if (origin.author_signature) {
+      author = truncateReplyText(origin.author_signature, REPLY_CONTEXT_AUTHOR_LIMIT);
+    }
+    const media = describeMedia(external);
+    const text = media?.placeholder;
+    const quoteCandidate = message.quote?.text ?? external.quote?.text;
+    const quote = quoteCandidate ? truncateReplyText(quoteCandidate, REPLY_CONTEXT_QUOTE_LIMIT) : undefined;
+    return {
+      messageId: String(external.message_id ?? "external"),
+      ...(author === undefined ? {} : { author }),
+      ...(text === undefined ? {} : { text }),
+      ...(quote === undefined ? {} : { quote }),
+      ...(origin.sender_user?.is_bot === undefined ? {} : { isBot: origin.sender_user.is_bot }),
+      ...(external.chat?.title === undefined ? {} : { chatTitle: external.chat.title }),
+      ...(media?.mediaKind === undefined ? {} : { mediaKind: media.mediaKind }),
+      ...(media?.mediaName === undefined ? {} : { mediaName: media.mediaName }),
+      isExternal: true,
+    };
+  }
+
+  return undefined;
 }
 
 function topicName(text: string): string {
@@ -487,7 +619,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
         this.#stopPairingApprovalMonitor?.();
       } catch (cleanupError) {
         this.#log?.warn(
-          `[telegram] pairing approval monitor cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          `[telegram] pairing approval monitor cleanup failed: ${
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
           }`,
         );
       }
@@ -497,7 +630,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
           this.#poller.stop();
         } catch (cleanupError) {
           this.#log?.warn(
-            `[telegram] poller cleanup failed after startup error: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+            `[telegram] poller cleanup failed after startup error: ${
+              cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
             }`,
           );
         }
@@ -696,7 +830,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
         );
       } catch (messageError) {
         this.#log?.warn(
-          `[telegram] voice acknowledgement failed for message ${message.message_id}: ${messageError instanceof Error ? messageError.message : String(messageError)
+          `[telegram] voice acknowledgement failed for message ${message.message_id}: ${
+            messageError instanceof Error ? messageError.message : String(messageError)
           } (reaction: ${reactionError instanceof Error ? reactionError.message : String(reactionError)})`,
         );
       }
@@ -751,12 +886,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
     });
     const transcript = attachment?.transcribable
       ? await this.#transcribe(attachment.localPath, context.signal).catch((error) => {
-        if (context.signal?.aborted) throw error;
-        this.#log?.warn(
-          `[telegram] transcription failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        return undefined;
-      })
+          if (context.signal?.aborted) throw error;
+          this.#log?.warn(
+            `[telegram] transcription failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        })
       : undefined;
     const textParts = [message.text ?? message.caption, transcript].filter(
       (part): part is string => typeof part === "string" && part.length > 0,
@@ -765,11 +900,35 @@ export class TelegramTransportAdapter implements TransportAdapter {
       attachment === undefined
         ? undefined
         : {
-          url: pathToFileURL(attachment.localPath).href,
-          name: attachment.displayName,
-          mediaType: attachment.mediaType,
+            url: pathToFileURL(attachment.localPath).href,
+            name: attachment.displayName,
+            mediaType: attachment.mediaType,
+          };
+    let replyContext = replyContextFrom(message);
+    if (replyContext !== undefined && replyContext.targetKind === undefined) {
+      const correlated = this.#store.getSemanticViewByReceipt?.(address, replyContext.messageId);
+      if (correlated !== undefined) {
+        const view = correlated.view;
+        const targetKind: InboundReplyTargetKind =
+          view.kind === "task"
+            ? "task_card"
+            : view.kind === "decision"
+              ? "decision"
+              : view.kind === "result"
+                ? "turn_result"
+                : "interaction";
+        const targetSummary = truncateReplyText(
+          view.summary ? `${view.title}: ${view.summary}` : view.title,
+          REPLY_CONTEXT_TEXT_LIMIT,
+        );
+        replyContext = {
+          ...replyContext,
+          targetKind,
+          targetId: view.id,
+          targetSummary,
         };
-    const replyContext = replyContextFrom(message);
+      }
+    }
     const envelope: InboundEnvelope = {
       id: `telegram:${this.#account}:${message.chat.id}:${message.message_id}`,
       sentAt: message.date * 1_000,
@@ -782,9 +941,9 @@ export class TelegramTransportAdapter implements TransportAdapter {
       ...(message.reply_to_message === undefined
         ? {}
         : {
-          replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) },
-          ...(replyContext === undefined ? {} : { replyContext }),
-        }),
+            replyTo: { transport: "telegram", messageId: String(message.reply_to_message.message_id) },
+          }),
+      ...(replyContext === undefined ? {} : { replyContext }),
       composition: {
         kind: message.media_group_id === undefined ? "text" : "media",
         ...(message.media_group_id === undefined ? {} : { groupId: message.media_group_id }),
@@ -947,11 +1106,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
     signal?: AbortSignal,
   ): Promise<
     | {
-      readonly localPath: string;
-      readonly displayName: string;
-      readonly mediaType: string;
-      readonly transcribable: boolean;
-    }
+        readonly localPath: string;
+        readonly displayName: string;
+        readonly mediaType: string;
+        readonly transcribable: boolean;
+      }
     | undefined
   > {
     const media = mediaFrom(message);
@@ -1425,7 +1584,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
       } catch (error) {
         if (context.signal?.aborted) return;
         this.#log?.warn(
-          `[telegram] pairing confirmation failed for user ${request.identity.subject}: ${error instanceof Error ? error.message : String(error)
+          `[telegram] pairing confirmation failed for user ${request.identity.subject}: ${
+            error instanceof Error ? error.message : String(error)
           }`,
         );
       }

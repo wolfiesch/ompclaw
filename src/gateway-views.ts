@@ -55,6 +55,7 @@ export interface StoredSemanticView {
 
 export interface GatewaySemanticViewStore {
   getSemanticView(address: ConversationAddress, viewId: string): StoredSemanticView | undefined;
+  getSemanticViewByReceipt(address: ConversationAddress, messageId: string): StoredSemanticView | undefined;
   putSemanticView(record: StoredSemanticView): boolean;
   deleteSemanticView(address: ConversationAddress, viewId: string): boolean;
   listSemanticViews(address?: ConversationAddress): StoredSemanticView[];

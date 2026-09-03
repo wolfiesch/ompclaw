@@ -38,6 +38,7 @@ export class TgError extends Error {
 export type TgUser = Readonly<{
   id: number;
   first_name?: string;
+  last_name?: string;
   username?: string;
   is_bot?: boolean;
 }>;
@@ -77,6 +78,37 @@ export type TgVideo = TgFileBase & Readonly<{ file_name?: string; mime_type?: st
 export type TgVideoNote = TgFileBase;
 export type TgAnimation = TgFileBase & Readonly<{ file_name?: string; mime_type?: string }>;
 export type TgSticker = TgFileBase & Readonly<{ is_animated?: boolean; is_video?: boolean }>;
+export type TgTextQuote = Readonly<{
+  text: string;
+  entities?: readonly TgMessageEntity[];
+  position?: number;
+  is_manual?: boolean;
+}>;
+
+export type TgMessageOrigin = Readonly<{
+  type: "user" | "hidden_user" | "chat" | "channel" | string;
+  date: number;
+  sender_user?: TgUser;
+  sender_user_name?: string;
+  sender_chat?: TgChat;
+  author_signature?: string;
+}>;
+
+export type TgExternalReplyInfo = Readonly<{
+  origin: TgMessageOrigin;
+  chat?: TgChat;
+  message_id?: number;
+  animation?: TgAnimation;
+  audio?: TgAudio;
+  document?: TgDocument;
+  photo?: readonly TgPhotoSize[];
+  sticker?: TgSticker;
+  video?: TgVideo;
+  video_note?: TgVideoNote;
+  voice?: TgVoice;
+  has_media_spoiler?: boolean;
+  quote?: TgTextQuote;
+}>;
 
 export type TgMessage = Readonly<{
   message_id: number;
@@ -91,6 +123,9 @@ export type TgMessage = Readonly<{
   entities?: readonly TgMessageEntity[];
   caption_entities?: readonly TgMessageEntity[];
   reply_to_message?: TgMessage;
+  quote?: TgTextQuote;
+  external_reply?: TgExternalReplyInfo;
+  forward_origin?: TgMessageOrigin;
   photo?: readonly TgPhotoSize[];
   document?: TgDocument;
   voice?: TgVoice;
