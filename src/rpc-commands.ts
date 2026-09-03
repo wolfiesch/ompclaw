@@ -1,5 +1,7 @@
-import type { AutonomyMode } from "./rpc-config";
-import { ompApprovalModeForAutonomy } from "./rpc-config";
+import {
+  type AutonomyMode,
+  ompApprovalModeForAutonomy,
+} from "./rpc-config";
 import type { RpcRecord } from "./rpc-protocol";
 import { isRecord } from "./type-guards";
 
@@ -25,7 +27,7 @@ export const RUNTIME_COMMANDS: readonly RuntimeCommandDefinition[] = [
   { command: "followup", description: "Add work after the current response", group: "Everyday" },
   { command: "compact", description: "Compact context with optional focus", group: "Session" },
   { command: "model", description: "List or select provider/model", group: "Session" },
-  { command: "autonomy", description: "Show configured autonomy policy", group: "Session" },
+  { command: "autonomy", description: "Show or set autonomy policy", group: "Session" },
   { command: "thinking", description: "Show or set reasoning level", group: "Session" },
   { command: "fast", description: "Show or toggle fast mode", group: "Session" },
   { command: "queue", description: "Inspect or tune queue behavior", group: "Session" },
@@ -103,11 +105,20 @@ export const THINKING_LEVELS: Readonly<Record<string, true>> = {
   auto: true,
 };
 
+export { AUTONOMY_MODES, type AutonomyMode, ompApprovalModeForAutonomy, parseAutonomyMode } from "./rpc-config";
+
 export const AUTONOMY_MODE_LABELS: Readonly<Record<AutonomyMode, string>> = {
   inherit: "Inherited",
   autopilot: "Autopilot",
   balanced: "Balanced",
   review: "Review",
+};
+
+export const AUTONOMY_MODE_DESCRIPTIONS: Readonly<Record<AutonomyMode, string>> = {
+  autopilot: "Full auto-approval for uninterrupted tool execution",
+  balanced: "Auto-approves reads; prompts before file writes and commands",
+  review: "Prompts before every tool execution",
+  inherit: "Preserves OMP's approval configuration without gateway override",
 };
 
 export function autonomyText(mode: AutonomyMode): string {
@@ -116,7 +127,7 @@ export function autonomyText(mode: AutonomyMode): string {
     `Autonomy: ${AUTONOMY_MODE_LABELS[mode]} (${mode})`,
     `OMP approval mode: ${approvalMode ?? "inherited (OmpClaw adds no autonomy override; omp.args still apply)"}`,
     "This affects tool approval prompts, not genuine user decisions.",
-    "Changes currently require configuration plus service restart.",
+    "Use /autonomy <mode> to switch modes at runtime.",
   ].join("\n");
 }
 

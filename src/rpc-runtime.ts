@@ -56,7 +56,10 @@ import { isRecord } from "./type-guards";
 
 import { formatPromptInput, type FormattedPromptInput } from "./rpc-prompt";
 import {
+  AUTONOMY_MODE_DESCRIPTIONS,
   AUTONOMY_MODE_LABELS,
+  AUTONOMY_MODES,
+  type AutonomyMode,
   CROSS_DELIVERY_COMMANDS,
   type ParsedCommand,
   SAME_DELIVERY_IMMEDIATE_COMMANDS,
@@ -64,6 +67,8 @@ import {
   activityForFrame,
   assistantWelcome,
   autonomyText,
+  ompApprovalModeForAutonomy,
+  parseAutonomyMode,
   parseSlashCommand,
   runtimeHelp,
   summarizeMessage,
@@ -190,6 +195,7 @@ export class RpcGatewayRuntime {
   #activeTurn: ActiveTurn | undefined;
   #sessionFile: string | undefined;
   #stopping = false;
+  #recycling = false;
   #restartAttempt = 0;
   #restartTimer: NodeJS.Timeout | undefined;
   #promptQueue: Promise<void> = Promise.resolve();
@@ -374,6 +380,40 @@ export class RpcGatewayRuntime {
     await this.#sendRpc({ type: "set_session_name", name });
     await this.#refreshStateRequired();
   }
+  get autonomyMode(): AutonomyMode {
+    return this.#options.config.autonomyMode;
+  }
+
+  async setAutonomyMode(mode: AutonomyMode): Promise<void> {
+    if (this.#currentTurnBusy()) {
+      throw new Error("Cannot change autonomy mode while a turn is in progress");
+    }
+    if (mode === this.#options.config.autonomyMode) return;
+
+    this.#recycling = true;
+    clearTimeout(this.#restartTimer);
+    this.#restartTimer = undefined;
+    try {
+      const oldRpc = this.#rpc;
+      this.#rpc = undefined;
+      this.#ui?.shutdown();
+      this.#ui = undefined;
+      for (const execution of this.#hostTools.values()) execution.controller.abort();
+      this.#hostTools.clear();
+      await oldRpc?.stop();
+      await this.#frameQueue;
+
+      this.#options.config.autonomyMode = mode;
+      await this.#startRpc();
+      const approval = ompApprovalModeForAutonomy(mode);
+      this.#log.info(
+        `[ompclaw rpc] Autonomy switched to ${mode}${approval ? ` (--approval-mode ${approval})` : ""}`,
+      );
+    } finally {
+      this.#recycling = false;
+    }
+  }
+
 
   /** Queue a scheduler-owned prompt and resolve only after its terminal OMP event. */
   async handleScheduled(message: InboundMessage): Promise<void> {
@@ -476,7 +516,7 @@ export class RpcGatewayRuntime {
   }
 
   async #handleRpcExit(error: Error): Promise<void> {
-    if (this.#stopping) return;
+    if (this.#stopping || this.#recycling) return;
     this.#rpc = undefined;
     this.#status.lastError = error.message;
     this.#ui?.shutdown();
@@ -749,13 +789,8 @@ export class RpcGatewayRuntime {
         await this.#refreshState();
         await reply("Compaction complete.");
       } else if (name === "model") await this.#modelCommand(delivery, args, reply);
-      else if (name === "autonomy") {
-        const now = this.#now();
-        await this.#presentSemanticView(
-          delivery,
-          informationSemanticView("Autonomy", autonomyText(this.#options.config.autonomyMode), now, now),
-        );
-      } else if (name === "thinking") await this.#thinkingCommand(delivery, args, reply);
+      else if (name === "autonomy") await this.#autonomyCommand(delivery, args, reply);
+      else if (name === "thinking") await this.#thinkingCommand(delivery, args, reply);
       else if (name === "fast")
         await this.#booleanCommand(delivery, "set_fast_mode", args, this.#status.state?.fastModeEnabled, reply);
       else if (name === "autocompact")
@@ -915,6 +950,59 @@ export class RpcGatewayRuntime {
       modelId: selection.slice(split + 1),
     });
     await this.#refreshState();
+    await this.#homeCommand(delivery);
+  }
+
+  async #autonomyCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const selection = args.trim();
+    if (!selection) {
+      const current = this.#options.config.autonomyMode;
+      const now = this.#now();
+      await this.#presentSemanticView(
+        delivery,
+        sessionChoiceSemanticView({
+          title: "Choose autonomy mode",
+          summary: "Governs whether OMP requests tool approval or runs autonomously.",
+          choices: AUTONOMY_MODES.map((mode) => ({
+            id: mode,
+            label: AUTONOMY_MODE_LABELS[mode],
+            description: AUTONOMY_MODE_DESCRIPTIONS[mode],
+            command: `/autonomy ${mode}`,
+            selected: mode === current,
+          })),
+          version: now,
+          updatedAt: now,
+        }),
+      );
+      return;
+    }
+    if (selection === "info" || selection === "status") {
+      const now = this.#now();
+      await this.#presentSemanticView(
+        delivery,
+        informationSemanticView("Autonomy", autonomyText(this.#options.config.autonomyMode), now, now),
+      );
+      return;
+    }
+    const mode = parseAutonomyMode(selection);
+    if (!mode) {
+      await reply(`Unknown autonomy mode. Use: ${AUTONOMY_MODES.join(", ")}`);
+      return;
+    }
+    if (this.#currentTurnBusy()) {
+      await reply("Wait for the current turn to finish before changing autonomy mode.");
+      return;
+    }
+    if (mode === this.#options.config.autonomyMode) {
+      await reply(`Autonomy is already set to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
+      return;
+    }
+    await this.setAutonomyMode(mode);
+    await reply(`Autonomy switched to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
     await this.#homeCommand(delivery);
   }
 

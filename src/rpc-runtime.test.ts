@@ -1443,7 +1443,7 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
-  test("shows configured autonomy in home as read-only approval guidance", async () => {
+  test("presents interactive autonomy choices and explanatory info in home and via /autonomy", async () => {
     const modes: ReadonlyArray<readonly [RpcRuntimeConfig["autonomyMode"], string, string]> = [
       ["inherit", "Inherited", "inherited (OmpClaw adds no autonomy override; omp.args still apply)"],
       ["balanced", "Balanced", "write"],
@@ -1469,7 +1469,30 @@ describe("RpcGatewayRuntime", () => {
           actions: expect.arrayContaining([{ id: "autonomy", label: "Autonomy", command: "/autonomy" }]),
         },
       });
+
+      // /autonomy without args presents interactive choice view
       await runtime.handleInbound(message("commands", "/autonomy"));
+      expect(
+        deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
+          ?.request,
+      ).toMatchObject({
+        type: "semantic_view",
+        view: {
+          title: "Choose autonomy mode",
+          actions: expect.arrayContaining([
+            expect.objectContaining({ command: "/autonomy autopilot" }),
+            expect.objectContaining({ command: "/autonomy balanced" }),
+            expect.objectContaining({ command: "/autonomy review" }),
+            expect.objectContaining({
+              command: "/autonomy inherit",
+              label: autonomyMode === "inherit" ? "✓ Inherited" : "Inherited",
+            }),
+          ]),
+        },
+      });
+
+      // /autonomy info presents explanatory text
+      await runtime.handleInbound(message("commands", "/autonomy info"));
       expect(
         deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
           ?.request,
@@ -1481,13 +1504,79 @@ describe("RpcGatewayRuntime", () => {
             `Autonomy: ${label} (${autonomyMode})`,
             `OMP approval mode: ${approvalMode}`,
             "This affects tool approval prompts, not genuine user decisions.",
-            "Changes currently require configuration plus service restart.",
+            "Use /autonomy <mode> to switch modes at runtime.",
           ].join("\n"),
           actions: [{ id: "back", label: "Back to Home", command: "/home" }],
         },
       });
       await runtime.stop();
     }
+  });
+
+  test("switches autonomy mode dynamically, preserves session via resume, and updates child approval mode", async () => {
+    deliveries = [];
+    const runtime = createRuntime({
+      config: { ...config, autonomyMode: "inherit" },
+      delivery: delivery(),
+    });
+    await runtime.start();
+    expect(runtime.autonomyMode).toBe("inherit");
+    const initialRpc = FakeOmpRpcClient.instances[0]!;
+    expect(initialRpc.options.argv).not.toContain("--approval-mode");
+
+    // Switch to autopilot
+    await runtime.handleInbound(message("commands", "/autonomy autopilot"));
+    expect(runtime.autonomyMode).toBe("autopilot");
+    expect(FakeOmpRpcClient.instances).toHaveLength(2);
+    const secondRpc = FakeOmpRpcClient.instances[1]!;
+    expect(secondRpc.options.argv).toContain("--approval-mode");
+    expect(secondRpc.options.argv).toContain("yolo");
+    expect(secondRpc.options.argv).toContain("--resume");
+    expect(secondRpc.options.argv).toContain("/sessions/initial.jsonl");
+    expect(
+      deliveries.some((call) => call.method === "send" && textFromContent(call.content).includes("Autonomy switched to Autopilot")),
+    ).toBe(true);
+
+    // Switch to balanced
+    await runtime.handleInbound(message("commands", "/autonomy balanced"));
+    expect(runtime.autonomyMode).toBe("balanced");
+    expect(FakeOmpRpcClient.instances).toHaveLength(3);
+    const thirdRpc = FakeOmpRpcClient.instances[2]!;
+    expect(thirdRpc.options.argv).toContain("--approval-mode");
+    expect(thirdRpc.options.argv).toContain("write");
+    expect(thirdRpc.options.argv).toContain("--resume");
+    expect(thirdRpc.options.argv).toContain("/sessions/initial.jsonl");
+
+    // Idempotent switch does not restart child
+    await runtime.handleInbound(message("commands", "/autonomy balanced"));
+    expect(FakeOmpRpcClient.instances).toHaveLength(3);
+    expect(
+      deliveries.some((call) => call.method === "send" && textFromContent(call.content).includes("already set to Balanced")),
+    ).toBe(true);
+
+    // Invalid mode reports usage
+    await runtime.handleInbound(message("commands", "/autonomy invalid"));
+    expect(
+      deliveries.some((call) => call.method === "send" && textFromContent(call.content).includes("Unknown autonomy mode")),
+    ).toBe(true);
+
+    // Direct API switch to review
+    await runtime.setAutonomyMode("review");
+    expect(runtime.autonomyMode).toBe("review");
+    expect(FakeOmpRpcClient.instances).toHaveLength(4);
+    const fourthRpc = FakeOmpRpcClient.instances[3]!;
+    expect(fourthRpc.options.argv).toContain("--approval-mode");
+    expect(fourthRpc.options.argv).toContain("always-ask");
+
+    // Cannot switch while busy
+    const busyMsg = message("active", "Long running turn");
+    await runtime.handleInbound(busyMsg);
+    expect(runtime.isBusy()).toBe(true);
+    await expect(runtime.setAutonomyMode("autopilot")).rejects.toThrow(
+      "Cannot change autonomy mode while a turn is in progress",
+    );
+
+    await runtime.stop();
   });
 
   test("resumes the supplied session, publishes new-session state, and supports representative commands", async () => {

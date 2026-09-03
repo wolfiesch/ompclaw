@@ -3,7 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripGatewaySecretsFromChildEnv } from "./gateway-config";
-import { buildOmpChildEnv, buildOmpRpcArgv, loadLiteralEnvFile, type RpcRuntimeConfig } from "./rpc-config";
+import { AUTONOMY_MODES, buildOmpChildEnv, buildOmpRpcArgv, loadLiteralEnvFile, parseAutonomyMode, type RpcRuntimeConfig } from "./rpc-config";
 import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
 
 const directories: string[] = [];
@@ -117,6 +117,15 @@ describe("RPC configuration", () => {
     expect(() => buildOmpRpcArgv(runtimeConfig({
       autonomyMode: "unknown" as unknown as RpcRuntimeConfig["autonomyMode"],
     }))).toThrow("Unsupported autonomy mode: unknown. Supported values: inherit, autopilot, balanced, review");
+  });
+  test("parses valid autonomy modes and rejects unknown strings", () => {
+    expect(AUTONOMY_MODES).toEqual(["autopilot", "balanced", "review", "inherit"]);
+    expect(parseAutonomyMode("inherit")).toBe("inherit");
+    expect(parseAutonomyMode("autopilot")).toBe("autopilot");
+    expect(parseAutonomyMode("balanced")).toBe("balanced");
+    expect(parseAutonomyMode("review")).toBe("review");
+    expect(parseAutonomyMode("unknown")).toBeUndefined();
+    expect(parseAutonomyMode(undefined)).toBeUndefined();
   });
 
   test("keeps raw approval mode arguments under inherited autonomy", () => {
