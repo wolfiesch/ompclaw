@@ -50,6 +50,7 @@ import {
   scheduledJobsSemanticView,
   sessionChoiceSemanticView,
   taskSemanticView,
+  type TaskSemanticActivity,
   type TaskSemanticTodoPhase,
 } from "./rpc-semantic-views";
 import { isRecord } from "./type-guards";
@@ -114,20 +115,26 @@ interface GatewayTurnTarget extends RpcGatewayUiTarget {
   readonly sourceReceipt?: OutboundReceipt;
 }
 
+interface ActiveTurnActivity extends TaskSemanticActivity {
+  readonly toolName: string;
+}
+
 interface ActiveTurn extends GatewayTurnTarget {
   receipt?: OutboundReceipt;
   previewText?: string;
   finalText?: string;
   statusVisible?: boolean;
   lifecycle?: TurnLifecycle;
-  activities: string[];
+  activities: ActiveTurnActivity[];
   statusText?: string;
   statusUpdatedAt?: number;
   statusTimer?: NodeJS.Timeout;
   statusPending?: TurnLifecycle;
   statusQueued?: boolean;
   statusUrgent?: boolean;
+  statusHeartbeat?: boolean;
   typingTimer?: NodeJS.Timeout;
+  heartbeatTimer?: NodeJS.Timeout;
   scheduledCompletion?: {
     readonly resolve: () => void;
     readonly reject: (error: Error) => void;
@@ -207,6 +214,7 @@ export class RpcGatewayRuntime {
   readonly #idleWaiters = new Set<PromiseWithResolvers<void>>();
   static readonly #TURN_CARD_THROTTLE_MS = 1_250;
   static readonly #TURN_CARD_INITIAL_DELAY_MS = 2_000;
+  static readonly #TURN_CARD_HEARTBEAT_MS = 45_000;
   static readonly #TYPING_REFRESH_MS = 4_000;
 
   constructor(options: RpcGatewayRuntimeOptions, logger: RpcRuntimeLogger = console) {
@@ -606,15 +614,25 @@ export class RpcGatewayRuntime {
     }
     if (frame.type === "tool_execution_start") {
       const activity = activityForFrame(frame);
+      const toolName = typeof frame.toolName === "string" ? frame.toolName : "tool";
       this.#status.currentTool = activity;
       const active = this.#activeTurn;
-      if (active && !active.activities.includes(activity)) active.activities.push(activity);
+      if (active) active.activities.push({ toolName, text: activity, state: "active" });
       await this.#setTurnLifecycle("running", { currentTool: activity });
       return;
     }
     if (frame.type === "tool_execution_end") {
+      const toolName = typeof frame.toolName === "string" ? frame.toolName : "tool";
       this.#status.currentTool = undefined;
-      if (frame.toolName === "todo") {
+      const active = this.#activeTurn;
+      const activityIndex = active?.activities.findLastIndex(
+        (activity) => activity.toolName === toolName && activity.state === "active",
+      );
+      if (active && activityIndex !== undefined && activityIndex >= 0) {
+        const activity = active.activities[activityIndex]!;
+        active.activities[activityIndex] = { ...activity, state: "completed" };
+      }
+      if (toolName === "todo") {
         try {
           await this.#refreshStateRequired();
         } catch (error) {
@@ -1344,6 +1362,7 @@ export class RpcGatewayRuntime {
     };
     this.#queueSourceReaction(this.#activeTurn, "👀");
     this.#startTypingHeartbeat(this.#activeTurn);
+    this.#startTaskHeartbeat(this.#activeTurn);
   }
 
   async #setTurnLifecycle(
@@ -1381,9 +1400,10 @@ export class RpcGatewayRuntime {
     this.#queueTurnCard(active, updated, terminal);
   }
 
-  #queueTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle, urgent = false): void {
+  #queueTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle, urgent = false, heartbeat = false): void {
     active.statusPending = lifecycle;
     active.statusUrgent = active.statusUrgent === true || urgent;
+    active.statusHeartbeat = active.statusHeartbeat === true || heartbeat;
     if (urgent && active.statusTimer !== undefined) {
       clearTimeout(active.statusTimer);
       active.statusTimer = undefined;
@@ -1412,16 +1432,18 @@ export class RpcGatewayRuntime {
     this.#turnCardQueue = this.#turnCardQueue.then(async () => {
       active.statusQueued = false;
       const lifecycle = active.statusPending;
+      const heartbeat = active.statusHeartbeat === true;
       active.statusPending = undefined;
       active.statusUrgent = false;
-      if (lifecycle !== undefined) await this.#renderTurnCard(active, lifecycle);
+      active.statusHeartbeat = false;
+      if (lifecycle !== undefined) await this.#renderTurnCard(active, lifecycle, heartbeat);
       if (active.statusPending !== undefined) {
-        this.#queueTurnCard(active, active.statusPending, Boolean(active.statusUrgent));
+        this.#queueTurnCard(active, active.statusPending, Boolean(active.statusUrgent), Boolean(active.statusHeartbeat));
       }
     });
   }
 
-  async #renderTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle): Promise<void> {
+  async #renderTurnCard(active: ActiveTurn, lifecycle: TurnLifecycle, heartbeat = false): Promise<void> {
     try {
       await this.#presentSemanticView(
         active,
@@ -1430,6 +1452,7 @@ export class RpcGatewayRuntime {
           active.activities,
           lifecycle.updatedAt,
           taskTodoPhases(this.#status.state?.todoPhases),
+          heartbeat,
         ),
       );
       active.statusVisible = true;
@@ -1570,13 +1593,32 @@ export class RpcGatewayRuntime {
     active.typingTimer.unref?.();
   }
 
-  #stopTurnPresentation(active: ActiveTurn): void {
-    if (active.typingTimer !== undefined) clearInterval(active.typingTimer);
-    active.typingTimer = undefined;
-    if (active.statusTimer !== undefined) clearTimeout(active.statusTimer);
-    active.statusTimer = undefined;
+  #startTaskHeartbeat(active: ActiveTurn): void {
+    const pulse = (): void => {
+      if (this.#activeTurn !== active || active.lifecycle === undefined) return;
+      if (active.lifecycle.state === "queued" || active.lifecycle.state === "running") {
+        this.#queueTurnCard(
+          active,
+          { ...active.lifecycle, updatedAt: this.#now() },
+          false,
+          true,
+        );
+      }
+      active.heartbeatTimer = setTimeout(pulse, RpcGatewayRuntime.#TURN_CARD_HEARTBEAT_MS);
+      active.heartbeatTimer.unref?.();
+    };
+    active.heartbeatTimer = setTimeout(pulse, RpcGatewayRuntime.#TURN_CARD_HEARTBEAT_MS);
+    active.heartbeatTimer.unref?.();
   }
 
+  #stopTurnPresentation(active: ActiveTurn): void {
+    clearInterval(active.typingTimer);
+    active.typingTimer = undefined;
+    clearTimeout(active.heartbeatTimer);
+    active.heartbeatTimer = undefined;
+    clearTimeout(active.statusTimer);
+    active.statusTimer = undefined;
+  }
   async #handleHostToolCall(call: RpcHostToolCall): Promise<void> {
     const rpc = this.#rpc;
     const active = this.#activeTurn;

@@ -344,6 +344,15 @@ describe("RpcGatewayRuntime", () => {
       type: "semantic_view",
       view: { notification: "silent", state: "active" },
     });
+
+    jest.advanceTimersByTime(45_000);
+    await settle();
+    expect(
+      deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
+        ?.request,
+    ).toMatchObject({
+      view: { title: expect.stringContaining("⏳ Still working") },
+    });
     rpc.emit({ type: "tool_execution_end", toolName: "bash" });
     await settle();
     rpc.state = {
@@ -380,6 +389,17 @@ describe("RpcGatewayRuntime", () => {
           call.request.view.state === "completed",
       ),
     );
+    const completedCard = deliveries
+      .filter(
+        (call) =>
+          call.method === "presentUi" &&
+          call.request?.type === "semantic_view" &&
+          call.request.view.kind === "result",
+      )
+      .at(-1)?.request;
+    expect(completedCard).toMatchObject({
+      view: { sections: [{ id: "progress", label: "Progress", tone: "success" }] },
+    });
 
     expect(turns.get("lifecycle-Deploy carefully")).toMatchObject({
       state: "completed",
@@ -1406,8 +1426,8 @@ describe("RpcGatewayRuntime", () => {
     expect(home).toMatchObject({
       type: "semantic_view",
       view: {
-        title: "OmpClaw control center",
-        actions: expect.arrayContaining([{ id: "model", label: "Model", command: "/model" }]),
+        title: "🟢 OmpClaw · Idle",
+        actions: expect.arrayContaining([{ id: "model", label: "🤖 Model", command: "/model" }]),
       },
     });
 
@@ -1439,7 +1459,7 @@ describe("RpcGatewayRuntime", () => {
     expect(
       deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
         ?.request,
-    ).toMatchObject({ type: "semantic_view", view: { title: "OmpClaw control center" } });
+    ).toMatchObject({ type: "semantic_view", view: { title: "🟢 OmpClaw · Idle" } });
     await runtime.stop();
   });
 
@@ -1465,8 +1485,8 @@ describe("RpcGatewayRuntime", () => {
       expect(home).toMatchObject({
         type: "semantic_view",
         view: {
-          sections: expect.arrayContaining([{ id: "autonomy", label: "Autonomy", text: label }]),
-          actions: expect.arrayContaining([{ id: "autonomy", label: "Autonomy", command: "/autonomy" }]),
+          sections: expect.arrayContaining([{ id: "mode", label: "Mode", text: `${label} · inherit` }]),
+          actions: expect.arrayContaining([{ id: "autonomy", label: "🛡 Autonomy", command: "/autonomy" }]),
         },
       });
 

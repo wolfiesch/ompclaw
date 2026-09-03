@@ -100,7 +100,10 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
           createdAt: version - 30_000,
           updatedAt: version,
         },
-        ["Checking release gates", "Running focused tests"],
+        [
+          { text: "Checking release gates", state: "completed" },
+          { text: "Running focused tests", state: "active" },
+        ],
         version,
         [
           {
