@@ -832,6 +832,9 @@ describe("RpcGatewayRuntime", () => {
     await waitFor(() => calls.includes("discard"));
 
     expect(calls).toEqual(["discard"]);
+    expect(deliveries.find((call) => call.method === "finalize")).toMatchObject({
+      content: { text: "The task completed, but OMP produced no final summary. Ask for a summary of the completed work." },
+    });
     await runtime.stop();
   });
 

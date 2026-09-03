@@ -668,9 +668,13 @@ export class RpcGatewayRuntime {
       if (this.#status.state) this.#status.state.isStreaming = false;
       const active = this.#activeTurn;
       const terminalState = this.#terminalState(frame.messages);
+      const terminalText = finalAssistantText(frame.messages);
+      const visibleTerminalText =
+        terminalText || active?.previewText || this.#missingTerminalSummaryText(terminalState);
       let finalDelivered = false;
       try {
-        finalDelivered = await this.#finalizeAssistantText(finalAssistantText(frame.messages));
+        await this.#finalizeAssistantText(visibleTerminalText);
+        finalDelivered = terminalText.trim().length > 0;
         await this.#setTurnLifecycle(terminalState);
         active?.scheduledCompletion?.resolve();
       } catch (error) {
@@ -1552,6 +1556,12 @@ export class RpcGatewayRuntime {
       content: { text: `Resume this unfinished task. Original request:\n${previous.prompt}` },
       edited: false,
     });
+  }
+
+  #missingTerminalSummaryText(state: "completed" | "stopped" | "failed"): string {
+    if (state === "stopped") return "The task stopped before OMP produced a final summary. Use /tasks to resume it.";
+    if (state === "failed") return "The task failed before OMP produced a final summary. Use /status for details.";
+    return "The task completed, but OMP produced no final summary. Ask for a summary of the completed work.";
   }
 
   #terminalState(messages: unknown): "completed" | "stopped" | "failed" {

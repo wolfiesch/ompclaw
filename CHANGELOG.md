@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
 - Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
 - Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
 
+### Fixed
+
+- Always finalize a Telegram task with a visible outcome when OMP omits its terminal assistant text, while retaining the existing safeguard that prevents an empty response from activating an armed update.
+
 ## 0.11.0 (2026-09-03)
 
 ### Added
