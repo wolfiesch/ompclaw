@@ -121,8 +121,8 @@ Autonomy mode governs prompts before OMP uses tools. It does not make genuine
 user decisions, including authorization, publication, or other consequential
 actions.
 
-Telegram Home displays the configured mode as read-only state. It has no live
-autonomy switch; change configuration and restart the service.
+Telegram Home displays the active mode and provides an interactive selector.
+Autonomy can also be changed at runtime with `/autonomy <mode>`.
 
 Put token values only in a private environment file. The values below are placeholders, not usable credentials.
 

@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - Add Telegram Deep Reply Context: extract Telegram Bot API 7.0+ text quotes, external reply origin metadata, and synthesized media descriptions for captionless replies.
 - Correlate message replies to semantic view task cards, decision prompts, and turn results as structured targets (`task_card`, `decision`, `turn_result`, `interaction`) in the OMP prompt envelope.
 - Preserve inbound reply context and target metadata across composed multipart ingress fragments.
+- Add dynamic runtime autonomy switching via `/autonomy <mode>` and interactive Telegram Home choice view, recycling the OMP RPC child with session resume.
 
 ### Changed
 

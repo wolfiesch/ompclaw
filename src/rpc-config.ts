@@ -2,6 +2,27 @@ import { lstatSync, readFileSync } from "node:fs";
 
 export type AutonomyMode = "inherit" | "autopilot" | "balanced" | "review";
 
+export const AUTONOMY_MODES: readonly AutonomyMode[] = [
+  "autopilot",
+  "balanced",
+  "review",
+  "inherit",
+] as const;
+
+export function parseAutonomyMode(value: unknown): AutonomyMode | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case "inherit":
+    case "autopilot":
+    case "balanced":
+    case "review":
+      return normalized;
+    default:
+      return undefined;
+  }
+}
+
 export function ompApprovalModeForAutonomy(
   mode: AutonomyMode,
 ): "yolo" | "write" | "always-ask" | undefined {
