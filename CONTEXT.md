@@ -52,8 +52,8 @@ A Telegram forum thread. Topic bindings can associate authorized topic
 conversations with their persisted OMP session contexts.
 
 **Home**:
-The Telegram control surface for current gateway and OMP state. It displays the
-configured autonomy mode, but that state is read-only in this release.
+The Telegram control surface for current gateway and OMP state. It shows the
+configured autonomy mode and provides an interactive selector for changing it.
 
 **Inbound request**:
 An authenticated message or control action submitted by a transport to the
