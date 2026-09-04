@@ -179,6 +179,21 @@ The scheduler persists the next occurrence before dispatch. A restart recovers e
 
 Scheduled output and OMP interaction requests return to the conversation that created the job. Telegram can receive output while no inbound request is active. WebSocket jobs require the exact authenticated origin to be connected when delivery occurs.
 
+
+### Ask your agent to watch things
+
+When durable automation is enabled, your agent can create recurring check-and-notify jobs directly from conversational instructions using the `ompclaw_watch` host tool. The tool binds job results to the requesting conversation and prefixes the job name with `watch: ` so it is easily identified in `/jobs` and Schedules views.
+
+Specify either a frequency in minutes (`everyMinutes`) or a standard cron schedule (`cron`), along with the prompt describing what to inspect and when to alert you:
+
+1. **CI / PR status monitoring:**
+   > "Watch CI on PR #142 every 5 minutes and ping me if the build fails or when all checks pass."
+
+2. **Service health and endpoint checks:**
+   > "Check https://api.example.com/health every 10 minutes and alert me if the status is not 200 or response time exceeds 500ms."
+
+To stop or inspect watch jobs, use standard automation tools: list jobs with `/jobs` (or `ompclaw_list_jobs`), and stop watching with `/job_delete <id>` (or `ompclaw_delete_job`).
+
 ### Experimental learning and profile isolation
 
 Learning is off by default because OMP marks auto-learn as experimental and automatic capture consumes an extra model turn. A private single-operator setup can enable the full loop:
