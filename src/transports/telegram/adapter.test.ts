@@ -47,7 +47,10 @@ describe("Telegram transport lifecycle", () => {
     expect(adapter.capabilities.maxMessageLength).toBe(Number.MAX_SAFE_INTEGER);
     expect(calls[0]).toEqual({
       method: "setMyCommands",
-      payload: { commands: [{ command: "home", description: "Open control center" }] },
+      payload: {
+        commands: [{ command: "home", description: "Open control center" }],
+        scope: { type: "all_private_chats" },
+      },
     });
     expect(poller.started).toBe(true);
     await adapter.stop();
@@ -198,6 +201,129 @@ describe("Telegram transport lifecycle", () => {
   });
 });
 
+
+describe("Telegram command catalog", () => {
+  test("registers compact private and group-scoped native menus", async () => {
+    const { calls } = await fixture({
+      commands: [
+        { command: "start", description: "Start" },
+        { command: "home", description: "Home" },
+        { command: "help", description: "Help" },
+        { command: "status", description: "Status" },
+        { command: "stop", description: "Stop" },
+        { command: "new", description: "New conversation" },
+      ],
+    });
+
+    expect(calls.filter((call) => call.method === "setMyCommands")).toEqual([
+      {
+        method: "setMyCommands",
+        payload: {
+          commands: [
+            { command: "start", description: "Start" },
+            { command: "home", description: "Home" },
+            { command: "help", description: "Help" },
+            { command: "status", description: "Status" },
+            { command: "stop", description: "Stop" },
+            { command: "new", description: "New conversation" },
+          ],
+          scope: { type: "all_private_chats" },
+        },
+      },
+      {
+        method: "setMyCommands",
+        payload: {
+          commands: [
+            { command: "help", description: "Help" },
+            { command: "status", description: "Status" },
+            { command: "stop", description: "Stop" },
+            { command: "new", description: "New conversation" },
+            { command: "start", description: "Start" },
+          ],
+          scope: { type: "all_group_chats" },
+        },
+      },
+    ]);
+  });
+
+  test("answers authorized inline queries with ranked command results and argument previews", async () => {
+    const { adapter, api } = await fixture({
+      ompCommands: [{ name: "format", description: "Format a response", source: "skill" }],
+      recentCommands: ["format"],
+    });
+
+    await adapter.handleUpdate({
+      update_id: 90,
+      inline_query: { id: "inline-1", from: { id: 42 }, query: "f --json", offset: "" },
+    });
+
+    const answer = api.last("answerInlineQuery");
+    expect(answer.payload).toMatchObject({
+      inline_query_id: "inline-1",
+      cache_time: 0,
+      is_personal: true,
+    });
+    if (!Array.isArray(answer.payload.results)) throw new Error("expected inline results");
+    expect(answer.payload.results[0]).toMatchObject({
+      type: "article",
+      id: "format",
+      title: "/format",
+      description: "Format a response\nArguments: --json",
+      input_message_content: { message_text: "/format --json" },
+    });
+  });
+
+  test("fails closed for unauthorized inline queries", async () => {
+    const { adapter, api, received } = await fixture({
+      ompCommands: [{ name: "private-skill", description: "Private automation", source: "skill" }],
+      resolve: () => undefined,
+    });
+
+    await adapter.handleUpdate({
+      update_id: 91,
+      inline_query: { id: "inline-unauthorized", from: { id: 99 }, query: "private", offset: "" },
+    });
+
+    expect(api.last("answerInlineQuery").payload).toMatchObject({
+      inline_query_id: "inline-unauthorized",
+      results: [],
+    });
+    expect(received).toEqual([]);
+  });
+
+  test("renders grouped catalog listings and routes search-card selections through ingress", async () => {
+    const { adapter, calls, commandUsage, received } = await fixture({
+      ompCommands: [{ name: "deploy", description: "Ship the current branch", source: "skill" }],
+    });
+
+    await adapter.handleUpdate({ update_id: 92, message: message({ text: "/commands" }) });
+    expect(sentMessage(calls).payload.text).toContain("Everyday");
+    expect(received).toEqual([]);
+
+    await adapter.handleUpdate({ update_id: 93, message: message({ message_id: 11, text: "/commands deploy" }) });
+    const card = sentMessage(calls);
+    expect(card.payload.text).toContain("Command search");
+    expect(card.payload.text).toContain("/deploy");
+
+    await adapter.handleUpdate({
+      update_id: 94,
+      callback_query: {
+        id: "catalog-pick",
+        from: { id: 42 },
+        data: callbackData(card, "/deploy"),
+        message: message({ message_id: 202, text: "Command search" }),
+      },
+    });
+
+    expect(received).toEqual([
+      expect.objectContaining({
+        content: { text: "/deploy" },
+        id: "telegram:primary:command-catalog:94",
+      }),
+    ]);
+    expect(commandUsage).toEqual(["deploy"]);
+  });
+});
 describe("Telegram typing", () => {
   test("sends a one-shot typing action to the conversation topic", async () => {
     const { adapter, calls } = await fixture();

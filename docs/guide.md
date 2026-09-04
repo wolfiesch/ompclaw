@@ -15,6 +15,7 @@ The following operating assumptions are intentional:
 - Every incoming transport identity must be bound to a local principal before it is admitted.
 - A token authorizes a WebSocket credential only after that credential's identity resolves to a principal.
 - Telegram uses Bot API long polling. Do not configure a webhook for the same bot token.
+- To enable Telegram inline command discovery, use `@BotFather` → `/setinline`, select this bot, and set its inline placeholder. If this is skipped or Telegram sends no inline updates, ordinary chats and `/commands` continue to work unchanged.
 - WebSocket is intended to bind to loopback by default. The only HTTP route is the unauthenticated health response.
 
 ## First-use setup and recovery
@@ -101,6 +102,7 @@ The SQLite database is `~/.omp/agent/ompclaw/ompclaw.sqlite` by default. A newly
 | principals and transport identities | resolve an inbound identity to authorized local roles |
 | conversation bindings | record the exact OMP session path associated with a transport address |
 | adapter checkpoints | store the active OMP session file and Telegram update progress |
+| OMP command catalog and command recency | cache OMP-discovered commands and promote a principal’s recent command choices |
 | inbound messages | deduplicate accepted transport messages |
 | pending UI interactions | keep transport UI metadata until completion or expiry |
 | migration markers | make legacy Telegram import idempotent |
@@ -316,7 +318,7 @@ use a custom principal ID, pass it after the code. Use `principal-add` and
 
 Existing forum topics get separate sessions when `topicSessions.enabled` is true. Non-topic Telegram chats and WebSocket credentials continue to share the gateway's root OMP session. Set `createFromRoot` to true to turn an authorized root message into a newly named topic and route that same turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Telegram requires the bot to be a supergroup administrator with permission to manage topics. Topic creation is idempotent across update retries.
 
-The native Telegram command menu exposes the everyday controls: `/start`, `/home`, `/status`, `/stop`, `/new`, `/tasks`, `/jobs`, and `/help`. `/start` explains the assistant without invoking the model. `/home` is a single-message control center: its inline actions edit that same Telegram message while navigating status, model, reasoning, fast mode, auto-compaction, autonomy mode, tasks, and scheduled jobs. Decision prompts provide approve, reject, clarify, and pause-task controls; clarification is sent back as a correction instead of approving the pending action. Scheduled-job cards expose pause, resume, run-now, and delete actions. `/help` groups the complete supported OMP RPC command surface into Everyday, Session, Work, and Advanced sections.
+The private-chat native Telegram command menu exposes the everyday controls: `/start`, `/home`, `/status`, `/stop`, `/new`, `/tasks`, `/jobs`, and `/help`; group chats receive a focused `/help`, `/status`, `/stop`, `/new`, and `/start` menu. `/commands` shows the full normalized gateway, OMP, and skill catalog; `/commands <query>` renders ranked, paginated command choices that submit the selected slash command through normal ingress. Inline search uses the same catalog for authorized users, promotes their recent choices, and inserts the selected slash command into the chat for ordinary command parsing. `/start` explains the assistant without invoking the model. `/home` is a single-message control center: its inline actions edit that same Telegram message while navigating status, model, reasoning, fast mode, auto-compaction, autonomy mode, tasks, and scheduled jobs. Decision prompts provide approve, reject, clarify, and pause-task controls; clarification is sent back as a correction instead of approving the pending action. Scheduled-job cards expose pause, resume, run-now, and delete actions. `/help` groups the complete supported OMP RPC command surface into Everyday, Session, Work, and Advanced sections.
 
 Every rendered inline control carries a view version. OmpClaw rejects expired, moved, disabled, or cross-principal callbacks, refreshes stale cards from current durable state, and serializes edits per control surface.
 

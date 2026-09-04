@@ -222,6 +222,28 @@ export type TgCallbackQuery = Readonly<{
   message?: TgMessage;
 }>;
 
+export type TgInlineQuery = Readonly<{
+  id: string;
+  from: TgUser;
+  query: string;
+  offset: string;
+  chat_type?: string;
+}>;
+
+export type TgInlineQueryResultArticle = Readonly<{
+  type: "article";
+  id: string;
+  title: string;
+  description?: string;
+  input_message_content: Readonly<{ message_text: string }>;
+}>;
+
+export interface TgInlineQueryAnswerOptions {
+  readonly cacheTime?: number;
+  readonly isPersonal?: boolean;
+  readonly signal?: AbortSignal;
+}
+
 export type TgMessageGenerationStopped = Readonly<{
   draft_id: number;
   chat: TgChat;
@@ -233,6 +255,7 @@ export type TgUpdate = Readonly<{
   message?: TgMessage;
   edited_message?: TgMessage;
   callback_query?: TgCallbackQuery;
+  inline_query?: TgInlineQuery;
   stopped_message_generation?: TgMessageGenerationStopped;
 }>;
 
@@ -293,6 +316,26 @@ export async function tg<T>(
     signal: requestSignal(options.timeoutMs ?? REQUEST_LIMIT_MS, options.signal),
   });
   return unwrapTelegram<T>(response);
+}
+
+/** Answers an authenticated inline command search without exposing transport state. */
+export async function answerInlineQuery(
+  token: string,
+  inlineQueryId: string,
+  results: readonly TgInlineQueryResultArticle[],
+  options: TgInlineQueryAnswerOptions = {},
+): Promise<boolean> {
+  return tg<boolean>(
+    token,
+    "answerInlineQuery",
+    {
+      inline_query_id: inlineQueryId,
+      results,
+      ...(options.cacheTime === undefined ? {} : { cache_time: options.cacheTime }),
+      ...(options.isPersonal === undefined ? {} : { is_personal: options.isPersonal }),
+    },
+    { signal: options.signal },
+  );
 }
 
 export async function tgUpload<T>(
@@ -625,8 +668,7 @@ export class Poller {
           "getUpdates",
           {
             offset,
-            timeout: 30,
-            allowed_updates: ["message", "edited_message", "callback_query", "stopped_message_generation"],
+            allowed_updates: ["message", "edited_message", "callback_query", "inline_query", "stopped_message_generation"],
           },
           { timeoutMs: 35_000, signal },
         );

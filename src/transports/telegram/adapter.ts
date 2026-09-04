@@ -5,14 +5,17 @@ import { tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import type { GatewayStore, JsonValue, PendingInteraction } from "../../gateway-store";
+import type { CommandCatalogEntry } from "../../command-catalog";
+import { CommandCatalog } from "../../command-catalog";
 import type { GatewayPairingService, PairingRequestView } from "../../gateway-pairing";
+import type { GatewayStore, JsonValue, PendingInteraction } from "../../gateway-store";
 import type {
   ConversationAddress,
   DeliveryContext,
   InboundEnvelope,
   InboundReplyMediaKind,
   InboundReplyTargetKind,
+  Principal,
   MessageAttachment,
   OutboundContent,
   OutboundReceipt,
@@ -25,9 +28,11 @@ import type {
   UiResponse,
   UiResponseFor,
 } from "../../gateway-types";
+import { parseSlashCommand } from "../../rpc-commands";
 import {
   TELEGRAM_BOT_DESCRIPTION,
   TELEGRAM_BOT_SHORT_DESCRIPTION,
+  answerInlineQuery,
   acquireLock,
   downloadFileBytes,
   Poller,
@@ -44,6 +49,9 @@ import {
   type TgChat,
   type TgDocument,
   type TgFileBase,
+  type TgInlineQuery,
+  type TgInlineQueryAnswerOptions,
+  type TgInlineQueryResultArticle,
   type TgMessage,
   type TgMessageGenerationStopped,
   type TgPhotoSize,
@@ -77,6 +85,8 @@ const STOP_CALLBACK = "ompctl:stop";
 const SELECT_PAGE_SIZE = 8;
 const TOPIC_NAME_LIMIT = 128;
 const PAIRING_APPROVAL_CHECK_MS = 1_000;
+const CATALOG_CALLBACK = "ompcat";
+const INLINE_RESULT_LIMIT = 50;
 
 function startPairingApprovalMonitor(run: () => void | Promise<void>): () => void {
   run();
@@ -106,6 +116,11 @@ export interface TelegramApiSeams {
   readonly randomId?: () => string;
   readonly transcribe?: (command: readonly string[], file: string, signal?: AbortSignal) => Promise<string>;
   readonly startPairingApprovalMonitor?: (run: () => void | Promise<void>) => () => void;
+  readonly answerInlineQuery?: (
+    inlineQueryId: string,
+    results: readonly TgInlineQueryResultArticle[],
+    options?: TgInlineQueryAnswerOptions,
+  ) => Promise<boolean>;
 }
 
 export interface TelegramTransportAdapterOptions {
@@ -124,7 +139,13 @@ export interface TelegramTransportAdapterOptions {
     | "getSemanticView"
     | "getSemanticViewByReceipt"
     | "putSemanticView"
-  >;
+  > &
+    Partial<
+      Pick<
+        GatewayStore,
+        "listOmpAvailableCommands" | "recordCommandUsage" | "listRecentCommandUsage"
+      >
+    >;
   readonly pairing?: Pick<
     GatewayPairingService,
     "requestFromTransport" | "listUnconfirmedApprovals" | "completeConfirmation"
@@ -136,6 +157,7 @@ export interface TelegramTransportAdapterOptions {
   readonly uiTimeoutMs?: number;
   readonly commands?: readonly { readonly command: string; readonly description: string }[];
   readonly createTopicsFromRoot?: boolean;
+  readonly allowRpcBash?: boolean;
 }
 
 interface MediaSelection {
@@ -196,6 +218,16 @@ interface DurablePairingCard {
 interface DraftRoute {
   readonly address: ConversationAddress;
   readonly context: DeliveryContext;
+}
+
+interface CommandCatalogCard {
+  readonly id: string;
+  readonly address: ConversationAddress;
+  readonly context: DeliveryContext;
+  readonly principalId: string;
+  readonly entries: readonly CommandCatalogEntry[];
+  page: number;
+  receipt?: OutboundReceipt;
 }
 
 function sameAddress(left: ConversationAddress, right: ConversationAddress): boolean {
@@ -576,6 +608,16 @@ function menuCommands(
   return result;
 }
 
+function groupMenuCommands(
+  input: readonly { readonly command: string; readonly description: string }[],
+): readonly { command: string; description: string }[] {
+  const byCommand = new Map(input.map((command) => [command.command, command]));
+  return ["help", "status", "stop", "new", "start"].flatMap((command) => {
+    const item = byCommand.get(command);
+    return item === undefined ? [] : [item];
+  });
+}
+
 export class TelegramTransportAdapter implements TransportAdapter {
   readonly id = "telegram";
   readonly capabilities: TransportCapabilities = {
@@ -598,6 +640,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #poller: TelegramPoller;
   readonly #call: TelegramCall;
   readonly #download: (token: string, filePath: string) => Promise<Uint8Array>;
+  readonly #answerInlineQuery: NonNullable<TelegramApiSeams["answerInlineQuery"]>;
   readonly #claimLock: NonNullable<TelegramApiSeams["acquireLock"]>;
   readonly #dropLock: NonNullable<TelegramApiSeams["releaseLock"]>;
   readonly #heartbeat: NonNullable<TelegramApiSeams["startLockHeartbeat"]>;
@@ -610,6 +653,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #interactionLifetime: number;
   readonly #commands: readonly { command: string; description: string }[];
   readonly #topicsFromRoot: boolean;
+  readonly #allowRpcBash: boolean;
   readonly #outbound: Outbound;
   readonly #semanticViews: TelegramSemanticViewReconciler;
   readonly #interactions = new Map<string, InteractiveState>();
@@ -618,6 +662,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #activeUpdates = new Set<number>();
   readonly #updateTasks = new Set<Promise<void>>();
 
+  readonly #catalogCards = new Map<string, CommandCatalogCard>();
   #context: TransportStartContext | undefined;
   #lockPath: string | undefined;
   #stopHeartbeat: (() => void) | undefined;
@@ -651,6 +696,9 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#interactionLifetime = options.uiTimeoutMs ?? INTERACTION_LIFETIME_MS;
     this.#commands = menuCommands(options.commands ?? []);
     this.#topicsFromRoot = options.createTopicsFromRoot ?? false;
+    this.#answerInlineQuery =
+      options.api?.answerInlineQuery ??
+      ((inlineQueryId, results, request) => answerInlineQuery(this.#token, inlineQueryId, results, request));
     this.#outbound = new Outbound({
       token: this.#token,
       account: this.#account,
@@ -659,6 +707,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       callTelegram: this.#call,
       uploadTelegram: options.api?.uploadTelegram,
     });
+    this.#allowRpcBash = options.allowRpcBash ?? false;
     this.#semanticViews = new TelegramSemanticViewReconciler(this.#store, this.#outbound, this.#clock);
   }
 
@@ -673,17 +722,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#stopHeartbeat = this.#heartbeat(lock);
     let pollerStarted = false;
     try {
-      if (this.#commands.length > 0) {
-        try {
-          await this.#telegram("setMyCommands", { commands: this.#commands }, context.signal);
-        } catch (error) {
-          if (context.signal?.aborted) throw error;
-          if (error instanceof TgError && (error.code === 401 || error.code === 404)) throw error;
-          this.#log?.warn(
-            `[telegram] command menu registration failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
+      if (this.#commands.length > 0) await this.#registerCommandMenus(context.signal);
       await this.#refreshBotProfile(context.signal);
       this.#poller.start(this.#token, (update) => this.#trackUpdate(update), this.#log);
       pollerStarted = true;
@@ -732,6 +771,26 @@ export class TelegramTransportAdapter implements TransportAdapter {
     }
   }
 
+  async #registerCommandMenus(signal?: AbortSignal): Promise<void> {
+    const menus = [
+      { commands: this.#commands, scope: { type: "all_private_chats" } },
+      { commands: groupMenuCommands(this.#commands), scope: { type: "all_group_chats" } },
+    ];
+    for (const menu of menus) {
+      if (menu.commands.length === 0) continue;
+      try {
+        await this.#telegram("setMyCommands", menu, signal);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        if (error instanceof TgError && (error.code === 401 || error.code === 404)) throw error;
+        this.#log?.warn(
+          `[telegram] command menu registration failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+    }
+  }
+
   async stop(): Promise<void> {
     if (this.#context === undefined) return;
     if (this.#stopTask) return this.#stopTask;
@@ -750,6 +809,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       this.#cards.clear();
       this.#draftRoutes.clear();
       this.#releaseRuntimeOwnership();
+      this.#catalogCards.clear();
       this.#context = undefined;
       this.#stopTask = undefined;
     })();
@@ -764,6 +824,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#activeUpdates.add(update.update_id);
     try {
       if (update.callback_query) await this.#handleCallback(update.callback_query, update.update_id, context);
+      else if (update.inline_query) await this.#handleInlineQuery(update.inline_query, context);
       else {
         const stopped = update.stopped_message_generation;
         if (stopped) await this.#handleDraftStop(stopped, update.update_id, context);
@@ -923,6 +984,116 @@ export class TelegramTransportAdapter implements TransportAdapter {
     }
   }
 
+  async #handleInlineQuery(query: TgInlineQuery, context: TransportStartContext): Promise<void> {
+    const identity = telegramIdentity(query.from.id, this.#account);
+    const principal = query.from.is_bot ? undefined : await context.resolveIdentity(identity, context.signal);
+    if (principal === undefined) {
+      await this.#respondInlineQuery(query, [], context.signal);
+      return;
+    }
+    const terms = query.query.trim().split(/\s+/);
+    const filter = terms[0] ?? "";
+    const args = terms.slice(1).join(" ");
+    const recent = this.#store.listRecentCommandUsage?.(principal.id) ?? [];
+    const results = this.#commandCatalog()
+      .search(filter, recent)
+      .slice(0, INLINE_RESULT_LIMIT)
+      .map((entry) => {
+        const description = args.length === 0 ? entry.description : `${entry.description}\nArguments: ${args}`;
+        return {
+          type: "article" as const,
+          id: entry.name,
+          title: `/${entry.name}`,
+          ...(description.length === 0 ? {} : { description: description.slice(0, 512) }),
+          input_message_content: { message_text: `/${entry.name}${args.length === 0 ? "" : ` ${args}`}` },
+        };
+      });
+    await this.#respondInlineQuery(query, results, context.signal);
+  }
+
+  async #respondInlineQuery(
+    query: TgInlineQuery,
+    results: readonly TgInlineQueryResultArticle[],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await withTelegramRetry(
+      () => this.#answerInlineQuery(query.id, results, { cacheTime: 0, isPersonal: true, signal }),
+      { signal, log: this.#log },
+    );
+  }
+
+  #commandCatalog(): CommandCatalog {
+    return new CommandCatalog({
+      ompCommands: this.#store.listOmpAvailableCommands?.() ?? [],
+      allowRpcBash: this.#allowRpcBash,
+    });
+  }
+
+  async #showCommandCatalog(
+    address: ConversationAddress,
+    principal: Principal,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const catalog = this.#commandCatalog();
+    const trimmedQuery = query.trim();
+    const delivery: DeliveryContext = { principal, origin: address };
+    if (trimmedQuery.length === 0) {
+      const text = [
+        "Commands",
+        ...catalog.groups().flatMap((group) => [
+          "",
+          `${group.name}: ${group.entries.map((entry) => `/${entry.name}`).join(" ")}`,
+        ]),
+        "",
+        "Search with /commands <query>.",
+      ].join("\n");
+      await this.#outbound.sendMessage(address, text, delivery, {}, signal);
+      return;
+    }
+    const entries = catalog.search(trimmedQuery, this.#store.listRecentCommandUsage?.(principal.id) ?? []);
+    if (entries.length === 0) {
+      await this.#outbound.sendMessage(address, "No commands match that search.", delivery, {}, signal);
+      return;
+    }
+    const card: CommandCatalogCard = {
+      id: this.#newId(),
+      address,
+      context: delivery,
+      principalId: principal.id,
+      entries,
+      page: 0,
+    };
+    const rendered = this.#renderCommandCatalogCard(card);
+    card.receipt = await this.#outbound.sendMessage(
+      address,
+      rendered.text,
+      delivery,
+      { replyMarkup: this.#cardReplyMarkup(rendered) },
+      signal,
+    );
+    this.#catalogCards.set(card.id, card);
+  }
+
+  #renderCommandCatalogCard(card: CommandCatalogCard): TelegramCardRender {
+    const start = card.page * SELECT_PAGE_SIZE;
+    const pageCount = Math.max(1, Math.ceil(card.entries.length / SELECT_PAGE_SIZE));
+    return renderPickerCard(
+      {
+        title: "Command search",
+        prompt: "Choose a command to send.",
+        options: card.entries.slice(start, start + SELECT_PAGE_SIZE).map((entry, relative) => ({
+          id: String(start + relative),
+          label: `/${entry.name}`,
+          ...(entry.description.length === 0 ? {} : { description: entry.description }),
+        })),
+        page: card.page,
+        pageCount,
+      },
+      (action) => `${CATALOG_CALLBACK}:${card.id}:${action}`,
+    );
+  }
+
   async #handleMessage(message: TgMessage, update: TgUpdate, context: TransportStartContext): Promise<void> {
     if (!message.from || message.from.is_bot) return;
     const identity = telegramIdentity(message.from.id, this.#account);
@@ -937,6 +1108,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return;
     }
     if (await this.#captureReply(message, principal.id, address)) return;
+    const catalogRequest = parseSlashCommand(message.text);
+    if (catalogRequest?.name === "commands") {
+      await this.#showCommandCatalog(address, principal, catalogRequest.args, context.signal);
+      return;
+    }
     if (this.#topicsFromRoot && message.chat.is_forum && !message.is_topic_message && !isBotCommand(message.text)) {
       const routeKey = `forum-topic:${message.chat.id}`;
       let threadId = storedTopicThread(this.#store.getCheckpoint(this.id, routeKey), message.message_id);
@@ -1039,6 +1215,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
     };
     if (envelope.content.text === undefined && envelope.content.attachments === undefined) return;
     await context.receive(envelope, context.signal);
+    const command = parseSlashCommand(envelope.content.text);
+    if (command !== undefined && this.#commandCatalog().find(command.name) !== undefined) {
+      this.#store.recordCommandUsage?.(principal.id, command.name, this.#clock());
+    }
   }
 
   async #handleCallback(query: TgCallbackQuery, updateId: number, context: TransportStartContext): Promise<void> {
@@ -1068,6 +1248,20 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return;
     }
     const callbackContext: DeliveryContext = { principal, origin: address };
+    const catalogPrefix = `${CATALOG_CALLBACK}:`;
+    if (query.data.startsWith(catalogPrefix)) {
+      await this.#handleCommandCatalogCallback(
+        query,
+        updateId,
+        identity,
+        address,
+        principal,
+        context,
+        query.data.slice(catalogPrefix.length),
+        acknowledge,
+      );
+      return;
+    }
     if (query.data.startsWith("s1.")) {
       let callbackData: ReturnType<typeof decodeTelegramSemanticCallback>;
       try {
@@ -1186,6 +1380,77 @@ export class TelegramTransportAdapter implements TransportAdapter {
       },
       context.signal,
     );
+  }
+
+  async #handleCommandCatalogCallback(
+    query: TgCallbackQuery,
+    updateId: number,
+    identity: TransportIdentity,
+    address: ConversationAddress,
+    principal: Principal,
+    context: TransportStartContext,
+    remainder: string,
+    acknowledge: (text?: string, alert?: boolean) => Promise<unknown>,
+  ): Promise<void> {
+    const separator = remainder.indexOf(":");
+    if (separator < 1 || query.message === undefined) {
+      await acknowledge("Invalid command control.");
+      return;
+    }
+    const card = this.#catalogCards.get(remainder.slice(0, separator));
+    if (
+      card === undefined ||
+      card.principalId !== principal.id ||
+      !sameAddress(card.address, address) ||
+      card.receipt?.messageId !== String(query.message.message_id)
+    ) {
+      await acknowledge("This command search has expired.", true);
+      return;
+    }
+    const action = remainder.slice(separator + 1);
+    if (action === "noop") {
+      await acknowledge();
+      return;
+    }
+    if (action === "previous" || action === "next") {
+      const pageCount = Math.max(1, Math.ceil(card.entries.length / SELECT_PAGE_SIZE));
+      card.page =
+        action === "previous" ? Math.max(0, card.page - 1) : Math.min(pageCount - 1, card.page + 1);
+      const rendered = this.#renderCommandCatalogCard(card);
+      if (card.receipt !== undefined) {
+        await this.#outbound.update(card.address, card.receipt, { text: rendered.text }, card.context);
+        await this.#outbound.setReplyMarkup(
+          card.address,
+          card.receipt,
+          this.#cardReplyMarkup(rendered),
+          card.context,
+        );
+      }
+      await acknowledge();
+      return;
+    }
+    const matched = /^pick-(\d+)$/.exec(action);
+    const index = matched === null ? Number.NaN : Number(matched[1]);
+    const entry = Number.isSafeInteger(index) ? card.entries[index] : undefined;
+    if (entry === undefined) {
+      await acknowledge("This command is no longer available.");
+      return;
+    }
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:command-catalog:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: `/${entry.name}` },
+        sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
+        edited: false,
+      },
+      context.signal,
+    );
+    this.#store.recordCommandUsage?.(principal.id, entry.name, this.#clock());
+    this.#catalogCards.delete(card.id);
+    await acknowledge(`Sent /${entry.name}`);
   }
 
   async #collectSemanticInput(

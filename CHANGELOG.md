@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
 - Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
 - Add table-driven native Telegram media dispatch for outbound attachments, sending audio (`sendAudio`), voice notes (`sendVoice`), video (`sendVideo`), animations (`sendAnimation`), photos (`sendPhoto`), and documents (`sendDocument`) by MIME type and file extension, with native `sendMediaGroup` grouping for visual and audio sets and automatic fallback to documents for mixed media batches.
+- Add an authorized searchable Telegram command and skill catalog through `/commands` and inline mode, with ranked results, durable per-principal recency, paginated picker cards, and private/group-scoped native menus.
 
 - Add a single durable Telegram pairing journey card that updates in place for approval, rejection, expiry, retry, connected Home access, and dismissible command examples.
 - Print the bot's `https://t.me/<botusername>` deep link during successful interactive setup.

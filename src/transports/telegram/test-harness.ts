@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { OmpAvailableCommand } from "../../command-catalog";
 import type {
   IngressCompositionRecord,
   JsonValue,
@@ -76,6 +77,23 @@ export class FakeTelegramApi {
 
   constructor(options: FakeTelegramApiOptions = {}) {
     this.poller = options.poller ?? new TelegramTestPoller();
+    const callTelegram = async (method: string, payload: Record<string, unknown> = {}): Promise<unknown> => {
+      this.calls.push({ method, payload });
+      if (method === "setMyCommands" && options.setCommandsError) throw options.setCommandsError;
+      if (method === "setMessageReaction" && options.reactionError) throw options.reactionError;
+      if (method === "getMe") return options.botIdentity ?? true;
+      if (
+        (method === "setMyDescription" || method === "setMyShortDescription" || method === "setMyName") &&
+        options.botProfileError
+      ) {
+        throw options.botProfileError;
+      }
+      if (method === "sendMessageDraft") return true;
+      if (method === "getFile") return { file_path: "uploads/file.bin" };
+      if (method === "createForumTopic") return { message_thread_id: 77 };
+      if (method === "sendMessage") return { message_id: ++this.#messageId };
+      return true;
+    };
     this.seams = {
       poller: this.poller,
       acquireLock: () => ({ ok: true }),
@@ -91,21 +109,14 @@ export class FakeTelegramApi {
           if (this.#pairingApprovalRun === run) this.#pairingApprovalRun = undefined;
         };
       },
-      callTelegram: async (method, payload = {}) => {
-        this.calls.push({ method, payload });
-        if (method === "setMyCommands" && options.setCommandsError) throw options.setCommandsError;
-        if (method === "setMessageReaction" && options.reactionError) throw options.reactionError;
-        if (method === "getMe") return options.botIdentity ?? true;
-        if (
-          (method === "setMyDescription" || method === "setMyShortDescription" || method === "setMyName") &&
-          options.botProfileError
-        ) {
-          throw options.botProfileError;
-        }
-        if (method === "sendMessageDraft") return true;
-        if (method === "getFile") return { file_path: "uploads/file.bin" };
-        if (method === "createForumTopic") return { message_thread_id: 77 };
-        if (method === "sendMessage") return { message_id: ++this.#messageId };
+      callTelegram,
+      answerInlineQuery: async (inlineQueryId, results, request) => {
+        await callTelegram("answerInlineQuery", {
+          inline_query_id: inlineQueryId,
+          results,
+          ...(request?.cacheTime === undefined ? {} : { cache_time: request.cacheTime }),
+          ...(request?.isPersonal === undefined ? {} : { is_personal: request.isPersonal }),
+        });
         return true;
       },
       downloadFileBytes: async () => new Uint8Array([4, 5, 6]),
@@ -135,6 +146,8 @@ export interface TelegramAdapterHarnessOptions extends FakeTelegramApiOptions {
   readonly receive?: (message: InboundEnvelope) => Promise<void>;
   readonly pairing?: TelegramTransportAdapterOptions["pairing"];
   readonly pendingInteractions?: readonly PendingInteraction[];
+  readonly ompCommands?: readonly OmpAvailableCommand[];
+  readonly recentCommands?: readonly string[];
 }
 
 export interface TelegramAdapterHarness {
@@ -148,6 +161,7 @@ export interface TelegramAdapterHarness {
   readonly received: InboundEnvelope[];
   readonly stateDir: string;
   readonly warnings: string[];
+  readonly commandUsage: string[];
   dispose(): Promise<void>;
   flushPairingApprovals(): Promise<void>;
 }
@@ -169,6 +183,7 @@ export async function createTelegramAdapterHarness(
   const semanticViews = new Map<string, StoredSemanticView>();
   const semanticKey = (address: ConversationAddress, viewId: string): string =>
     JSON.stringify([address.transport, address.account, address.channel, address.thread ?? "", viewId]);
+  const commandUsage: string[] = [];
   const pendingInbound: PendingInboundMessage[] =
     options.pendingAttachmentName === undefined
       ? []
@@ -265,6 +280,13 @@ export async function createTelegramAdapterHarness(
         semanticViews.set(semanticKey(record.address, record.view.id), record);
         return true;
       },
+      listOmpAvailableCommands: () => options.ompCommands ?? [],
+      recordCommandUsage: (_principalId, commandName) => {
+        const existing = commandUsage.indexOf(commandName);
+        if (existing >= 0) commandUsage.splice(existing, 1);
+        commandUsage.unshift(commandName);
+      },
+      listRecentCommandUsage: () => [...commandUsage, ...(options.recentCommands ?? [])],
     },
     logger: {
       debug: () => {},
@@ -307,6 +329,7 @@ export async function createTelegramAdapterHarness(
     semanticViews,
     stateDir,
     warnings,
+    commandUsage,
     flushPairingApprovals: () => api.flushPairingApprovals(),
     async dispose() {
       let stopError: unknown;

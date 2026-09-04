@@ -25,6 +25,7 @@ import {
 import {
   GatewayStore,
   type ConversationBinding,
+  type GatewayCommandCatalogStore,
   type GatewayTurnLifecycleStore,
   type JsonValue,
   type ScheduledJob,
@@ -61,6 +62,10 @@ export interface GatewayApplicationStore
   getSemanticView: GatewayStore["getSemanticView"];
   putSemanticView: GatewayStore["putSemanticView"];
   getSemanticViewByReceipt: GatewayStore["getSemanticViewByReceipt"];
+  listOmpAvailableCommands?: GatewayCommandCatalogStore["listOmpAvailableCommands"];
+  recordCommandUsage?: GatewayCommandCatalogStore["recordCommandUsage"];
+  listRecentCommandUsage?: GatewayCommandCatalogStore["listRecentCommandUsage"];
+  replaceOmpAvailableCommands?: GatewayCommandCatalogStore["replaceOmpAvailableCommands"];
 }
 
 export interface GatewayRuntime {
@@ -322,6 +327,7 @@ export class GatewayApplication {
           store,
           pairing: new GatewayPairingService(store),
           commands: runtimeCommandMenu(this.#config.omp.allowRpcBash),
+          allowRpcBash: this.#config.omp.allowRpcBash,
           createTopicsFromRoot: telegram.topicSessions.enabled && telegram.topicSessions.createFromRoot,
           ...(telegram.transcribeCommand === undefined ? {} : { transcribeCommand: telegram.transcribeCommand }),
         }),
