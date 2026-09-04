@@ -193,19 +193,23 @@ export function taskHistorySemanticView(
       ? "active"
       : "waiting",
     title: "Task timeline",
-    summary: entries.length === 0 ? "No persisted tasks for this conversation." : `${entries.length} recent task${entries.length === 1 ? "" : "s"}`,
+    summary:
+      entries.length === 0
+        ? "No persisted tasks for this conversation."
+        : `${entries.length} recent task${entries.length === 1 ? "" : "s"}`,
     sections: visible.map((entry, index) => {
       const eventLines = entry.events.slice(-3).map((event) => `• ${event.text}`);
       return {
         id: `task${index}`,
         label: `${taskHistoryState(entry.lifecycle.state)} · ${boundedSummary(entry.lifecycle.prompt).slice(0, 80)}`,
-        text: [
-          entry.lifecycle.currentTool ? `Current activity · ${entry.lifecycle.currentTool}` : undefined,
-          ...eventLines,
-          entry.lifecycle.error ? `Recovery · ${boundedSummary(entry.lifecycle.error)}` : undefined,
-        ]
-          .filter((line): line is string => line !== undefined)
-          .join("\n") || "No recorded activity.",
+        text:
+          [
+            entry.lifecycle.currentTool ? `Current activity · ${entry.lifecycle.currentTool}` : undefined,
+            ...eventLines,
+            entry.lifecycle.error ? `Recovery · ${boundedSummary(entry.lifecycle.error)}` : undefined,
+          ]
+            .filter((line): line is string => line !== undefined)
+            .join("\n") || "No recorded activity.",
         tone:
           entry.lifecycle.state === "completed"
             ? ("success" as const)
@@ -216,7 +220,9 @@ export function taskHistorySemanticView(
     }),
     actions: [
       ...visible.flatMap((entry, index) =>
-        entry.lifecycle.state === "failed" || entry.lifecycle.state === "interrupted" || entry.lifecycle.state === "stopped"
+        entry.lifecycle.state === "failed" ||
+        entry.lifecycle.state === "interrupted" ||
+        entry.lifecycle.state === "stopped"
           ? [
               {
                 id: `retry${index}`,
@@ -283,6 +289,113 @@ export function sessionChoiceSemanticView(input: SessionChoiceSemanticViewInput)
         style: choice.selected ? ("primary" as const) : ("default" as const),
       })),
       { id: "back", label: "Back to Home", command: "/home" },
+    ],
+    updatedAt: input.updatedAt,
+  };
+}
+
+export interface AvailableModel {
+  readonly provider: string;
+  readonly id: string;
+}
+
+export interface ModelProviderSemanticViewInput {
+  readonly models: readonly AvailableModel[];
+  readonly current?: AvailableModel;
+  readonly version: number;
+  readonly updatedAt: number;
+}
+
+export interface ModelPageSemanticViewInput extends ModelProviderSemanticViewInput {
+  readonly provider: string;
+  readonly page: number;
+  readonly pageSize: number;
+}
+
+function modelDisplayName(id: string): string {
+  return id
+    .split(/[-_]/)
+    .filter((part) => part.length > 0)
+    .map((part) => (part.toLowerCase() === "gpt" ? "GPT" : `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`))
+    .join(" ");
+}
+
+export function modelProviderSemanticView(input: ModelProviderSemanticViewInput): SemanticView {
+  const providers: Array<{ readonly provider: string; readonly count: number }> = [];
+  for (const model of [...input.models].sort((left, right) => left.provider.localeCompare(right.provider))) {
+    const last = providers.at(-1);
+    if (last?.provider === model.provider) {
+      providers[providers.length - 1] = { provider: last.provider, count: last.count + 1 };
+    } else {
+      providers.push({ provider: model.provider, count: 1 });
+    }
+  }
+  const current =
+    input.current === undefined ? "Unknown" : `${input.current.provider} · ${modelDisplayName(input.current.id)}`;
+  return {
+    schemaVersion: 1,
+    id: "model",
+    kind: "decision",
+    version: input.version,
+    state: "waiting",
+    title: "🤖 Model",
+    summary: `Current: ${current}`,
+    sections: [{ id: "choose", text: "Choose a provider." }],
+    actions: [
+      ...providers.map(({ provider, count }, index) => ({
+        id: `provider${index}`,
+        label: `${input.current?.provider === provider ? "✓ " : ""}${provider} · ${count}`,
+        command: `/model provider ${encodeURIComponent(provider)}`,
+        style: input.current?.provider === provider ? ("primary" as const) : ("default" as const),
+      })),
+      { id: "cancel", label: "Cancel", command: "/home" },
+    ],
+    updatedAt: input.updatedAt,
+  };
+}
+
+export function modelPageSemanticView(input: ModelPageSemanticViewInput): SemanticView {
+  const providerModels = input.models
+    .filter((model) => model.provider === input.provider)
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const pageCount = Math.max(1, Math.ceil(providerModels.length / input.pageSize));
+  const page = Math.max(0, Math.min(pageCount - 1, input.page));
+  const visible = providerModels.slice(page * input.pageSize, (page + 1) * input.pageSize);
+  const current = input.current?.provider === input.provider ? modelDisplayName(input.current.id) : "None";
+  const encodedProvider = encodeURIComponent(input.provider);
+  return {
+    schemaVersion: 1,
+    id: "model",
+    kind: "decision",
+    version: input.version,
+    state: "waiting",
+    title: `🤖 ${input.provider} models ${page + 1}/${pageCount}`,
+    summary: `Current: ${current}`,
+    sections: visible.map((model, index) => ({
+      id: `model${index}`,
+      label: modelDisplayName(model.id),
+      text: model.id,
+      tone:
+        input.current?.provider === model.provider && input.current.id === model.id
+          ? ("success" as const)
+          : ("muted" as const),
+    })),
+    actions: [
+      ...visible.map((model, index) => ({
+        id: `choose${index}`,
+        label: `${input.current?.provider === model.provider && input.current.id === model.id ? "✓ " : ""}${modelDisplayName(model.id)}`,
+        command: `/model select ${encodedProvider} ${encodeURIComponent(model.id)}`,
+        style:
+          input.current?.provider === model.provider && input.current.id === model.id
+            ? ("primary" as const)
+            : ("default" as const),
+      })),
+      { id: "back", label: "← Back", command: "/model" },
+      ...(page + 1 < pageCount
+        ? [{ id: "next", label: "Next →", command: `/model page ${encodedProvider} ${page + 1}` }]
+        : []),
+      ...(page > 0 ? [{ id: "previous", label: "← Prev", command: `/model page ${encodedProvider} ${page - 1}` }] : []),
+      { id: "cancel", label: "Cancel", command: "/home" },
     ],
     updatedAt: input.updatedAt,
   };

@@ -1,9 +1,4 @@
-import type {
-  ConversationAddress,
-  DeliveryContext,
-  UiRequest,
-  UiResponse,
-} from "./gateway-types";
+import type { ConversationAddress, DeliveryContext, UiRequest, UiResponse } from "./gateway-types";
 import type { GatewayDelivery } from "./gateway-tools";
 import type { RpcExtensionUiRequest, RpcExtensionUiResponse } from "./rpc-protocol";
 
@@ -111,7 +106,9 @@ export class RpcGatewayUiBroker {
       if (!this.#pendingByRpcId.delete(pending.rpcId)) return;
       clearTimeout(pending.timer);
       if (pending.controller.signal.aborted) return;
-      this.#options.log.warn(`[ompclaw rpc] UI ${pending.request.method} failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#options.log.warn(
+        `[ompclaw rpc] UI ${pending.request.method} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       this.#sendCancelled(pending);
     }
   }
@@ -121,6 +118,7 @@ export class RpcGatewayUiBroker {
       case "select":
         return {
           type: "select",
+          presentation: "decision",
           title: request.title,
           options: request.options.map((value, index) => {
             const description = request.optionDetails?.[index]?.description;
@@ -138,7 +136,11 @@ export class RpcGatewayUiBroker {
       case "editor":
         return { type: "editor", title: request.title, initialValue: request.prefill ?? "" };
       case "notify":
-        return { type: "notify", message: request.message, ...(request.notifyType ? { level: request.notifyType } : {}) };
+        return {
+          type: "notify",
+          message: request.message,
+          ...(request.notifyType ? { level: request.notifyType } : {}),
+        };
       case "setStatus":
         return { type: "status", key: request.statusKey, ...(request.statusText ? { text: request.statusText } : {}) };
       case "setWidget":
@@ -153,22 +155,33 @@ export class RpcGatewayUiBroker {
       case "set_editor_text":
         return { type: "editor_text", text: request.text };
       case "open_url":
-        return { type: "open_url", url: request.launchUrl ?? request.url, ...(request.instructions ? { label: request.instructions } : {}) };
+        return {
+          type: "open_url",
+          url: request.launchUrl ?? request.url,
+          ...(request.instructions ? { label: request.instructions } : {}),
+        };
     }
   }
 
   #sendResponse(request: RpcExtensionUiRequest, response: UiResponse): void {
     switch (request.method) {
       case "select":
-        if (response.type === "select") this.#options.sendResponse({ type: "extension_ui_response", id: request.id, value: response.selected[0] ?? "" });
+        if (response.type === "select")
+          this.#options.sendResponse({
+            type: "extension_ui_response",
+            id: request.id,
+            value: response.selected[0] ?? "",
+          });
         return;
       case "confirm":
-        if (response.type === "confirm") this.#options.sendResponse({ type: "extension_ui_response", id: request.id, confirmed: response.confirmed });
+        if (response.type === "confirm")
+          this.#options.sendResponse({ type: "extension_ui_response", id: request.id, confirmed: response.confirmed });
         return;
       case "input":
       case "editor":
         if (response.type === request.method) {
-          if (response.cancelled) this.#options.sendResponse({ type: "extension_ui_response", id: request.id, cancelled: true });
+          if (response.cancelled)
+            this.#options.sendResponse({ type: "extension_ui_response", id: request.id, cancelled: true });
           else this.#options.sendResponse({ type: "extension_ui_response", id: request.id, value: response.value });
         }
         return;
@@ -178,7 +191,12 @@ export class RpcGatewayUiBroker {
   }
 
   #sendCancelled(pending: PendingUi): void {
-    if (pending.request.method === "select" || pending.request.method === "confirm" || pending.request.method === "input" || pending.request.method === "editor") {
+    if (
+      pending.request.method === "select" ||
+      pending.request.method === "confirm" ||
+      pending.request.method === "input" ||
+      pending.request.method === "editor"
+    ) {
       this.#options.sendResponse({
         type: "extension_ui_response",
         id: pending.rpcId,
@@ -200,18 +218,26 @@ export class RpcGatewayUiBroker {
   }
 
   #timeoutFor(request: Exclude<RpcExtensionUiRequest, { method: "cancel" }>): number | undefined {
-    return "timeout" in request && typeof request.timeout === "number" && request.timeout > 0 ? request.timeout : undefined;
+    return "timeout" in request && typeof request.timeout === "number" && request.timeout > 0
+      ? request.timeout
+      : undefined;
   }
 
   #logMissingTarget(request: Exclude<RpcExtensionUiRequest, { method: "cancel" }>): void {
     if (
-      request.method === "setStatus"
-      || request.method === "setWidget"
-      || request.method === "setTitle"
-      || request.method === "set_editor_text"
-    ) return;
+      request.method === "setStatus" ||
+      request.method === "setWidget" ||
+      request.method === "setTitle" ||
+      request.method === "set_editor_text"
+    )
+      return;
     this.#options.log.warn(`[ompclaw rpc] Cannot present ${request.method}: no active delivery context`);
-    if (request.method === "select" || request.method === "confirm" || request.method === "input" || request.method === "editor") {
+    if (
+      request.method === "select" ||
+      request.method === "confirm" ||
+      request.method === "input" ||
+      request.method === "editor"
+    ) {
       this.#options.sendResponse({ type: "extension_ui_response", id: request.id, cancelled: true });
     }
   }

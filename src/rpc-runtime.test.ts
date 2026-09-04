@@ -1478,16 +1478,32 @@ describe("RpcGatewayRuntime", () => {
     expect(modelPage).toMatchObject({
       type: "semantic_view",
       view: {
-        id: "home",
-        title: "Choose a model",
+        id: "model",
+        title: "🤖 Model",
         actions: expect.arrayContaining([
-          expect.objectContaining({ label: "✓ model", command: "/model provider/model" }),
-          { id: "back", label: "Back to Home", command: "/home" },
+          expect.objectContaining({ label: "✓ provider · 1", command: "/model provider provider" }),
+          { id: "cancel", label: "Cancel", command: "/home" },
         ]),
       },
     });
 
-    await runtime.handleInbound(message("commands", "/model provider/model"));
+    await runtime.handleInbound(message("commands", "/model provider provider"));
+    const providerPage = deliveries
+      .filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view")
+      .at(-1)?.request;
+    expect(providerPage).toMatchObject({
+      type: "semantic_view",
+      view: {
+        id: "model",
+        title: "🤖 provider models 1/1",
+        actions: expect.arrayContaining([
+          expect.objectContaining({ label: "✓ Model", command: "/model select provider model" }),
+          { id: "back", label: "← Back", command: "/model" },
+        ]),
+      },
+    });
+
+    await runtime.handleInbound(message("commands", "/model select provider model"));
     const rpc = FakeOmpRpcClient.instances[0];
     expect(rpc.sent).toContainEqual(
       expect.objectContaining({

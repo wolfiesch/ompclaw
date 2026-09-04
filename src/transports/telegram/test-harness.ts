@@ -125,6 +125,7 @@ export interface TelegramAdapterHarnessOptions extends FakeTelegramApiOptions {
   readonly pendingAttachmentName?: string;
   readonly receive?: (message: InboundEnvelope) => Promise<void>;
   readonly pairing?: TelegramTransportAdapterOptions["pairing"];
+  readonly pendingInteractions?: readonly PendingInteraction[];
 }
 
 export interface TelegramAdapterHarness {
@@ -153,7 +154,9 @@ export async function createTelegramAdapterHarness(
   const inboxDir = join(stateDir, "inbox", "telegram", "primary");
   const received: InboundEnvelope[] = [];
   const checkpoints = new Map<string, JsonValue>();
-  const pending = new Map<string, PendingInteraction>();
+  const pending = new Map<string, PendingInteraction>(
+    (options.pendingInteractions ?? []).map((interaction) => [interaction.id, interaction]),
+  );
   const semanticViews = new Map<string, StoredSemanticView>();
   const semanticKey = (address: ConversationAddress, viewId: string): string =>
     JSON.stringify([address.transport, address.account, address.channel, address.thread ?? "", viewId]);
@@ -231,6 +234,7 @@ export async function createTelegramAdapterHarness(
         pending.set(interaction.id, interaction);
       },
       deletePendingInteraction: (id) => pending.delete(id),
+      listPendingInteractions: () => [...pending.values()],
       listPendingInboundMessages: () => pendingInbound,
       listPendingIngressCompositions: () => pendingIngress,
       getSemanticView: (address, viewId) => semanticViews.get(semanticKey(address, viewId)),

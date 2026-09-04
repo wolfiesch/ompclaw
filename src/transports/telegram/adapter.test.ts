@@ -3,6 +3,7 @@ import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PairingRequestView } from "../../gateway-pairing";
+import type { PendingInteraction } from "../../gateway-store";
 import type { Principal } from "../../gateway-types";
 import type { SemanticView } from "../../gateway-views";
 import { TgError } from "./bot-api";
@@ -166,6 +167,7 @@ describe("Telegram transport lifecycle", () => {
         setCheckpoint: () => {},
         putPendingInteraction: () => {},
         deletePendingInteraction: () => {},
+        listPendingInteractions: () => [],
         listPendingInboundMessages: () => [],
         listPendingIngressCompositions: () => [],
       },
@@ -706,29 +708,135 @@ describe("Telegram interactive UI", () => {
     });
     await expect(answer).resolves.toEqual({ type: "confirm", confirmed: true });
     expect(pending.size).toBe(0);
+    expect(calls.findLast((call) => call.method === "editMessageText")?.payload.text).toContain("✅ Approved");
   });
 
-  test("offers clarify and pause controls for a decision", async () => {
-    const { adapter, calls, received } = await fixture();
+  test("renders a numbered clarification card and captures an other reply", async () => {
+    const { adapter, calls } = await fixture();
     const answer = adapter.presentUi(
       baseAddress,
-      { type: "confirm", title: "Deploy", message: "Ship this build?" },
+      {
+        type: "select",
+        presentation: "decision",
+        title: "Clarify the target",
+        options: [
+          { value: "staging", label: "Staging", description: "Use the staging environment." },
+          { value: "production", label: "Production", description: "Use the production environment." },
+        ],
+      },
       delivery,
     );
     await flush();
     const prompt = sentMessage(calls);
-    expect(callbackData(prompt, "Clarify")).toContain("clarify");
+    expect(prompt.payload.text).toContain("1. Staging\nUse the staging environment.");
+    expect(callbackData(prompt, "Other answer")).toContain(":other");
     await adapter.handleUpdate({
       update_id: 12,
       callback_query: {
-        id: "pause",
+        id: "other",
         from: { id: 42 },
-        data: callbackData(prompt, "⚠️ Pause task"),
+        data: callbackData(prompt, "Other answer"),
         message: message({ message_id: 201 }),
       },
     });
-    await expect(answer).resolves.toEqual({ type: "confirm", confirmed: false });
-    expect(received).toEqual([expect.objectContaining({ content: { text: "/stop" } })]);
+    await adapter.handleUpdate({
+      update_id: 13,
+      message: message({
+        message_id: 44,
+        text: "Use the canary environment.",
+        reply_to_message: message({ message_id: 201 }),
+      }),
+    });
+    await expect(answer).resolves.toEqual({ type: "select", selected: ["Use the canary environment."] });
+  });
+
+  test("replays persisted provider and model pickers on their original receipts", async () => {
+    const now = 1_800_000_000_000;
+    const interaction = (
+      id: string,
+      title: string,
+      options: readonly { readonly value: string; readonly label: string }[],
+      page: number,
+      messageId: string,
+    ): PendingInteraction => ({
+      id,
+      address: baseAddress,
+      kind: "select",
+      payload: {
+        schemaVersion: 1,
+        principalId: owner.id,
+        request: { title, options, multiple: false },
+        selected: [],
+        page,
+        awaitingAnswer: false,
+        promptMessageId: messageId,
+      },
+      createdAt: now,
+      expiresAt: now + 10_000,
+    });
+    const { adapter, calls, pending } = await fixture({
+      pendingInteractions: [
+        interaction(
+          "provider-page",
+          "Choose a provider",
+          [
+            { value: "openai", label: "OpenAI · 2" },
+            { value: "anthropic", label: "Anthropic · 1" },
+          ],
+          0,
+          "201",
+        ),
+        interaction(
+          "model-page",
+          "OpenAI models",
+          Array.from({ length: 10 }, (_, index) => ({ value: `gpt-5-${index + 1}`, label: `GPT-5 ${index + 1}` })),
+          1,
+          "202",
+        ),
+      ],
+    });
+    const modelMarkup = calls.find(
+      (call) => call.method === "editMessageReplyMarkup" && call.payload.message_id === 202,
+    );
+    const providerMarkup = calls.find(
+      (call) => call.method === "editMessageReplyMarkup" && call.payload.message_id === 201,
+    );
+    if (modelMarkup === undefined || providerMarkup === undefined) throw new Error("expected replayed picker markup");
+
+    await adapter.handleUpdate({
+      update_id: 30,
+      callback_query: {
+        id: "previous-page",
+        from: { id: 42 },
+        data: callbackData(modelMarkup, "← Prev"),
+        message: message({ message_id: 202 }),
+      },
+    });
+    const refreshedModelMarkup = calls.findLast((call) => call.method === "editMessageReplyMarkup");
+    if (refreshedModelMarkup === undefined) throw new Error("expected refreshed model picker markup");
+    expect(callbackData(refreshedModelMarkup, "GPT-5 1")).toContain("ompui");
+
+    const pickProvider = callbackData(providerMarkup, "OpenAI · 2");
+    await adapter.handleUpdate({
+      update_id: 31,
+      callback_query: {
+        id: "pick-provider",
+        from: { id: 42 },
+        data: pickProvider,
+        message: message({ message_id: 201 }),
+      },
+    });
+    await adapter.handleUpdate({
+      update_id: 32,
+      callback_query: {
+        id: "pick-provider-again",
+        from: { id: 42 },
+        data: pickProvider,
+        message: message({ message_id: 201 }),
+      },
+    });
+    expect(pending.has("provider-page")).toBe(false);
+    expect(calls.findLast((call) => call.method === "answerCallbackQuery")?.payload.text).toContain("expired");
   });
 
   test("accepts text input only as a reply to the correlated prompt", async () => {
@@ -845,9 +953,7 @@ describe("Telegram interactive UI", () => {
       }),
     });
     await flush();
-    expect(received).toEqual([
-      expect.objectContaining({ content: { text: "/steer Use the staging environment." } }),
-    ]);
+    expect(received).toEqual([expect.objectContaining({ content: { text: "/steer Use the staging environment." } })]);
   });
 
   test("refreshes a stale semantic callback without dispatching its action", async () => {

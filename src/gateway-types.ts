@@ -146,6 +146,7 @@ export interface SelectUiRequest {
   readonly title: string;
   readonly options: readonly UiOption[];
   readonly multiSelect?: boolean;
+  readonly presentation?: "picker" | "decision";
 }
 
 export interface InputUiRequest {

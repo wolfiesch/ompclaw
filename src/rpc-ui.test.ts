@@ -86,7 +86,12 @@ describe("RpcGatewayUiBroker", () => {
     await settle();
 
     expect(presentations.map((presentation) => presentation.request)).toEqual([
-      { type: "select", title: "Choose", options: [{ value: "one", label: "one", description: "first" }, { value: "two", label: "two" }] },
+      {
+        type: "select",
+        presentation: "decision",
+        title: "Choose",
+        options: [{ value: "one", label: "one", description: "first" }, { value: "two", label: "two" }],
+      },
       { type: "confirm", title: "Continue", message: "Proceed?" },
       { type: "input", title: "Value", prompt: "Type it", placeholder: "Type it" },
       { type: "editor", title: "Edit", initialValue: "before" },

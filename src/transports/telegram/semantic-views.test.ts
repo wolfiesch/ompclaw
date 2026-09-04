@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { ConversationAddress, DeliveryContext, OutboundReceipt } from "../../gateway-types";
 import type { GatewaySemanticViewStore } from "../../gateway-store";
 import type { SemanticView, StoredSemanticView } from "../../gateway-views";
+import { modelPageSemanticView, modelProviderSemanticView } from "../../rpc-semantic-views";
 import {
   TelegramSemanticViewReconciler,
   decodeTelegramSemanticCallback,
@@ -126,6 +127,39 @@ describe("Telegram semantic views", () => {
     });
     expect(hashTelegramSemanticMessage(first)).toBe(hashTelegramSemanticMessage(second));
     expect(hashTelegramSemanticMessage(first)).toHaveLength(64);
+  });
+
+  test("renders the provider hierarchy and a paginated model card", () => {
+    const models = [
+      { provider: "OpenAI", id: "gpt-5" },
+      { provider: "OpenAI", id: "gpt-5-mini" },
+      { provider: "Anthropic", id: "claude-sonnet-4" },
+    ] as const;
+    const provider = renderTelegramSemanticView(
+      modelProviderSemanticView({
+        models,
+        current: { provider: "OpenAI", id: "gpt-5" },
+        version: 1,
+        updatedAt: 1,
+      }),
+    );
+    const page = renderTelegramSemanticView(
+      modelPageSemanticView({
+        models,
+        current: { provider: "OpenAI", id: "gpt-5" },
+        provider: "OpenAI",
+        page: 0,
+        pageSize: 1,
+        version: 2,
+        updatedAt: 2,
+      }),
+    );
+
+    expect(provider.text).toContain("Choose a provider.");
+    expect(provider.replyMarkup.inline_keyboard.flat().map((button) => button.text)).toContain("✓ OpenAI · 2");
+    expect(page.text).toContain("🤖 OpenAI models 1/2");
+    expect(page.text).toContain("gpt-5");
+    expect(page.replyMarkup.inline_keyboard.flat().map((button) => button.text)).toContain("Next →");
   });
 
   test("encodes bounded canonical callbacks and rejects malformed input", () => {
