@@ -15,6 +15,7 @@ The following operating assumptions are intentional:
 - Every incoming transport identity must be bound to a local principal before it is admitted.
 - A token authorizes a WebSocket credential only after that credential's identity resolves to a principal.
 - Telegram uses Bot API long polling. Do not configure a webhook for the same bot token.
+- To enable Telegram inline command discovery, use `@BotFather` → `/setinline`, select this bot, and set its inline placeholder. If this is skipped or Telegram sends no inline updates, ordinary chats and `/commands` continue to work unchanged.
 - WebSocket is intended to bind to loopback by default. The only HTTP route is the unauthenticated health response.
 
 ## First-use setup and recovery
@@ -33,7 +34,7 @@ either file when one already exists. Setup temporarily owns the same per-account
 polling lock used by the runtime. A running gateway or another setup listener
 therefore blocks discovery instead of competing for Telegram updates.
 
-After setup prints that the listener is ready, send the bot a direct, non-topic
+After setup prints the bot's `https://t.me/<botusername>` link and that the listener is ready, send the bot a direct, non-topic
 message from the account to authorize. Messages already queued when the listener
 starts are ignored. The bot acknowledges that local approval is still required.
 Setup shows the Telegram identity locally, stores only a salted hash of a newly
@@ -57,9 +58,9 @@ ompclaw pairing-listen \
 ```
 
 The command prints a new code and local approval command. A running gateway
-provides the normal path: an unknown private sender receives a pairing code and
-the exact local approval command in Telegram. Approval is still performed only
-on the gateway host:
+provides the normal path: an unknown private sender receives one mutable pairing
+card in Telegram with its short-lived code and approval state. Approval is still
+performed only on the gateway host:
 
 ```text
 ompclaw pairing-list
@@ -68,7 +69,7 @@ ompclaw pairing-reject <code>
 ompclaw pairing-clear
 ```
 
-After approval, the bot confirms the binding in the originating chat. The next
+After approval, that card changes in place to the connected journey and the next
 message enters the normal OMP conversation. `pairing-list` never returns a code
 or code hash. `pairing-clear` removes all pairing request records without
 changing approved principal bindings. Use `telegram-allow` only for deliberate
@@ -101,6 +102,7 @@ The SQLite database is `~/.omp/agent/ompclaw/ompclaw.sqlite` by default. A newly
 | principals and transport identities | resolve an inbound identity to authorized local roles |
 | conversation bindings | record the exact OMP session path associated with a transport address |
 | adapter checkpoints | store the active OMP session file and Telegram update progress |
+| OMP command catalog and command recency | cache OMP-discovered commands and promote a principal’s recent command choices |
 | inbound messages | deduplicate accepted transport messages |
 | pending UI interactions | keep transport UI metadata until completion or expiry |
 | migration markers | make legacy Telegram import idempotent |
@@ -176,6 +178,21 @@ Use `/jobs` to inspect your jobs, `/job_pause <id>` or `/job_resume <id>` to cha
 The scheduler persists the next occurrence before dispatch. A restart recovers every due job from SQLite. Only one OMP turn runs at a time, so a scheduled job that finds the runtime busy is deferred without consuming an attempt. Other failures use bounded linear backoff. A one-shot job is disabled after success or after exhausting retries. A recurring job advances to its next cron occurrence after success or final failure. Job execution is at least once across process crashes, so prompts that mutate external systems should be idempotent.
 
 Scheduled output and OMP interaction requests return to the conversation that created the job. Telegram can receive output while no inbound request is active. WebSocket jobs require the exact authenticated origin to be connected when delivery occurs.
+
+
+### Ask your agent to watch things
+
+When durable automation is enabled, your agent can create recurring check-and-notify jobs directly from conversational instructions using the `ompclaw_watch` host tool. The tool binds job results to the requesting conversation and prefixes the job name with `watch: ` so it is easily identified in `/jobs` and Schedules views.
+
+Specify either a frequency in minutes (`everyMinutes`) or a standard cron schedule (`cron`), along with the prompt describing what to inspect and when to alert you:
+
+1. **CI / PR status monitoring:**
+   > "Watch CI on PR #142 every 5 minutes and ping me if the build fails or when all checks pass."
+
+2. **Service health and endpoint checks:**
+   > "Check https://api.example.com/health every 10 minutes and alert me if the status is not 200 or response time exceeds 500ms."
+
+To stop or inspect watch jobs, use standard automation tools: list jobs with `/jobs` (or `ompclaw_list_jobs`), and stop watching with `/job_delete <id>` (or `ompclaw_delete_job`).
 
 ### Experimental learning and profile isolation
 
@@ -272,6 +289,18 @@ A Telegram object is required only when Telegram is configured:
 | `topicSessions.enabled` | isolate each Telegram forum topic in its own persisted OMP session |
 | `topicSessions.createFromRoot` | create a new forum topic for each authorized non-command root message; requires topic sessions |
 
+#### BotFather finishing checklist
+
+The Bot API cannot configure these profile fields. In `@BotFather`, complete them for the bot after setup:
+
+1. Enable inline mode with `/setinline`.
+2. Set the inline placeholder to a short invitation such as `Ask OmpClaw…`.
+3. Set the avatar with `/setuserpic`.
+
+The gateway refreshes the factual description and short description at setup and
+startup. You may manually use a short description such as `🟢 Online`, but it is
+not automated because it becomes stale after a crash.
+
 #### Conversation behavior
 
 OmpClaw presents routine Telegram turns as a conversation rather than a command console:
@@ -281,7 +310,7 @@ OmpClaw presents routine Telegram turns as a conversation rather than a command 
 - The completed response uses parsed Telegram MarkdownV2 with block-aware splitting for headings, lists, quotes, tables, links, code, and fenced code blocks. Plain-text fallback remains available when Telegram rejects formatting.
 - Consecutive photos are sent as one Telegram album when the Bot API supports media groups. The first item carries the caption and source-message reply.
 - The source reaction changes to `👍` after success, `👌` after a user stop, or `👎` after failure.
-- The task card exposes every active task and recent activity without tool arguments or raw tool output. Terminal turns become durable result cards, and `/tasks` retains history across restart.
+- Active task cards expose recent activity plus **Add instruction**, **Add follow-up**, and Stop controls. `/tasks` renders a durable timeline of task, tool, terminal, and restart-interruption events; stopped, failed, and interrupted tasks can be retried from their card.
 - Voice notes and video notes are transcribed as ordinary user speech when `transcribeCommand` is configured. The bot acknowledges receipt with a reaction, or a short message when reactions are unavailable. Replies remain text.
 These behaviors need no additional configuration. OMP still controls the response content, reasoning mode, tools, approvals, memory, and session history.
 
@@ -304,7 +333,7 @@ use a custom principal ID, pass it after the code. Use `principal-add` and
 
 Existing forum topics get separate sessions when `topicSessions.enabled` is true. Non-topic Telegram chats and WebSocket credentials continue to share the gateway's root OMP session. Set `createFromRoot` to true to turn an authorized root message into a newly named topic and route that same turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Telegram requires the bot to be a supergroup administrator with permission to manage topics. Topic creation is idempotent across update retries.
 
-The native Telegram command menu exposes the everyday controls: `/start`, `/home`, `/status`, `/stop`, `/new`, `/tasks`, `/jobs`, and `/help`. `/start` explains the assistant without invoking the model. `/home` is a single-message control center: its inline actions edit that same Telegram message while navigating status, model, reasoning, fast mode, auto-compaction, autonomy mode, tasks, and scheduled jobs. Scheduled-job cards expose pause, resume, run-now, and delete actions. `/help` groups the complete supported OMP RPC command surface into Everyday, Session, Work, and Advanced sections.
+The private-chat native Telegram command menu exposes the everyday controls: `/start`, `/home`, `/status`, `/stop`, `/new`, `/tasks`, `/jobs`, and `/help`; group chats receive a focused `/help`, `/status`, `/stop`, `/new`, and `/start` menu. `/commands` shows the full normalized gateway, OMP, and skill catalog; `/commands <query>` renders ranked, paginated command choices that submit the selected slash command through normal ingress. Inline search uses the same catalog for authorized users, promotes their recent choices, and inserts the selected slash command into the chat for ordinary command parsing. `/start` explains the assistant without invoking the model. `/home` is a single-message control center: its inline actions edit that same Telegram message while navigating status, model, reasoning, fast mode, auto-compaction, autonomy mode, tasks, and scheduled jobs. Decision prompts provide approve, reject, clarify, and pause-task controls; clarification is sent back as a correction instead of approving the pending action. Scheduled-job cards expose pause, resume, run-now, and delete actions. `/help` groups the complete supported OMP RPC command surface into Everyday, Session, Work, and Advanced sections.
 
 Every rendered inline control carries a view version. OmpClaw rejects expired, moved, disabled, or cross-principal callbacks, refreshes stale cards from current durable state, and serializes edits per control surface.
 

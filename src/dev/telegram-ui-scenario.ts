@@ -1,9 +1,16 @@
 import {
   homeSemanticView,
+  modelPageSemanticView,
+  modelProviderSemanticView,
+  moreSemanticView,
+  scheduledJobDeleteConfirmSemanticView,
+  scheduledJobDeleteSettledSemanticView,
+  scheduledJobDetailSemanticView,
   scheduledJobsSemanticView,
   sessionChoiceSemanticView,
   taskSemanticView,
 } from "../rpc-semantic-views";
+import { renderDecisionCard, type TelegramCardRender } from "../transports/telegram/cards";
 import { renderTelegramSemanticView } from "../transports/telegram/semantic-views";
 import type { SemanticView } from "../gateway-views";
 
@@ -19,6 +26,14 @@ function scenario(name: string, view: SemanticView): TelegramUiScenario {
     name,
     text: rendered.text,
     buttons: rendered.replyMarkup.inline_keyboard.map((row) => row.map((button) => button.text)),
+  };
+}
+
+function cardScenario(name: string, rendered: TelegramCardRender): TelegramUiScenario {
+  return {
+    name,
+    text: rendered.text,
+    buttons: rendered.inlineKeyboard.map((row) => row.map((button) => button.text)),
   };
 }
 
@@ -48,6 +63,48 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
       }),
     ),
     scenario(
+      "home-busy",
+      homeSemanticView({
+        state: {
+          sessionId: "session-42",
+          sessionName: "Release planning",
+          isStreaming: true,
+          isCompacting: false,
+        },
+        activeTask: {
+          title: "Prepare the release",
+          startedAt: version - 35_000,
+          currentStep: "Running focused tests",
+        },
+        autonomyMode: "balanced",
+        quickAskArmed: true,
+        autonomyLabel: "Balanced",
+        version,
+        updatedAt: version,
+      }),
+    ),
+    scenario(
+      "more",
+      moreSemanticView({
+        state: {
+          sessionId: "session-42",
+          sessionName: "Release planning",
+          isStreaming: false,
+          isCompacting: false,
+          model: { provider: "openai", id: "gpt-5" },
+          thinkingLevel: "high",
+          fastModeEnabled: false,
+          autoCompactionEnabled: true,
+          contextUsage: { tokens: 32_000, contextWindow: 128_000, percent: 25 },
+          queuedMessageCount: 0,
+        },
+        autonomyMode: "balanced",
+        autonomyLabel: "Balanced",
+        version,
+        updatedAt: version,
+      }),
+    ),
+    scenario(
       "reasoning",
       sessionChoiceSemanticView({
         title: "Choose reasoning depth",
@@ -63,7 +120,50 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
       }),
     ),
     scenario(
-      "jobs",
+      "model-providers",
+      modelProviderSemanticView({
+        models: [
+          { provider: "OpenAI", id: "gpt-5" },
+          { provider: "OpenAI", id: "gpt-5-mini" },
+          { provider: "Anthropic", id: "claude-sonnet-4" },
+        ],
+        current: { provider: "OpenAI", id: "gpt-5" },
+        version,
+        updatedAt: version,
+      }),
+    ),
+    scenario(
+      "model-page-1",
+      modelPageSemanticView({
+        models: Array.from({ length: 10 }, (_, index) => ({
+          provider: "OpenAI",
+          id: `gpt-5-${index + 1}`,
+        })),
+        current: { provider: "OpenAI", id: "gpt-5-1" },
+        provider: "OpenAI",
+        page: 0,
+        pageSize: 8,
+        version,
+        updatedAt: version,
+      }),
+    ),
+    scenario(
+      "model-page-2-selected",
+      modelPageSemanticView({
+        models: Array.from({ length: 10 }, (_, index) => ({
+          provider: "OpenAI",
+          id: `gpt-5-${index + 1}`,
+        })),
+        current: { provider: "OpenAI", id: "gpt-5-9" },
+        provider: "OpenAI",
+        page: 1,
+        pageSize: 8,
+        version: version + 1,
+        updatedAt: version + 1,
+      }),
+    ),
+    scenario(
+      "schedules-list",
       scheduledJobsSemanticView(
         [
           {
@@ -82,10 +182,101 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
             createdAt: version - 86_400_000,
             updatedAt: version,
           },
+          {
+            id: "exotic-sync",
+            principalId: "operator",
+            identity: { transport: "telegram", account: "primary", subject: "42" },
+            address,
+            name: "Exotic sync",
+            prompt: "Sync mid-month stats",
+            schedule: { kind: "cron", expression: "23 4 1,15 * 2", timezone: "America/Los_Angeles" },
+            enabled: false,
+            nextRunAt: undefined,
+            attemptCount: 1,
+            successCount: 1,
+            failureCount: 1,
+            lastError: "Gateway unavailable",
+            createdAt: version - 86_400_000,
+            updatedAt: version,
+          },
         ],
         version,
         version,
       ),
+    ),
+    scenario(
+      "schedule-detail",
+      scheduledJobDetailSemanticView(
+        {
+          id: "morning-brief",
+          principalId: "operator",
+          identity: { transport: "telegram", account: "primary", subject: "42" },
+          address,
+          name: "Morning brief",
+          prompt: "Summarize overnight changes",
+          schedule: { kind: "cron", expression: "0 9 * * *", timezone: "America/Los_Angeles" },
+          enabled: true,
+          nextRunAt: version + 3_600_000,
+          attemptCount: 0,
+          successCount: 4,
+          failureCount: 0,
+          createdAt: version - 86_400_000,
+          updatedAt: version,
+        },
+        version,
+        version,
+      ),
+    ),
+    scenario(
+      "schedule-detail-exotic",
+      scheduledJobDetailSemanticView(
+        {
+          id: "exotic-sync",
+          principalId: "operator",
+          identity: { transport: "telegram", account: "primary", subject: "42" },
+          address,
+          name: "Exotic sync",
+          prompt: "Sync mid-month stats",
+          schedule: { kind: "cron", expression: "23 4 1,15 * 2", timezone: "America/Los_Angeles" },
+          enabled: false,
+          nextRunAt: undefined,
+          attemptCount: 1,
+          successCount: 1,
+          failureCount: 1,
+          lastError: "Gateway unavailable",
+          createdAt: version - 86_400_000,
+          updatedAt: version,
+        },
+        version,
+        version,
+      ),
+    ),
+    scenario(
+      "schedule-delete-confirm",
+      scheduledJobDeleteConfirmSemanticView(
+        {
+          id: "morning-brief",
+          principalId: "operator",
+          identity: { transport: "telegram", account: "primary", subject: "42" },
+          address,
+          name: "Morning brief",
+          prompt: "Summarize overnight changes",
+          schedule: { kind: "cron", expression: "0 9 * * *", timezone: "America/Los_Angeles" },
+          enabled: true,
+          nextRunAt: version + 3_600_000,
+          attemptCount: 0,
+          successCount: 4,
+          failureCount: 0,
+          createdAt: version - 86_400_000,
+          updatedAt: version,
+        },
+        version,
+        version,
+      ),
+    ),
+    scenario(
+      "schedule-delete-settled",
+      scheduledJobDeleteSettledSemanticView("Morning brief", version, version),
     ),
     scenario(
       "active-task",
@@ -115,6 +306,82 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
             ],
           },
         ],
+      ),
+    ),
+    scenario(
+      "failed-task",
+      taskSemanticView(
+        {
+          id: "turn-failed",
+          principalId: "operator",
+          address,
+          prompt: "Deploy the release",
+          state: "failed",
+          createdAt: version - 30_000,
+          updatedAt: version,
+          finishedAt: version,
+          error: "Provider socket timed out\n    at transport.send (rpc.ts:44)",
+        },
+        [{ text: "Deploying the selected build", state: "active" }],
+        version,
+      ),
+    ),
+    scenario(
+      "failed-task-details",
+      taskSemanticView(
+        {
+          id: "turn-failed",
+          principalId: "operator",
+          address,
+          prompt: "Deploy the release",
+          state: "failed",
+          createdAt: version - 30_000,
+          updatedAt: version,
+          finishedAt: version,
+          error: "Provider socket timed out\n    at transport.send (rpc.ts:44)",
+        },
+        [{ text: "Deploying the selected build", state: "active" }],
+        version + 1,
+        [],
+        false,
+        true,
+      ),
+    ),
+    cardScenario(
+      "decision-approved",
+      renderDecisionCard(
+        {
+          title: "Approve deployment",
+          preview: "Deploy the selected build?",
+          choices: [],
+          state: "approved",
+          settledLabel: "✅ Approved once",
+        },
+        (action) => action,
+      ),
+    ),
+    cardScenario(
+      "decision-denied",
+      renderDecisionCard(
+        {
+          title: "Approve deployment",
+          preview: "Deploy the selected build?",
+          choices: [],
+          state: "denied",
+        },
+        (action) => action,
+      ),
+    ),
+    cardScenario(
+      "decision-expired",
+      renderDecisionCard(
+        {
+          title: "Approve deployment",
+          preview: "Deploy the selected build?",
+          choices: [],
+          state: "expired",
+        },
+        (action) => action,
       ),
     ),
   ];

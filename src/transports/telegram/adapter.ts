@@ -5,14 +5,17 @@ import { tmpdir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import type { CommandCatalogEntry } from "../../command-catalog";
+import { CommandCatalog } from "../../command-catalog";
+import type { GatewayPairingService, PairingRequestView } from "../../gateway-pairing";
 import type { GatewayStore, JsonValue, PendingInteraction } from "../../gateway-store";
-import type { GatewayPairingService } from "../../gateway-pairing";
 import type {
   ConversationAddress,
   DeliveryContext,
   InboundEnvelope,
   InboundReplyMediaKind,
   InboundReplyTargetKind,
+  Principal,
   MessageAttachment,
   OutboundContent,
   OutboundReceipt,
@@ -25,10 +28,15 @@ import type {
   UiResponse,
   UiResponseFor,
 } from "../../gateway-types";
+import { parseSlashCommand } from "../../rpc-commands";
 import {
+  TELEGRAM_BOT_DESCRIPTION,
+  TELEGRAM_BOT_SHORT_DESCRIPTION,
+  answerInlineQuery,
   acquireLock,
   downloadFileBytes,
   Poller,
+  refreshTelegramBotProfile,
   releaseLock,
   startLockHeartbeat,
   telegramPollLockPath,
@@ -41,6 +49,9 @@ import {
   type TgChat,
   type TgDocument,
   type TgFileBase,
+  type TgInlineQuery,
+  type TgInlineQueryAnswerOptions,
+  type TgInlineQueryResultArticle,
   type TgMessage,
   type TgMessageGenerationStopped,
   type TgPhotoSize,
@@ -54,15 +65,32 @@ import {
 } from "./bot-api";
 import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } from "./delivery";
 import { MAX_INBOUND_ATTACHMENT_BYTES, saveInboxAttachment } from "./inbox";
+import type { SemanticViewActionInput } from "../../gateway-views";
+import { isRecord } from "../../type-guards";
+import {
+  renderDecisionCard,
+  renderPairingJourneyCard,
+  renderPickerCard,
+  type DecisionCardState,
+  type PairingJourneyCardState,
+  type TelegramCardRender,
+} from "./cards";
 import { decodeTelegramSemanticCallback, TelegramSemanticViewReconciler } from "./semantic-views";
 
 const executeFile = promisify(execFile);
 const INTERACTION_LIFETIME_MS = 5 * 60 * 1_000;
 const INTERACTION_CALLBACK = "ompui";
+const PAIRING_CALLBACK = "omppair";
 const STOP_CALLBACK = "ompctl:stop";
+const QUICK_ASK_CALLBACK = "ompctl:quick-arm";
+const QUICK_ASK_STATUS_KEY = "quick-ask";
+const QUICK_ASK_LABEL = "⚡ Quick ask";
+const QUICK_ASK_ARMED_LABEL = "⚡ Quick ask armed — send your question";
 const SELECT_PAGE_SIZE = 8;
 const TOPIC_NAME_LIMIT = 128;
 const PAIRING_APPROVAL_CHECK_MS = 1_000;
+const CATALOG_CALLBACK = "ompcat";
+const INLINE_RESULT_LIMIT = 50;
 
 function startPairingApprovalMonitor(run: () => void | Promise<void>): () => void {
   run();
@@ -92,6 +120,11 @@ export interface TelegramApiSeams {
   readonly randomId?: () => string;
   readonly transcribe?: (command: readonly string[], file: string, signal?: AbortSignal) => Promise<string>;
   readonly startPairingApprovalMonitor?: (run: () => void | Promise<void>) => () => void;
+  readonly answerInlineQuery?: (
+    inlineQueryId: string,
+    results: readonly TgInlineQueryResultArticle[],
+    options?: TgInlineQueryAnswerOptions,
+  ) => Promise<boolean>;
 }
 
 export interface TelegramTransportAdapterOptions {
@@ -106,20 +139,29 @@ export interface TelegramTransportAdapterOptions {
     | "deletePendingInteraction"
     | "listPendingIngressCompositions"
     | "listPendingInboundMessages"
+    | "listPendingInteractions"
     | "getSemanticView"
     | "getSemanticViewByReceipt"
     | "putSemanticView"
-  >;
+  > &
+    Partial<
+      Pick<
+        GatewayStore,
+        "listOmpAvailableCommands" | "recordCommandUsage" | "listRecentCommandUsage"
+      >
+    >;
   readonly pairing?: Pick<
     GatewayPairingService,
     "requestFromTransport" | "listUnconfirmedApprovals" | "completeConfirmation"
-  >;
+  > &
+    Partial<Pick<GatewayPairingService, "list">>;
   readonly transcribeCommand?: readonly string[];
   readonly logger?: Logger;
   readonly api?: TelegramApiSeams;
   readonly uiTimeoutMs?: number;
   readonly commands?: readonly { readonly command: string; readonly description: string }[];
   readonly createTopicsFromRoot?: boolean;
+  readonly allowRpcBash?: boolean;
 }
 
 interface MediaSelection {
@@ -145,6 +187,12 @@ interface InteractiveState {
   readonly reject: (error: Error) => void;
   readonly multiple: boolean;
   page: number;
+  decisionState?: DecisionCardState;
+  decisionSettledLabel?: string;
+  awaitingAnswer: boolean;
+  restored: boolean;
+  readonly createdAt: number;
+  readonly expiresAt: number;
   prompt?: OutboundReceipt;
   timeout?: NodeJS.Timeout;
   detachAbort?: () => void;
@@ -160,9 +208,32 @@ interface ControlCard {
   stopVisible: boolean;
 }
 
+interface DurablePairingCard {
+  readonly id: string;
+  readonly identity: TransportIdentity;
+  readonly address: ConversationAddress;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  readonly state: PairingJourneyCardState;
+  readonly principalId?: string;
+  prompt?: OutboundReceipt;
+}
+
 interface DraftRoute {
   readonly address: ConversationAddress;
   readonly context: DeliveryContext;
+}
+
+interface CommandCatalogCard {
+  readonly id: string;
+  readonly address: ConversationAddress;
+  readonly context: DeliveryContext;
+  readonly principalId: string;
+  readonly entries: readonly CommandCatalogEntry[];
+  readonly expiresAt: number;
+  page: number;
+  receipt?: OutboundReceipt;
+  timeout?: NodeJS.Timeout;
 }
 
 function sameAddress(left: ConversationAddress, right: ConversationAddress): boolean {
@@ -172,6 +243,56 @@ function sameAddress(left: ConversationAddress, right: ConversationAddress): boo
     left.channel === right.channel &&
     left.thread === right.thread
   );
+}
+
+function sameIdentity(left: TransportIdentity, right: TransportIdentity): boolean {
+  return left.transport === right.transport && left.account === right.account && left.subject === right.subject;
+}
+
+function pairingJourneyState(request: PairingRequestView): PairingJourneyCardState {
+  if (request.state === "approved") return "connected";
+  if (request.state === "expired") return "expired";
+  if (request.state === "rejected" || request.state === "exhausted") return "rejected";
+  return "pending";
+}
+
+function pairingCardFromPending(pending: PendingInteraction): DurablePairingCard | undefined {
+  if (pending.kind !== "pairing" || !isRecord(pending.payload) || pending.payload.schemaVersion !== 1) return undefined;
+  if (!isRecord(pending.payload.identity)) return undefined;
+  const identity = pending.payload.identity;
+  const state = pending.payload.state;
+  const expiresAt = pending.payload.expiresAt;
+  const promptMessageId = pending.payload.promptMessageId;
+  if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt)) return undefined;
+  if (
+    typeof identity.transport !== "string" ||
+    identity.transport.length === 0 ||
+    typeof identity.account !== "string" ||
+    identity.account.length === 0 ||
+    typeof identity.subject !== "string" ||
+    identity.subject.length === 0 ||
+    (state !== "pending" &&
+      state !== "connected" &&
+      state !== "examples" &&
+      state !== "rejected" &&
+      state !== "expired") ||
+    expiresAt < pending.createdAt ||
+    (promptMessageId !== undefined && (typeof promptMessageId !== "string" || !/^[1-9]\d*$/.test(promptMessageId))) ||
+    (pending.payload.principalId !== undefined &&
+      (typeof pending.payload.principalId !== "string" || pending.payload.principalId.length === 0))
+  ) {
+    return undefined;
+  }
+  return {
+    id: pending.id,
+    identity: { transport: identity.transport, account: identity.account, subject: identity.subject },
+    address: pending.address,
+    createdAt: pending.createdAt,
+    expiresAt,
+    state,
+    ...(typeof pending.payload.principalId === "string" ? { principalId: pending.payload.principalId } : {}),
+    ...(typeof promptMessageId === "string" ? { prompt: { transport: "telegram", messageId: promptMessageId } } : {}),
+  };
 }
 
 function telegramAddress(
@@ -493,6 +614,16 @@ function menuCommands(
   return result;
 }
 
+function groupMenuCommands(
+  input: readonly { readonly command: string; readonly description: string }[],
+): readonly { command: string; description: string }[] {
+  const byCommand = new Map(input.map((command) => [command.command, command]));
+  return ["help", "status", "stop", "new", "start"].flatMap((command) => {
+    const item = byCommand.get(command);
+    return item === undefined ? [] : [item];
+  });
+}
+
 export class TelegramTransportAdapter implements TransportAdapter {
   readonly id = "telegram";
   readonly capabilities: TransportCapabilities = {
@@ -515,6 +646,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #poller: TelegramPoller;
   readonly #call: TelegramCall;
   readonly #download: (token: string, filePath: string) => Promise<Uint8Array>;
+  readonly #answerInlineQuery: NonNullable<TelegramApiSeams["answerInlineQuery"]>;
   readonly #claimLock: NonNullable<TelegramApiSeams["acquireLock"]>;
   readonly #dropLock: NonNullable<TelegramApiSeams["releaseLock"]>;
   readonly #heartbeat: NonNullable<TelegramApiSeams["startLockHeartbeat"]>;
@@ -527,6 +659,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #interactionLifetime: number;
   readonly #commands: readonly { command: string; description: string }[];
   readonly #topicsFromRoot: boolean;
+  readonly #allowRpcBash: boolean;
   readonly #outbound: Outbound;
   readonly #semanticViews: TelegramSemanticViewReconciler;
   readonly #interactions = new Map<string, InteractiveState>();
@@ -535,6 +668,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
   readonly #activeUpdates = new Set<number>();
   readonly #updateTasks = new Set<Promise<void>>();
 
+  readonly #catalogCards = new Map<string, CommandCatalogCard>();
   #context: TransportStartContext | undefined;
   #lockPath: string | undefined;
   #stopHeartbeat: (() => void) | undefined;
@@ -568,6 +702,9 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#interactionLifetime = options.uiTimeoutMs ?? INTERACTION_LIFETIME_MS;
     this.#commands = menuCommands(options.commands ?? []);
     this.#topicsFromRoot = options.createTopicsFromRoot ?? false;
+    this.#answerInlineQuery =
+      options.api?.answerInlineQuery ??
+      ((inlineQueryId, results, request) => answerInlineQuery(this.#token, inlineQueryId, results, request));
     this.#outbound = new Outbound({
       token: this.#token,
       account: this.#account,
@@ -576,6 +713,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       callTelegram: this.#call,
       uploadTelegram: options.api?.uploadTelegram,
     });
+    this.#allowRpcBash = options.allowRpcBash ?? false;
     this.#semanticViews = new TelegramSemanticViewReconciler(this.#store, this.#outbound, this.#clock);
   }
 
@@ -590,19 +728,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#stopHeartbeat = this.#heartbeat(lock);
     let pollerStarted = false;
     try {
-      if (this.#commands.length > 0) {
-        try {
-          await this.#telegram("setMyCommands", { commands: this.#commands }, context.signal);
-        } catch (error) {
-          if (context.signal?.aborted) throw error;
-          if (error instanceof TgError && (error.code === 401 || error.code === 404)) throw error;
-          this.#log?.warn(
-            `[telegram] command menu registration failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
+      if (this.#commands.length > 0) await this.#registerCommandMenus(context.signal);
+      await this.#refreshBotProfile(context.signal);
       this.#poller.start(this.#token, (update) => this.#trackUpdate(update), this.#log);
       pollerStarted = true;
+      await this.#restoreInteractions(context.signal);
       if (this.#pairing !== undefined) {
         this.#stopPairingApprovalMonitor = this.#startPairingApprovalMonitor(() =>
           this.#schedulePairingApprovalDrain(),
@@ -647,6 +777,26 @@ export class TelegramTransportAdapter implements TransportAdapter {
     }
   }
 
+  async #registerCommandMenus(signal?: AbortSignal): Promise<void> {
+    const menus = [
+      { commands: this.#commands, scope: { type: "all_private_chats" } },
+      { commands: groupMenuCommands(this.#commands), scope: { type: "all_group_chats" } },
+    ];
+    for (const menu of menus) {
+      if (menu.commands.length === 0) continue;
+      try {
+        await this.#telegram("setMyCommands", menu, signal);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        if (error instanceof TgError && (error.code === 401 || error.code === 404)) throw error;
+        this.#log?.warn(
+          `[telegram] command menu registration failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+    }
+  }
+
   async stop(): Promise<void> {
     if (this.#context === undefined) return;
     if (this.#stopTask) return this.#stopTask;
@@ -665,6 +815,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       this.#cards.clear();
       this.#draftRoutes.clear();
       this.#releaseRuntimeOwnership();
+      for (const card of [...this.#catalogCards.values()]) this.#removeCommandCatalogCard(card);
       this.#context = undefined;
       this.#stopTask = undefined;
     })();
@@ -679,6 +830,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
     this.#activeUpdates.add(update.update_id);
     try {
       if (update.callback_query) await this.#handleCallback(update.callback_query, update.update_id, context);
+      else if (update.inline_query) await this.#handleInlineQuery(update.inline_query, context);
       else {
         const stopped = update.stopped_message_generation;
         if (stopped) await this.#handleDraftStop(stopped, update.update_id, context);
@@ -838,6 +990,142 @@ export class TelegramTransportAdapter implements TransportAdapter {
     }
   }
 
+  async #handleInlineQuery(query: TgInlineQuery, context: TransportStartContext): Promise<void> {
+    const identity = telegramIdentity(query.from.id, this.#account);
+    const principal = query.from.is_bot ? undefined : await context.resolveIdentity(identity, context.signal);
+    if (principal === undefined) {
+      await this.#respondInlineQuery(query, [], context.signal);
+      return;
+    }
+    const terms = query.query.trim().split(/\s+/);
+    const filter = terms[0] ?? "";
+    const args = terms.slice(1).join(" ");
+    const recent = this.#store.listRecentCommandUsage?.(principal.id) ?? [];
+    const results = this.#commandCatalog()
+      .search(filter, recent)
+      .slice(0, INLINE_RESULT_LIMIT)
+      .map((entry) => {
+        const description = args.length === 0 ? entry.description : `${entry.description}\nArguments: ${args}`;
+        return {
+          type: "article" as const,
+          id: entry.name,
+          title: `/${entry.name}`,
+          ...(description.length === 0 ? {} : { description: description.slice(0, 512) }),
+          input_message_content: { message_text: `/${entry.name}${args.length === 0 ? "" : ` ${args}`}` },
+        };
+      });
+    await this.#respondInlineQuery(query, results, context.signal);
+  }
+
+  async #respondInlineQuery(
+    query: TgInlineQuery,
+    results: readonly TgInlineQueryResultArticle[],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await withTelegramRetry(
+      () => this.#answerInlineQuery(query.id, results, { cacheTime: 0, isPersonal: true, signal }),
+      { signal, log: this.#log },
+    );
+  }
+
+  #commandCatalog(): CommandCatalog {
+    return new CommandCatalog({
+      ompCommands: this.#store.listOmpAvailableCommands?.() ?? [],
+      allowRpcBash: this.#allowRpcBash,
+    });
+  }
+
+  #removeCommandCatalogCard(card: CommandCatalogCard): boolean {
+    if (!this.#catalogCards.delete(card.id)) return false;
+    clearTimeout(card.timeout);
+    return true;
+  }
+
+  #scheduleCommandCatalogCardExpiry(card: CommandCatalogCard): void {
+    const timeout = Math.max(0, card.expiresAt - this.#clock());
+    card.timeout = setTimeout(() => {
+      this.#removeCommandCatalogCard(card);
+    }, timeout);
+    card.timeout.unref?.();
+  }
+
+  #replaceCommandCatalogCard(card: CommandCatalogCard): void {
+    for (const existing of this.#catalogCards.values()) {
+      if (existing.principalId === card.principalId && sameAddress(existing.address, card.address)) {
+        this.#removeCommandCatalogCard(existing);
+      }
+    }
+    this.#catalogCards.set(card.id, card);
+    this.#scheduleCommandCatalogCardExpiry(card);
+  }
+
+  async #showCommandCatalog(
+    address: ConversationAddress,
+    principal: Principal,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const catalog = this.#commandCatalog();
+    const trimmedQuery = query.trim();
+    const delivery: DeliveryContext = { principal, origin: address };
+    if (trimmedQuery.length === 0) {
+      const text = [
+        "Commands",
+        ...catalog.groups().flatMap((group) => [
+          "",
+          `${group.name}: ${group.entries.map((entry) => `/${entry.name}`).join(" ")}`,
+        ]),
+        "",
+        "Search with /commands <query>.",
+      ].join("\n");
+      await this.#outbound.sendMessage(address, text, delivery, {}, signal);
+      return;
+    }
+    const entries = catalog.search(trimmedQuery, this.#store.listRecentCommandUsage?.(principal.id) ?? []);
+    if (entries.length === 0) {
+      await this.#outbound.sendMessage(address, "No commands match that search.", delivery, {}, signal);
+      return;
+    }
+    const createdAt = this.#clock();
+    const card: CommandCatalogCard = {
+      id: this.#newId(),
+      address,
+      context: delivery,
+      principalId: principal.id,
+      entries,
+      expiresAt: createdAt + this.#interactionLifetime,
+      page: 0,
+    };
+    const rendered = this.#renderCommandCatalogCard(card);
+    card.receipt = await this.#outbound.sendMessage(
+      address,
+      rendered.text,
+      delivery,
+      { replyMarkup: this.#cardReplyMarkup(rendered) },
+      signal,
+    );
+    this.#replaceCommandCatalogCard(card);
+  }
+
+  #renderCommandCatalogCard(card: CommandCatalogCard): TelegramCardRender {
+    const start = card.page * SELECT_PAGE_SIZE;
+    const pageCount = Math.max(1, Math.ceil(card.entries.length / SELECT_PAGE_SIZE));
+    return renderPickerCard(
+      {
+        title: "Command search",
+        prompt: "Choose a command to send.",
+        options: card.entries.slice(start, start + SELECT_PAGE_SIZE).map((entry, relative) => ({
+          id: String(start + relative),
+          label: `/${entry.name}`,
+          ...(entry.description.length === 0 ? {} : { description: entry.description }),
+        })),
+        page: card.page,
+        pageCount,
+      },
+      (action) => `${CATALOG_CALLBACK}:${card.id}:${action}`,
+    );
+  }
+
   async #handleMessage(message: TgMessage, update: TgUpdate, context: TransportStartContext): Promise<void> {
     if (!message.from || message.from.is_bot) return;
     const identity = telegramIdentity(message.from.id, this.#account);
@@ -852,6 +1140,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return;
     }
     if (await this.#captureReply(message, principal.id, address)) return;
+    const catalogRequest = parseSlashCommand(message.text);
+    if (catalogRequest?.name === "commands") {
+      await this.#showCommandCatalog(address, principal, catalogRequest.args, context.signal);
+      return;
+    }
     if (this.#topicsFromRoot && message.chat.is_forum && !message.is_topic_message && !isBotCommand(message.text)) {
       const routeKey = `forum-topic:${message.chat.id}`;
       let threadId = storedTopicThread(this.#store.getCheckpoint(this.id, routeKey), message.message_id);
@@ -954,6 +1247,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
     };
     if (envelope.content.text === undefined && envelope.content.attachments === undefined) return;
     await context.receive(envelope, context.signal);
+    const command = parseSlashCommand(envelope.content.text);
+    if (command !== undefined && this.#commandCatalog().find(command.name) !== undefined) {
+      this.#store.recordCommandUsage?.(principal.id, command.name, this.#clock());
+    }
   }
 
   async #handleCallback(query: TgCallbackQuery, updateId: number, context: TransportStartContext): Promise<void> {
@@ -972,13 +1269,31 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return;
     }
     const identity = telegramIdentity(query.from.id, this.#account);
+    const address = telegramAddress(query.message, this.#account);
+    if (query.data.startsWith(`${PAIRING_CALLBACK}:`)) {
+      await this.#handlePairingCardCallback(query, identity, address, updateId, context, acknowledge);
+      return;
+    }
     const principal = await context.resolveIdentity(identity, context.signal);
     if (!principal) {
       await acknowledge("Not authorized.", true);
       return;
     }
-    const address = telegramAddress(query.message, this.#account);
     const callbackContext: DeliveryContext = { principal, origin: address };
+    const catalogPrefix = `${CATALOG_CALLBACK}:`;
+    if (query.data.startsWith(catalogPrefix)) {
+      await this.#handleCommandCatalogCallback(
+        query,
+        updateId,
+        identity,
+        address,
+        principal,
+        context,
+        query.data.slice(catalogPrefix.length),
+        acknowledge,
+      );
+      return;
+    }
     if (query.data.startsWith("s1.")) {
       let callbackData: ReturnType<typeof decodeTelegramSemanticCallback>;
       try {
@@ -1005,6 +1320,16 @@ export class TelegramTransportAdapter implements TransportAdapter {
       const action = current.view.actions.find(
         (candidate) => candidate.id === callbackData.actionId && candidate.enabled !== false,
       );
+      if (action?.input !== undefined) {
+        await acknowledge("Reply with your instruction.");
+        void this.#collectSemanticInput(address, identity, action.input, callbackContext, updateId, context).catch(
+          (error) =>
+            this.#log?.warn(
+              `[telegram] semantic input failed: ${error instanceof Error ? error.message : String(error)}`,
+            ),
+        );
+        return;
+      }
       if (action?.command === undefined) {
         await acknowledge("This control is no longer available.");
         return;
@@ -1022,6 +1347,32 @@ export class TelegramTransportAdapter implements TransportAdapter {
         },
         context.signal,
       );
+      return;
+    }
+    if (query.data === QUICK_ASK_CALLBACK) {
+      const card = this.#cards.get(cardKey(address));
+      const receipt = card?.receipts.at(-1);
+      if (!card || !receipt || receipt.messageId !== String(query.message.message_id)) {
+        await acknowledge("This control has expired.");
+        return;
+      }
+      if (card.context?.principal.id !== principal.id) {
+        await acknowledge("This control belongs to another user.", true);
+        return;
+      }
+      await context.receive(
+        {
+          id: `telegram:${this.#account}:quick-arm:${updateId}`,
+          sentAt: this.#clock(),
+          identity,
+          address,
+          content: { text: "/quick-arm" },
+          sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
+          edited: false,
+        },
+        context.signal,
+      );
+      await acknowledge("Quick ask toggled.");
       return;
     }
     if (query.data === STOP_CALLBACK) {
@@ -1072,7 +1423,122 @@ export class TelegramTransportAdapter implements TransportAdapter {
       await acknowledge("This prompt belongs to another user.", true);
       return;
     }
+    const stopRequested = state.request.type === "confirm" && action === "stop";
     await this.#applyInteractionAction(state, action, query, acknowledge);
+    if (!stopRequested) return;
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:interaction-stop:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: "/stop" },
+        sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
+        edited: false,
+      },
+      context.signal,
+    );
+  }
+
+  async #handleCommandCatalogCallback(
+    query: TgCallbackQuery,
+    updateId: number,
+    identity: TransportIdentity,
+    address: ConversationAddress,
+    principal: Principal,
+    context: TransportStartContext,
+    remainder: string,
+    acknowledge: (text?: string, alert?: boolean) => Promise<unknown>,
+  ): Promise<void> {
+    const separator = remainder.indexOf(":");
+    if (separator < 1 || query.message === undefined) {
+      await acknowledge("Invalid command control.");
+      return;
+    }
+    const card = this.#catalogCards.get(remainder.slice(0, separator));
+    if (
+      card === undefined ||
+      card.expiresAt <= this.#clock() ||
+      card.principalId !== principal.id ||
+      !sameAddress(card.address, address) ||
+      card.receipt?.messageId !== String(query.message.message_id)
+    ) {
+      if (card !== undefined && card.expiresAt <= this.#clock()) this.#removeCommandCatalogCard(card);
+      await acknowledge("This command search has expired.");
+      return;
+    }
+    const action = remainder.slice(separator + 1);
+    if (action === "noop") {
+      await acknowledge();
+      return;
+    }
+    if (action === "previous" || action === "next") {
+      const pageCount = Math.max(1, Math.ceil(card.entries.length / SELECT_PAGE_SIZE));
+      card.page =
+        action === "previous" ? Math.max(0, card.page - 1) : Math.min(pageCount - 1, card.page + 1);
+      const rendered = this.#renderCommandCatalogCard(card);
+      if (card.receipt !== undefined) {
+        await this.#outbound.update(card.address, card.receipt, { text: rendered.text }, card.context);
+        await this.#outbound.setReplyMarkup(
+          card.address,
+          card.receipt,
+          this.#cardReplyMarkup(rendered),
+          card.context,
+        );
+      }
+      await acknowledge();
+      return;
+    }
+    const matched = /^pick-(\d+)$/.exec(action);
+    const index = matched === null ? Number.NaN : Number(matched[1]);
+    const entry = Number.isSafeInteger(index) ? card.entries[index] : undefined;
+    if (entry === undefined) {
+      await acknowledge("This command is no longer available.");
+      return;
+    }
+    this.#removeCommandCatalogCard(card);
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:command-catalog:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: `/${entry.name}` },
+        sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
+        edited: false,
+      },
+      context.signal,
+    );
+    this.#store.recordCommandUsage?.(principal.id, entry.name, this.#clock());
+    await acknowledge(`Sent /${entry.name}`);
+  }
+
+  async #collectSemanticInput(
+    address: ConversationAddress,
+    identity: TransportIdentity,
+    input: SemanticViewActionInput,
+    deliveryContext: DeliveryContext,
+    updateId: number,
+    context: TransportStartContext,
+  ): Promise<void> {
+    const response = await this.#openInteraction(
+      address,
+      { type: "input", title: input.title, prompt: input.prompt },
+      deliveryContext,
+      context.signal,
+    );
+    if (response.type !== "input" || response.cancelled || !response.value.trim()) return;
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:semantic-input:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: [input.command, input.argument, response.value.trim()].filter(Boolean).join(" ") },
+        edited: false,
+      },
+      context.signal,
+    );
   }
 
   async #handleDraftStop(
@@ -1202,34 +1668,33 @@ export class TelegramTransportAdapter implements TransportAdapter {
     signal?: AbortSignal,
   ): Promise<InteractiveResponse> {
     return new Promise<InteractiveResponse>((resolvePromise, rejectPromise) => {
-      const id = this.#newId();
-      const choices = request.type === "select" ? request.options.map((option) => option.value) : [];
-      const labels = request.type === "select" ? request.options.map((option) => option.label) : [];
-      const notes = request.type === "select" ? request.options.map((option) => option.description) : [];
+      const createdAt = this.#clock();
       const state: InteractiveState = {
-        id,
+        id: this.#newId(),
         request,
         address,
         context,
         principalId: context.principal.id,
-        choices,
-        labels,
-        notes,
+        choices: request.type === "select" ? request.options.map((option) => option.value) : [],
+        labels: request.type === "select" ? request.options.map((option) => option.label) : [],
+        notes: request.type === "select" ? request.options.map((option) => option.description) : [],
         selected: new Set<number>(),
         settle: resolvePromise,
         reject: rejectPromise,
         multiple: request.type === "select" && request.multiSelect === true,
         page: 0,
+        awaitingAnswer: false,
+        restored: false,
+        createdAt,
+        expiresAt: createdAt + this.#interactionLifetime,
       };
-      this.#interactions.set(id, state);
-      this.#store.putPendingInteraction(this.#pendingInteraction(state));
-      state.timeout = setTimeout(
-        () => this.#finishInteraction(state, this.#cancelledResponse(request)),
-        this.#interactionLifetime,
-      );
-      state.timeout.unref?.();
+      this.#interactions.set(state.id, state);
+      this.#persistInteraction(state);
+      this.#scheduleInteractionExpiry(state);
       if (signal) {
-        const abort = (): void => this.#finishInteraction(state, this.#cancelledResponse(request));
+        const abort = (): void => {
+          void this.#finishInteraction(state, this.#cancelledResponse(request), "expired");
+        };
         signal.addEventListener("abort", abort, { once: true });
         state.detachAbort = () => signal.removeEventListener("abort", abort);
       }
@@ -1237,54 +1702,245 @@ export class TelegramTransportAdapter implements TransportAdapter {
     });
   }
 
-  #pendingInteraction(state: InteractiveState): PendingInteraction {
-    const payload: JsonValue = {
-      title: state.request.title,
-      principalId: state.principalId,
-      choices: state.choices,
-      multiple: state.multiple,
+  #scheduleInteractionExpiry(state: InteractiveState): void {
+    const timeout = Math.max(0, state.expiresAt - this.#clock());
+    state.timeout = setTimeout(() => {
+      void this.#finishInteraction(state, this.#cancelledResponse(state.request), "expired");
+    }, timeout);
+    state.timeout.unref?.();
+  }
+
+  async #restoreInteractions(signal?: AbortSignal): Promise<void> {
+    for (const pending of this.#store.listPendingInteractions()) {
+      if (pending.address.transport !== "telegram" || pending.address.account !== this.#account) continue;
+      const state = this.#restoreInteractionState(pending);
+      if (state === undefined) continue;
+      if (state.expiresAt <= this.#clock()) {
+        if (
+          (state.request.type === "confirm" ||
+            (state.request.type === "select" && state.request.presentation === "decision")) &&
+          state.prompt !== undefined
+        ) {
+          state.decisionState = "expired";
+          await this.#refreshInteraction(state).catch((error) => {
+            this.#log?.warn(
+              `[telegram] could not settle expired interaction ${state.id}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+        }
+        this.#store.deletePendingInteraction(state.id);
+        continue;
+      }
+      this.#interactions.set(state.id, state);
+      this.#scheduleInteractionExpiry(state);
+      if (state.prompt === undefined) {
+        await this.#sendInteractionPrompt(state, signal);
+      } else if (state.request.type === "confirm" || state.request.type === "select") {
+        await this.#refreshInteraction(state);
+      }
+    }
+  }
+
+  #restoreInteractionState(pending: PendingInteraction): InteractiveState | undefined {
+    if (!isRecord(pending.payload) || pending.payload.schemaVersion !== 1 || !isRecord(pending.payload.request)) {
+      return undefined;
+    }
+    const principalId = pending.payload.principalId;
+    const requestData = pending.payload.request;
+    const title = requestData.title;
+    if (
+      typeof principalId !== "string" ||
+      principalId.length === 0 ||
+      typeof title !== "string" ||
+      title.length === 0
+    ) {
+      return undefined;
+    }
+    let request: InteractiveRequest;
+    let choices: readonly string[] = [];
+    let labels: readonly string[] = [];
+    let notes: readonly (string | undefined)[] = [];
+    let multiple = false;
+    if (pending.kind === "confirm" && typeof requestData.message === "string") {
+      request = {
+        type: "confirm",
+        title,
+        message: requestData.message,
+        ...(typeof requestData.confirmLabel === "string" ? { confirmLabel: requestData.confirmLabel } : {}),
+        ...(typeof requestData.cancelLabel === "string" ? { cancelLabel: requestData.cancelLabel } : {}),
+      };
+    } else if (pending.kind === "select" && Array.isArray(requestData.options)) {
+      const options = requestData.options.map((option) => {
+        if (!isRecord(option) || typeof option.value !== "string" || typeof option.label !== "string") return undefined;
+        return {
+          value: option.value,
+          label: option.label,
+          ...(typeof option.description === "string" ? { description: option.description } : {}),
+        };
+      });
+      if (options.some((option) => option === undefined)) return undefined;
+      const restoredOptions = options as Array<{
+        readonly value: string;
+        readonly label: string;
+        readonly description?: string;
+      }>;
+      multiple = requestData.multiple === true;
+      request = {
+        type: "select",
+        title,
+        options: restoredOptions,
+        ...(multiple ? { multiSelect: true } : {}),
+        ...(requestData.presentation === "decision"
+          ? { presentation: "decision" as const }
+          : requestData.presentation === "picker"
+            ? { presentation: "picker" as const }
+            : {}),
+      };
+      choices = restoredOptions.map((option) => option.value);
+      labels = restoredOptions.map((option) => option.label);
+      notes = restoredOptions.map((option) => option.description);
+    } else if (pending.kind === "input") {
+      request = {
+        type: "input",
+        title,
+        ...(typeof requestData.prompt === "string" ? { prompt: requestData.prompt } : {}),
+        ...(typeof requestData.initialValue === "string" ? { initialValue: requestData.initialValue } : {}),
+        ...(typeof requestData.placeholder === "string" ? { placeholder: requestData.placeholder } : {}),
+      };
+    } else if (pending.kind === "editor" && typeof requestData.initialValue === "string") {
+      request = {
+        type: "editor",
+        title,
+        initialValue: requestData.initialValue,
+        ...(typeof requestData.language === "string" ? { language: requestData.language } : {}),
+      };
+    } else {
+      return undefined;
+    }
+    const selected = new Set<number>();
+    if (Array.isArray(pending.payload.selected)) {
+      for (const index of pending.payload.selected) {
+        if (typeof index === "number" && Number.isSafeInteger(index) && index >= 0 && index < choices.length) {
+          selected.add(index);
+        }
+      }
+    }
+    const pageCount = Math.max(1, Math.ceil(choices.length / SELECT_PAGE_SIZE));
+    const restoredPage =
+      typeof pending.payload.page === "number" && Number.isSafeInteger(pending.payload.page)
+        ? Math.max(0, Math.min(pageCount - 1, pending.payload.page))
+        : 0;
+    const promptMessageId = pending.payload.promptMessageId;
+    const prompt =
+      typeof promptMessageId === "string" && /^[1-9]\d*$/.test(promptMessageId)
+        ? ({ transport: "telegram", messageId: promptMessageId } as const)
+        : undefined;
+    const expiresAt = pending.expiresAt ?? pending.createdAt + this.#interactionLifetime;
+    return {
+      id: pending.id,
+      request,
+      address: pending.address,
+      context: {
+        principal: { id: principalId, roles: [] },
+        origin: pending.address,
+      },
+      principalId,
+      choices,
+      labels,
+      notes,
+      selected,
+      settle: () => {},
+      reject: () => {},
+      multiple,
+      page: restoredPage,
+      ...(pending.payload.decisionState === "active" ||
+      pending.payload.decisionState === "waiting_answer" ||
+      pending.payload.decisionState === "approved" ||
+      pending.payload.decisionState === "denied" ||
+      pending.payload.decisionState === "expired"
+        ? { decisionState: pending.payload.decisionState }
+        : {}),
+      ...(typeof pending.payload.decisionSettledLabel === "string"
+        ? { decisionSettledLabel: pending.payload.decisionSettledLabel }
+        : {}),
+      awaitingAnswer: pending.payload.awaitingAnswer === true,
+      restored: true,
+      createdAt: pending.createdAt,
+      expiresAt,
+      ...(prompt === undefined ? {} : { prompt }),
     };
+  }
+
+  #pendingInteraction(state: InteractiveState): PendingInteraction {
+    const request: JsonValue =
+      state.request.type === "confirm"
+        ? {
+            title: state.request.title,
+            message: state.request.message,
+            ...(state.request.confirmLabel === undefined ? {} : { confirmLabel: state.request.confirmLabel }),
+            ...(state.request.cancelLabel === undefined ? {} : { cancelLabel: state.request.cancelLabel }),
+          }
+        : state.request.type === "select"
+          ? {
+              title: state.request.title,
+              options: state.choices.map((value, index) => ({
+                value,
+                label: state.labels[index]!,
+                ...(state.notes[index] === undefined ? {} : { description: state.notes[index]! }),
+              })),
+              multiple: state.multiple,
+              ...(state.request.presentation === undefined ? {} : { presentation: state.request.presentation }),
+            }
+          : state.request.type === "input"
+            ? {
+                title: state.request.title,
+                ...(state.request.prompt === undefined ? {} : { prompt: state.request.prompt }),
+                ...(state.request.initialValue === undefined ? {} : { initialValue: state.request.initialValue }),
+                ...(state.request.placeholder === undefined ? {} : { placeholder: state.request.placeholder }),
+              }
+            : {
+                title: state.request.title,
+                initialValue: state.request.initialValue,
+                ...(state.request.language === undefined ? {} : { language: state.request.language }),
+              };
     return {
       id: state.id,
       address: state.address,
       kind: state.request.type,
-      payload,
-      createdAt: this.#clock(),
-      expiresAt: this.#clock() + this.#interactionLifetime,
+      payload: {
+        schemaVersion: 1,
+        principalId: state.principalId,
+        request,
+        selected: [...state.selected].sort((left, right) => left - right),
+        page: state.page,
+        awaitingAnswer: state.awaitingAnswer,
+        ...(state.decisionState === undefined ? {} : { decisionState: state.decisionState }),
+        ...(state.decisionSettledLabel === undefined ? {} : { decisionSettledLabel: state.decisionSettledLabel }),
+        ...(state.prompt === undefined ? {} : { promptMessageId: state.prompt.messageId }),
+      },
+      createdAt: state.createdAt,
+      expiresAt: state.expiresAt,
     };
+  }
+
+  #persistInteraction(state: InteractiveState): void {
+    this.#store.putPendingInteraction(this.#pendingInteraction(state));
   }
 
   async #sendInteractionPrompt(state: InteractiveState, signal?: AbortSignal): Promise<void> {
     const request = state.request;
-    if (request.type === "confirm") {
+    if (request.type === "confirm" || request.type === "select") {
+      const rendered = this.#renderInteractiveCard(state);
       state.prompt = await this.#outbound.sendMessage(
         state.address,
-        `${request.title}\n\n${request.message}`,
+        rendered.text,
         state.context,
-        {
-          replyMarkup: {
-            inline_keyboard: [
-              [
-                { text: request.confirmLabel ?? "Confirm", callback_data: callback(state.id, "accept") },
-                { text: request.cancelLabel ?? "Cancel", callback_data: callback(state.id, "reject") },
-              ],
-            ],
-          },
-        },
+        { replyMarkup: this.#cardReplyMarkup(rendered) },
         signal,
       );
-      return;
-    }
-    if (request.type === "select") {
-      state.prompt = await this.#outbound.sendMessage(
-        state.address,
-        this.#selectPrompt(state),
-        state.context,
-        {
-          replyMarkup: this.#selectKeyboard(state),
-        },
-        signal,
-      );
+      this.#persistInteraction(state);
       return;
     }
     const prompt = request.type === "input" ? request.prompt : undefined;
@@ -1296,54 +1952,83 @@ export class TelegramTransportAdapter implements TransportAdapter {
       state.address,
       lines.join("\n\n"),
       state.context,
-      {
-        replyMarkup: { force_reply: true, selective: true },
-      },
+      { replyMarkup: { force_reply: true, selective: true } },
       signal,
+    );
+    this.#persistInteraction(state);
+  }
+
+  #renderInteractiveCard(state: InteractiveState) {
+    const decision =
+      state.request.type === "confirm" ||
+      (state.request.type === "select" && state.request.presentation === "decision");
+    if (decision) {
+      const choices =
+        state.request.type === "confirm"
+          ? [
+              { id: "accept", label: state.request.confirmLabel ?? "Confirm" },
+              { id: "reject", label: state.request.cancelLabel ?? "Cancel" },
+            ]
+          : state.choices.map((value, index) => ({
+              id: `pick-${index}`,
+              label: `${state.labels[index]!}${state.notes[index] === undefined ? "" : `\n${state.notes[index]!}`}`,
+              shortLabel: String(index + 1),
+              ...(value.length === 0 ? { disabled: true } : {}),
+            }));
+      return renderDecisionCard(
+        {
+          title: state.request.title,
+          preview: state.request.type === "confirm" ? state.request.message : "Choose the best answer.",
+          choices,
+          expiresAt: state.expiresAt,
+          state: state.decisionState ?? "active",
+          ...(state.decisionSettledLabel === undefined ? {} : { settledLabel: state.decisionSettledLabel }),
+        },
+        (action) => callback(state.id, action),
+      );
+    }
+    const start = state.page * SELECT_PAGE_SIZE;
+    const pageCount = Math.max(1, Math.ceil(state.choices.length / SELECT_PAGE_SIZE));
+    return renderPickerCard(
+      {
+        title: state.request.title,
+        prompt: "Choose an option.",
+        options: state.choices.slice(start, start + SELECT_PAGE_SIZE).map((value, relative) => {
+          const index = start + relative;
+          return {
+            id: String(index),
+            label: state.labels[index]!,
+            ...(state.notes[index] === undefined ? {} : { description: state.notes[index]! }),
+            ...(state.selected.has(index) ? { selected: true } : {}),
+            ...(value.length === 0 ? { disabled: true } : {}),
+          };
+        }),
+        page: state.page,
+        pageCount,
+        ...(state.multiple && state.selected.size > 0 ? { current: `${state.selected.size} selected` } : {}),
+        ...(state.choices.length === 0 ? { warning: "No options are available." } : {}),
+        ...(state.multiple ? { doneAction: "done" } : {}),
+        cancelAction: "cancel",
+      },
+      (action) => callback(state.id, action),
     );
   }
 
-  #selectPrompt(state: InteractiveState): string {
-    const request = state.request;
-    if (request.type !== "select") return request.title;
-    const start = state.page * SELECT_PAGE_SIZE;
-    const end = Math.min(start + SELECT_PAGE_SIZE, state.labels.length);
-    const options = state.labels.slice(start, end).map((label, relative) => {
-      const index = start + relative;
-      const marker = state.selected.has(index) ? "[selected]" : "[ ]";
-      const note = state.notes[index];
-      return `${marker} ${label}${note ? `\n${note}` : ""}`;
-    });
-    return [request.title, ...options].join("\n\n");
+  #cardReplyMarkup(rendered: TelegramCardRender): Record<string, unknown> {
+    return {
+      inline_keyboard: rendered.inlineKeyboard.map((row) =>
+        row.map((button) => ({ text: button.text, callback_data: button.action })),
+      ),
+    };
   }
 
-  #selectKeyboard(state: InteractiveState): Record<string, unknown> {
-    const start = state.page * SELECT_PAGE_SIZE;
-    const end = Math.min(start + SELECT_PAGE_SIZE, state.labels.length);
-    const rows: Record<string, string>[][] = [];
-    for (let index = start; index < end; index += 1) {
-      rows.push([
-        {
-          text: `${state.selected.has(index) ? "✓ " : ""}${state.labels[index]}`.slice(0, 64),
-          callback_data: callback(state.id, `pick-${index}`),
-        },
-      ]);
-    }
-    const pages = Math.max(1, Math.ceil(state.labels.length / SELECT_PAGE_SIZE));
-    if (pages > 1) {
-      rows.push([
-        { text: "Previous", callback_data: callback(state.id, "previous") },
-        { text: `${state.page + 1}/${pages}`, callback_data: callback(state.id, "noop") },
-        { text: "Next", callback_data: callback(state.id, "next") },
-      ]);
-    }
-    if (state.multiple) {
-      rows.push([
-        { text: "Done", callback_data: callback(state.id, "done") },
-        { text: "Cancel", callback_data: callback(state.id, "cancel") },
-      ]);
-    }
-    return { inline_keyboard: rows };
+  async #refreshInteraction(state: InteractiveState, persist = true): Promise<void> {
+    if (!state.prompt) return;
+    if (state.request.type !== "confirm" && state.request.type !== "select") return;
+    const rendered = this.#renderInteractiveCard(state);
+    await this.#outbound.update(state.address, state.prompt, { text: rendered.text }, state.context);
+    await this.#outbound.setReplyMarkup(state.address, state.prompt, this.#cardReplyMarkup(rendered), state.context);
+    if (persist) this.#persistInteraction(state);
   }
 
   async #applyInteractionAction(
@@ -1353,16 +2038,43 @@ export class TelegramTransportAdapter implements TransportAdapter {
     acknowledge: (text?: string, alert?: boolean) => Promise<unknown>,
   ): Promise<void> {
     if (state.request.type === "confirm") {
-      if (action !== "accept" && action !== "reject") {
-        await acknowledge("Invalid response.");
+      if (action === "noop") {
+        await acknowledge();
         return;
       }
-      this.#finishInteraction(state, { type: "confirm", confirmed: action === "accept" });
-      await acknowledge(action === "accept" ? "Confirmed" : "Cancelled");
+      if (action !== "accept" && action !== "reject") {
+        await acknowledge("This decision is no longer available.");
+        return;
+      }
+      await this.#finishInteraction(
+        state,
+        { type: "confirm", confirmed: action === "accept" },
+        action === "accept" ? "approved" : "denied",
+      );
+      await acknowledge(action === "accept" ? "Approved" : "Denied");
       return;
     }
     if (state.request.type !== "select") {
       await acknowledge("Reply to the prompt instead.");
+      return;
+    }
+    if (state.request.presentation === "decision") {
+      if (action === "other") {
+        state.awaitingAnswer = true;
+        state.decisionState = "waiting_answer";
+        await this.#refreshInteraction(state);
+        await acknowledge("Reply to this card with your answer.");
+        return;
+      }
+      const picked = /^pick-(\d+)$/.exec(action);
+      const index = picked === null ? -1 : Number(picked[1]);
+      if (!Number.isSafeInteger(index) || index < 0 || index >= state.choices.length) {
+        await acknowledge("This decision is no longer available.");
+        return;
+      }
+      state.decisionSettledLabel = "✅ Answered";
+      await this.#finishInteraction(state, { type: "select", selected: [state.choices[index]!] }, "approved");
+      await acknowledge(`Selected ${index + 1}`);
       return;
     }
     if (action === "noop") {
@@ -1372,54 +2084,54 @@ export class TelegramTransportAdapter implements TransportAdapter {
     if (action === "previous" || action === "next") {
       const pageCount = Math.max(1, Math.ceil(state.choices.length / SELECT_PAGE_SIZE));
       state.page = Math.max(0, Math.min(pageCount - 1, state.page + (action === "next" ? 1 : -1)));
-      await this.#refreshSelection(state);
+      await this.#refreshInteraction(state);
       await acknowledge();
       return;
     }
     if (action === "cancel") {
-      this.#finishInteraction(state, { type: "select", selected: [] });
+      await this.#finishInteraction(state, { type: "select", selected: [] });
       await acknowledge("Cancelled");
       return;
     }
     if (action === "done") {
-      this.#finishInteraction(state, {
+      await this.#finishInteraction(state, {
         type: "select",
-        selected: [...state.selected].sort((a, b) => a - b).map((index) => state.choices[index]!),
+        selected: [...state.selected].sort((left, right) => left - right).map((index) => state.choices[index]!),
       });
       await acknowledge("Selected");
       return;
     }
     const picked = /^pick-(\d+)$/.exec(action);
-    const index = picked ? Number(picked[1]) : -1;
+    const index = picked === null ? -1 : Number(picked[1]);
     if (!Number.isSafeInteger(index) || index < 0 || index >= state.choices.length) {
       await acknowledge("Invalid option.");
       return;
     }
     if (!state.multiple) {
-      this.#finishInteraction(state, { type: "select", selected: [state.choices[index]!] });
+      await this.#finishInteraction(state, { type: "select", selected: [state.choices[index]!] });
       await acknowledge(state.labels[index]);
       return;
     }
     if (state.selected.has(index)) state.selected.delete(index);
     else state.selected.add(index);
-    await this.#refreshSelection(state);
+    await this.#refreshInteraction(state);
     await acknowledge();
     void query;
-  }
-
-  async #refreshSelection(state: InteractiveState): Promise<void> {
-    if (!state.prompt) return;
-    await this.#outbound.update(state.address, state.prompt, { text: this.#selectPrompt(state) }, state.context);
-    await this.#outbound.setReplyMarkup(state.address, state.prompt, this.#selectKeyboard(state), state.context);
   }
 
   async #captureReply(message: TgMessage, principalId: string, address: ConversationAddress): Promise<boolean> {
     if (!message.reply_to_message || typeof message.text !== "string") return false;
     for (const state of this.#interactions.values()) {
-      if (state.request.type !== "input" && state.request.type !== "editor") continue;
       if (state.principalId !== principalId || !sameAddress(state.address, address)) continue;
       if (state.prompt?.messageId !== String(message.reply_to_message.message_id)) continue;
-      this.#finishInteraction(
+      if (state.request.type === "select" && state.awaitingAnswer) {
+        state.awaitingAnswer = false;
+        state.decisionSettledLabel = "✅ Answered";
+        await this.#finishInteraction(state, { type: "select", selected: [message.text] }, "approved");
+        return true;
+      }
+      if (state.request.type !== "input" && state.request.type !== "editor") continue;
+      await this.#finishInteraction(
         state,
         state.request.type === "input"
           ? { type: "input", cancelled: false, value: message.text }
@@ -1437,21 +2149,32 @@ export class TelegramTransportAdapter implements TransportAdapter {
     return { type: "editor", cancelled: true };
   }
 
-  #finishInteraction(state: InteractiveState, response: InteractiveResponse): void {
+  async #finishInteraction(
+    state: InteractiveState,
+    response: InteractiveResponse,
+    decisionState?: Extract<DecisionCardState, "approved" | "denied" | "expired">,
+  ): Promise<void> {
     if (!this.#interactions.delete(state.id)) return;
-    if (state.timeout) clearTimeout(state.timeout);
+    clearTimeout(state.timeout);
     state.detachAbort?.();
     this.#store.deletePendingInteraction(state.id);
-    if (state.prompt)
-      void this.#outbound
+    const decision =
+      state.request.type === "confirm" ||
+      (state.request.type === "select" && state.request.presentation === "decision");
+    if (decisionState !== undefined && decision) {
+      state.decisionState = decisionState;
+      await this.#refreshInteraction(state, false).catch(() => undefined);
+    } else if (state.prompt) {
+      await this.#outbound
         .setReplyMarkup(state.address, state.prompt, { inline_keyboard: [] }, state.context)
         .catch(() => undefined);
+    }
     state.settle(response);
   }
 
   #failInteraction(state: InteractiveState, error: unknown): void {
     if (!this.#interactions.delete(state.id)) return;
-    if (state.timeout) clearTimeout(state.timeout);
+    clearTimeout(state.timeout);
     state.detachAbort?.();
     this.#store.deletePendingInteraction(state.id);
     state.reject(error instanceof Error ? error : new Error(String(error)));
@@ -1486,8 +2209,14 @@ export class TelegramTransportAdapter implements TransportAdapter {
     card.stopVisible = [...card.statuses.values()].some(activeTask);
     this.#cards.set(key, card);
     const body = this.#renderCard(card);
+    const quickAskArmed = card.statuses.has(QUICK_ASK_STATUS_KEY);
     const markup = card.stopVisible
-      ? { inline_keyboard: [[{ text: "Stop", callback_data: STOP_CALLBACK }]] }
+      ? {
+          inline_keyboard: [
+            [{ text: quickAskArmed ? QUICK_ASK_ARMED_LABEL : QUICK_ASK_LABEL, callback_data: QUICK_ASK_CALLBACK }],
+            [{ text: "Stop", callback_data: STOP_CALLBACK }],
+          ],
+        }
       : { inline_keyboard: [] };
     const options = {
       replyMarkup: markup,
@@ -1504,17 +2233,106 @@ export class TelegramTransportAdapter implements TransportAdapter {
 
   #renderCard(card: ControlCard): string {
     const sections: string[] = [card.title];
-    for (const [name, value] of card.statuses) sections.push(`${name}\n${value}`);
+    for (const [name, value] of card.statuses) {
+      sections.push(name === QUICK_ASK_STATUS_KEY ? value : `${name}\n${value}`);
+    }
     for (const [name, lines] of card.widgets) sections.push(`${name}\n${lines.join("\n")}`);
     if (card.editorText) sections.push(`Suggested reply\n${card.editorText}`);
     return sections.join("\n\n");
+  }
+  #pairingCardFor(
+    identity: TransportIdentity,
+    address: ConversationAddress,
+    messageId?: string,
+  ): DurablePairingCard | undefined {
+    for (const pending of this.#store.listPendingInteractions(address)) {
+      const card = pairingCardFromPending(pending);
+      if (
+        card !== undefined &&
+        sameIdentity(card.identity, identity) &&
+        (messageId === undefined || card.prompt?.messageId === messageId)
+      ) {
+        return card;
+      }
+    }
+    return undefined;
+  }
+
+  #persistPairingCard(card: DurablePairingCard): void {
+    this.#store.putPendingInteraction({
+      id: card.id,
+      address: card.address,
+      kind: "pairing",
+      payload: {
+        schemaVersion: 1,
+        identity: {
+          transport: card.identity.transport,
+          account: card.identity.account,
+          subject: card.identity.subject,
+        },
+        state: card.state,
+        expiresAt: card.expiresAt,
+        ...(card.principalId === undefined ? {} : { principalId: card.principalId }),
+        ...(card.prompt === undefined ? {} : { promptMessageId: card.prompt.messageId }),
+      },
+      createdAt: card.createdAt,
+    });
+  }
+
+  #pairingCardContext(card: DurablePairingCard): DeliveryContext {
+    return {
+      principal: { id: card.principalId ?? `telegram-unresolved:${card.identity.subject}`, roles: [] },
+      origin: card.address,
+    };
+  }
+
+  #renderPairingCard(card: DurablePairingCard, code?: string): TelegramCardRender {
+    const remainingMs = Math.max(0, card.expiresAt - this.#clock());
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+    const expiresIn = `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+    return renderPairingJourneyCard(
+      {
+        state: card.state,
+        ...(card.state === "pending" && code !== undefined ? { code } : {}),
+        ...(card.state === "pending" ? { expiresIn } : {}),
+      },
+      (action) => `${PAIRING_CALLBACK}:${action}`,
+    );
+  }
+
+  async #settlePairingCard(
+    card: DurablePairingCard,
+    state: PairingJourneyCardState,
+    principalId?: string,
+    signal?: AbortSignal,
+  ): Promise<DurablePairingCard> {
+    const next: DurablePairingCard = {
+      ...card,
+      state,
+      ...(principalId === undefined ? {} : { principalId }),
+    };
+    if (next.prompt !== undefined) {
+      const rendered = this.#renderPairingCard(next);
+      const receipts = await this.#outbound.replaceMessages(
+        next.address,
+        [next.prompt],
+        rendered.text,
+        this.#pairingCardContext(next),
+        { replyMarkup: this.#cardReplyMarkup(rendered) },
+        signal,
+      );
+      const prompt = receipts.at(-1);
+      if (prompt === undefined) throw new Error("Telegram pairing card update did not return a receipt");
+      next.prompt = prompt;
+    }
+    this.#persistPairingCard(next);
+    return next;
   }
 
   async #sendPairingChallenge(message: TgMessage, identity: TransportIdentity): Promise<void> {
     const pairing = this.#pairing;
     if (pairing === undefined) return;
     const address = telegramAddress(message, this.#account);
-    const principal = { id: `telegram-unresolved:${identity.subject}`, roles: [] };
     const challenge = pairing.requestFromTransport(identity, address, this.#clock());
     if (challenge.status === "capacity") {
       await this.#outbound.sendMessage(
@@ -1523,28 +2341,98 @@ export class TelegramTransportAdapter implements TransportAdapter {
           "Pairing is temporarily unavailable because this Telegram account has too many pending requests.",
           "Ask the gateway operator to approve or clear an existing request, then try again.",
         ].join("\n"),
-        { principal, origin: address },
+        { principal: { id: `telegram-unresolved:${identity.subject}`, roles: [] }, origin: address },
       );
       return;
     }
 
     const { code, request } = challenge.result;
-    const minutes = Math.max(1, Math.ceil((request.expiresAt - request.createdAt) / 60_000));
-    await this.#outbound.sendMessage(
+    const previous = this.#pairingCardFor(identity, address);
+    const card: DurablePairingCard = {
+      id: previous?.id ?? `pairing:${encodeURIComponent(identity.account)}:${encodeURIComponent(identity.subject)}`,
+      identity,
       address,
-      [
-        "OmpClaw needs local approval before this Telegram account can send tasks.",
-        "",
-        `Pairing code: ${code}`,
-        `Expires in ${minutes} ${minutes === 1 ? "minute" : "minutes"}. A newer code replaces this one.`,
-        "",
-        "On the gateway host, run:",
-        `ompclaw pairing-approve ${code}`,
-        "",
-        `Telegram user ID: ${identity.subject}`,
-        `Chat ID: ${message.chat.id}`,
-      ].join("\n"),
-      { principal, origin: address },
+      createdAt: request.createdAt,
+      expiresAt: request.expiresAt,
+      state: "pending",
+      ...(previous?.prompt === undefined ? {} : { prompt: previous.prompt }),
+    };
+    const rendered = this.#renderPairingCard(card, code);
+    const context = this.#pairingCardContext(card);
+    if (card.prompt === undefined) {
+      card.prompt = await this.#outbound.sendMessage(address, rendered.text, context, {
+        replyMarkup: this.#cardReplyMarkup(rendered),
+      });
+    } else {
+      const receipts = await this.#outbound.replaceMessages(address, [card.prompt], rendered.text, context, {
+        replyMarkup: this.#cardReplyMarkup(rendered),
+      });
+      const prompt = receipts.at(-1);
+      if (prompt === undefined) throw new Error("Telegram pairing card creation did not return a receipt");
+      card.prompt = prompt;
+    }
+    this.#persistPairingCard(card);
+  }
+
+  async #handlePairingCardCallback(
+    query: TgCallbackQuery,
+    identity: TransportIdentity,
+    address: ConversationAddress,
+    updateId: number,
+    context: TransportStartContext,
+    acknowledge: (text?: string, alert?: boolean) => Promise<unknown>,
+  ): Promise<void> {
+    const message = query.message;
+    const action = query.data?.slice(`${PAIRING_CALLBACK}:`.length);
+    if (message === undefined || action === undefined) {
+      await acknowledge("This control is no longer available.");
+      return;
+    }
+    const card = this.#pairingCardFor(identity, address, String(message.message_id));
+    if (card === undefined) {
+      await acknowledge("This control has expired.");
+      return;
+    }
+    if (action === "retry") {
+      if (card.state !== "rejected" && card.state !== "expired") {
+        await acknowledge("This pairing request is still active.");
+        return;
+      }
+      await acknowledge("Requesting a new pairing code.");
+      await this.#sendPairingChallenge(message, identity);
+      return;
+    }
+    const principal = await context.resolveIdentity(identity, context.signal);
+    if (principal === undefined || card.principalId !== principal.id) {
+      await acknowledge("Not authorized.", true);
+      return;
+    }
+    if (action === "examples" && card.state === "connected") {
+      await this.#settlePairingCard(card, "examples", principal.id, context.signal);
+      await acknowledge("Examples shown.");
+      return;
+    }
+    if (action === "dismiss" && card.state === "examples") {
+      await this.#settlePairingCard(card, "connected", principal.id, context.signal);
+      await acknowledge("Examples dismissed.");
+      return;
+    }
+    if (action !== "home" || card.state !== "connected") {
+      await acknowledge("This control has expired.");
+      return;
+    }
+    await acknowledge("Opening Home.");
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:pairing:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: "/home" },
+        sourceReceipt: { transport: "telegram", messageId: String(message.message_id) },
+        edited: false,
+      },
+      context.signal,
     );
   }
 
@@ -1568,19 +2456,29 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const pairing = this.#pairing;
     const context = this.#context;
     if (pairing === undefined || context === undefined) return;
-    const approved = pairing.listUnconfirmedApprovals("telegram", this.#account);
-    for (const request of approved) {
+    const requests =
+      pairing.list === undefined
+        ? pairing.listUnconfirmedApprovals("telegram", this.#account)
+        : pairing.list(this.#clock());
+    const cards = this.#store
+      .listPendingInteractions()
+      .map(pairingCardFromPending)
+      .filter((card): card is DurablePairingCard => card !== undefined);
+    for (const card of cards) {
+      const request = requests.find((candidate) => sameIdentity(candidate.identity, card.identity));
+      if (request === undefined) continue;
+      const state = pairingJourneyState(request);
       try {
-        const principal = await context.resolveIdentity(request.identity, context.signal);
-        if (principal === undefined || principal.id !== request.principalId) continue;
-        await this.#outbound.sendMessage(
-          request.address,
-          "Paired. Send your first task.",
-          { principal, origin: request.address },
-          {},
-          context.signal,
-        );
-        pairing.completeConfirmation(request.identity, this.#clock());
+        if (state === "connected") {
+          const principal = await context.resolveIdentity(request.identity, context.signal);
+          if (principal === undefined || principal.id !== request.principalId) continue;
+          if (card.state !== "connected" && card.state !== "examples") {
+            await this.#settlePairingCard(card, "connected", principal.id, context.signal);
+          }
+          pairing.completeConfirmation(request.identity, this.#clock());
+          continue;
+        }
+        if (state !== card.state) await this.#settlePairingCard(card, state, undefined, context.signal);
       } catch (error) {
         if (context.signal?.aborted) return;
         this.#log?.warn(
@@ -1622,6 +2520,36 @@ export class TelegramTransportAdapter implements TransportAdapter {
       context.origin.account === this.#account &&
       sameAddress(address, context.origin)
     );
+  }
+  async #refreshBotProfile(signal?: AbortSignal): Promise<void> {
+    let name: string | undefined;
+    try {
+      const bot = await this.#telegram("getMe", {}, signal);
+      if (isRecord(bot) && typeof bot.first_name === "string" && bot.first_name.trim().length > 0) {
+        name = bot.first_name.trim();
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      this.#log?.warn(
+        `[telegram] bot profile identity lookup failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const failures = await refreshTelegramBotProfile(
+      (method, payload, options) => this.#telegram(method, payload ?? {}, options?.signal),
+      {
+        description: TELEGRAM_BOT_DESCRIPTION,
+        shortDescription: TELEGRAM_BOT_SHORT_DESCRIPTION,
+        ...(name === undefined ? {} : { name }),
+      },
+      signal,
+    );
+    for (const failure of failures) {
+      this.#log?.warn(
+        `[telegram] bot profile ${failure.method} failed: ${
+          failure.error instanceof Error ? failure.error.message : String(failure.error)
+        }`,
+      );
+    }
   }
 
   #trackUpdate(update: TgUpdate): Promise<void> {

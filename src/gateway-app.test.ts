@@ -6,6 +6,7 @@ import {
   GatewayApplication,
   type GatewayApplicationStore,
   type GatewayCoreRuntime,
+  type GatewayQuickLaneRuntime,
   type GatewayRuntime,
   type GatewaySchedulerRuntime,
 } from "./gateway-app";
@@ -281,6 +282,10 @@ class MemoryStore implements GatewayApplicationStore {
   deletePendingInteraction() {
     return false;
   }
+
+  listPendingInteractions() {
+    return [];
+  }
 }
 
 function coreHarness(events: string[]) {
@@ -378,6 +383,85 @@ describe("GatewayApplication", () => {
       "unlock",
     ]);
     expect(store.closed).toBe(true);
+  });
+
+  test("routes an armed quick question while the main runtime stays busy", async () => {
+    const events: string[] = [];
+    const store = new MemoryStore();
+    const core = coreHarness(events);
+    const mainHandled: string[] = [];
+    const quickAnswers: string[] = [];
+    const homeRefreshes: string[] = [];
+    let armed = false;
+    let quickStopped = false;
+    const quickLane: GatewayQuickLaneRuntime = {
+      routeFor(message) {
+        const text = message.content.text;
+        if (text === "/quick-arm") return { kind: "arm" };
+        if (armed && text === "unrelated question") return { kind: "query", prompt: text, consumesArm: true };
+        return undefined;
+      },
+      async handle(_message, route) {
+        if (route.kind === "arm") {
+          armed = !armed;
+          return { armChanged: true, armed };
+        }
+        if (route.kind === "query") {
+          quickAnswers.push(route.prompt);
+          armed = false;
+          return { armChanged: route.consumesArm, armed };
+        }
+        throw new Error(`unexpected quick route ${route.kind}`);
+      },
+      async stop() {
+        quickStopped = true;
+      },
+      isArmed() {
+        return armed;
+      },
+    };
+    const runtime: GatewayRuntime = {
+      async start() {},
+      async stop() {},
+      async handleInbound(message) {
+        mainHandled.push(message.id);
+      },
+      isBusy: () => true,
+      async showHome(message) {
+        homeRefreshes.push(message.id);
+      },
+    };
+    const app = new GatewayApplication({
+      config: gatewayConfig(),
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
+      seams: {
+        ingressComposer: FAST_INGRESS,
+        createStore: () => store,
+        createCore: core.create,
+        createRuntime: () => runtime,
+        createQuickLane: () => quickLane,
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        startLockHeartbeat: () => () => {},
+        releaseLock: () => {},
+      },
+    });
+
+    await app.start();
+    await core.options().onInbound({ ...inbound("arm"), content: { text: "/quick-arm" } });
+    await waitFor(() => armed && homeRefreshes.length === 1);
+    await core.options().onInbound({ ...inbound("question"), content: { text: "unrelated question" } });
+    await waitFor(() => quickAnswers.length === 1);
+
+    expect(quickAnswers).toEqual(["unrelated question"]);
+    expect(mainHandled).toEqual([]);
+    expect(homeRefreshes).toEqual(["arm", "question"]);
+    await app.stop();
+    expect(quickStopped).toBe(true);
   });
 
   test("refuses a second process before opening its database", async () => {

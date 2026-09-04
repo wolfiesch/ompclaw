@@ -14,6 +14,13 @@ import {
   type GatewayIngressCompositionStore,
 } from "./gateway-ingress-composer";
 import { GatewayPairingService, type GatewayPairingPersistence } from "./gateway-pairing";
+import {
+  GatewayQuickLane,
+  QuickLaneStoppedError,
+  type GatewayQuickLaneHandleResult,
+  type GatewayQuickLaneOptions,
+  type GatewayQuickLaneRoute,
+} from "./gateway-quicklane";
 import type { GatewayDelivery } from "./gateway-tools";
 import {
   GatewayScheduler,
@@ -25,11 +32,12 @@ import {
 import {
   GatewayStore,
   type ConversationBinding,
+  type GatewayCommandCatalogStore,
   type GatewayTurnLifecycleStore,
   type JsonValue,
   type ScheduledJob,
 } from "./gateway-store";
-import type { InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
+import type { ConversationAddress, InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
 import { RpcGatewayRuntime, runtimeCommandMenu, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import type { RpcSessionState } from "./rpc-protocol";
 import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
@@ -57,9 +65,14 @@ export interface GatewayApplicationStore
   migrateTelegramUpdateCheckpoint?(account: string): boolean;
   putPendingInteraction: GatewayStore["putPendingInteraction"];
   deletePendingInteraction: GatewayStore["deletePendingInteraction"];
+  listPendingInteractions: GatewayStore["listPendingInteractions"];
   getSemanticView: GatewayStore["getSemanticView"];
   putSemanticView: GatewayStore["putSemanticView"];
   getSemanticViewByReceipt: GatewayStore["getSemanticViewByReceipt"];
+  listOmpAvailableCommands?: GatewayCommandCatalogStore["listOmpAvailableCommands"];
+  recordCommandUsage?: GatewayCommandCatalogStore["recordCommandUsage"];
+  listRecentCommandUsage?: GatewayCommandCatalogStore["listRecentCommandUsage"];
+  replaceOmpAvailableCommands?: GatewayCommandCatalogStore["replaceOmpAvailableCommands"];
 }
 
 export interface GatewayRuntime {
@@ -74,6 +87,14 @@ export interface GatewayRuntime {
   notifyInboundQueued?(message: InboundMessage): Promise<void>;
   newSession?(name?: string): Promise<boolean>;
   switchSession?(sessionPath: string): Promise<boolean>;
+  showHome?(message: InboundMessage): Promise<void>;
+}
+
+export interface GatewayQuickLaneRuntime {
+  routeFor(message: InboundMessage): GatewayQuickLaneRoute | undefined;
+  handle(message: InboundMessage, route: GatewayQuickLaneRoute): Promise<GatewayQuickLaneHandleResult>;
+  stop(): Promise<void>;
+  isArmed(address: ConversationAddress): boolean;
 }
 
 export type GatewayCoreRuntime = GatewayDelivery & Pick<GatewayCore, "register" | "start" | "stop">;
@@ -86,6 +107,7 @@ export interface GatewayApplicationSeams {
   readonly createStore?: (path: string) => GatewayApplicationStore;
   readonly createCore?: (options: GatewayCoreOptions) => GatewayCoreRuntime;
   readonly createRuntime?: (options: RpcGatewayRuntimeOptions) => GatewayRuntime;
+  readonly createQuickLane?: (options: GatewayQuickLaneOptions) => GatewayQuickLaneRuntime;
   readonly createTelegramAdapter?: (options: TelegramTransportAdapterOptions) => TransportAdapter;
   readonly createWebSocketAdapter?: (options: WebSocketTransportOptions) => TransportAdapter;
   readonly createScheduler?: (options: GatewaySchedulerOptions) => GatewaySchedulerRuntime;
@@ -125,8 +147,8 @@ interface PendingInboundCompletion {
 }
 
 /**
- * One process owns one OMP RPC session. Transport adapters are deliberately
- * downstream of that session: no poller or server can accept traffic first.
+ * One process owns the main OMP RPC session and an optional lazy quick-answer
+ * session. Transport adapters remain downstream of both RPC children.
  */
 export class GatewayApplication {
   readonly #config: GatewayConfig;
@@ -138,6 +160,7 @@ export class GatewayApplication {
   #store: GatewayApplicationStore | undefined;
   #core: GatewayCoreRuntime | undefined;
   #runtime: GatewayRuntime | undefined;
+  #quickLane: GatewayQuickLaneRuntime | undefined;
   #scheduler: GatewaySchedulerRuntime | undefined;
   #ingressComposer: GatewayIngressComposer | undefined;
   #updates: GatewayUpdateCoordinator | undefined;
@@ -212,6 +235,13 @@ export class GatewayApplication {
         onInbound: (message) => this.#acceptInbound(message),
       });
       this.#core = core;
+      this.#quickLane = (
+        this.#seams.createQuickLane ?? ((options: GatewayQuickLaneOptions) => new GatewayQuickLane(options))
+      )({
+        config: this.#config,
+        delivery: core,
+        readyTimeoutMs: this.#config.updates.healthTimeoutMs,
+      });
 
       const secrets = this.#providedSecrets ?? resolveGatewaySecrets(this.#config);
       this.#adapters = this.#createAdapters(store, secrets);
@@ -256,6 +286,7 @@ export class GatewayApplication {
         config: rpcConfig,
         delivery: core,
         sessionFile: this.#sessionFile,
+        isQuickAskArmed: (address) => this.#quickLane?.isArmed(address) === true,
         onSessionState: (session) => this.#recordSessionState(session),
         ...(scheduler === undefined ? {} : { automation: scheduler }),
         ...(updates === undefined ? {} : { updates }),
@@ -321,6 +352,7 @@ export class GatewayApplication {
           store,
           pairing: new GatewayPairingService(store),
           commands: runtimeCommandMenu(this.#config.omp.allowRpcBash),
+          allowRpcBash: this.#config.omp.allowRpcBash,
           createTopicsFromRoot: telegram.topicSessions.enabled && telegram.topicSessions.createFromRoot,
           ...(telegram.transcribeCommand === undefined ? {} : { transcribeCommand: telegram.transcribeCommand }),
         }),
@@ -358,7 +390,8 @@ export class GatewayApplication {
     const runtime = this.#requireRuntime();
     if (!store.claimInboundMessage(message, (this.#seams.now ?? Date.now)())) return;
 
-    const immediate = runtime.canHandleInboundImmediately?.(message) === true;
+    const quickRoute = this.#quickLane?.routeFor(message);
+    const immediate = quickRoute !== undefined || runtime.canHandleInboundImmediately?.(message) === true;
     const delayed = !immediate && (this.#queuedInboundCount > 0 || runtime.isBusy?.() === true);
     const ready =
       delayed && runtime.notifyInboundQueued !== undefined
@@ -422,6 +455,30 @@ export class GatewayApplication {
     const store = this.#requireStore();
     const runtime = this.#requireRuntime();
     const key = this.#inboundKey(message);
+    const quickLane = this.#quickLane;
+    const quickRoute = scheduled ? undefined : quickLane?.routeFor(message);
+    if (quickRoute !== undefined && quickLane !== undefined) {
+      const principal = this.#resolvePendingPrincipal(store, message);
+      if (principal === undefined) return;
+      const authorizedMessage = { ...message, principal };
+      try {
+        const result = await quickLane.handle(authorizedMessage, quickRoute);
+        if (result.armChanged) await runtime.showHome?.(authorizedMessage);
+      } catch (error) {
+        if (!(error instanceof QuickLaneStoppedError) || this.#state !== "stopping") throw error;
+        // Quick turns deliberately do not survive gateway shutdown or replay on restart.
+        if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+          throw new Error(`Interrupted quick inbound message ${message.id} disappeared before completion`);
+        }
+        console.warn(`[ompclaw quick] dropped interrupted quick request ${message.id} during gateway shutdown`);
+        return;
+      }
+      if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+        throw new Error(`Quick inbound message ${message.id} disappeared before completion`);
+      }
+      return;
+    }
+
     let completion = this.#pendingInboundCompletions.get(key);
     if (completion === undefined) {
       const dispatchImmediately = immediate || (!scheduled && runtime.canHandleInboundImmediately?.(message) === true);
@@ -638,6 +695,16 @@ export class GatewayApplication {
     if (scheduler !== undefined) {
       try {
         scheduler.stop();
+      } catch (error) {
+        remember(error);
+      }
+    }
+
+    const quickLane = this.#quickLane;
+    this.#quickLane = undefined;
+    if (quickLane !== undefined) {
+      try {
+        await quickLane.stop();
       } catch (error) {
         remember(error);
       }

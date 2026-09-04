@@ -7,12 +7,19 @@ import type {
   ConversationAddress,
   DeliveryContext,
   InboundMessage,
+  Principal,
   UiRequest,
   UiResponse,
   UiResponseFor,
 } from "./gateway-types";
 import type { GatewayDelivery } from "./gateway-tools";
-import type { GatewayTurnLifecycleStore, TurnLifecycle } from "./gateway-store";
+import type {
+  GatewayPrincipalStore,
+  GatewayTurnLifecycleStore,
+  GatewayTurnOutcomeStore,
+  TurnLifecycle,
+  TurnOutcome,
+} from "./gateway-store";
 import type { GatewayUpdateControl } from "./gateway-update";
 import type { OmpRpcClientOptions, RpcClient, RpcCommandInput, RpcFrameListener } from "./rpc-client";
 import type { RpcRuntimeConfig } from "./rpc-config";
@@ -286,7 +293,8 @@ describe("RpcGatewayRuntime", () => {
         },
       ],
     ]);
-    const turnStore: GatewayTurnLifecycleStore = {
+    const outcomes = new Map<string, TurnOutcome>();
+    const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore & GatewayPrincipalStore = {
       putTurnLifecycle: (turn) => turns.set(turn.id, turn),
       interruptActiveTurns: (interruptedAt) => {
         let changed = 0;
@@ -302,6 +310,20 @@ describe("RpcGatewayRuntime", () => {
           .filter((turn) => JSON.stringify(turn.address) === JSON.stringify(address))
           .sort((left, right) => right.createdAt - left.createdAt)
           .slice(0, limit),
+      getPrincipal: (id): Principal | undefined => ({ id, roles: ["owner"] }),
+      putTurnOutcome: (outcome) => outcomes.set(outcome.turnId, outcome),
+      getTurnOutcome: (id) => outcomes.get(id),
+      listPendingTurnOutcomes: () => [...outcomes.values()].filter((outcome) => outcome.deliveredAt === undefined),
+      recordTurnOutcomeAttempt: (id, attemptedAt) => {
+        const outcome = outcomes.get(id);
+        if (outcome) outcomes.set(id, { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt });
+      },
+      markTurnOutcomeDelivered: (id, deliveredAt) => {
+        const outcome = outcomes.get(id);
+        if (outcome === undefined || outcome.deliveredAt !== undefined) return false;
+        outcomes.set(id, { ...outcome, deliveredAt });
+        return true;
+      },
     };
     let now = 100;
     const runtime = createRuntime({
@@ -400,6 +422,14 @@ describe("RpcGatewayRuntime", () => {
     expect(completedCard).toMatchObject({
       view: { sections: [{ id: "progress", label: "Progress", tone: "success" }] },
     });
+    expect(outcomes.get("lifecycle-Deploy carefully")).toMatchObject({
+      state: "completed",
+      text: "Done",
+      attemptCount: 1,
+      deliveredAt: expect.any(Number),
+    });
+    await runtime.handleInbound(message("lifecycle", "/result lifecycle-Deploy carefully"));
+    expect(deliveries.at(-1)).toMatchObject({ method: "send", content: { text: "Done" } });
 
     expect(turns.get("lifecycle-Deploy carefully")).toMatchObject({
       state: "completed",
@@ -430,7 +460,204 @@ describe("RpcGatewayRuntime", () => {
     expect(rpc.sent.filter((command) => command.type === "get_state").length).toBeGreaterThan(1);
 
     await runtime.handleInbound(message("lifecycle", "/tasks"));
-    expect(deliveries.some((call) => textFromContent(call.content)?.includes("Done | Deploy carefully"))).toBe(true);
+    expect(
+      deliveries.some(
+        (call) =>
+          call.method === "presentUi" &&
+          call.request?.type === "semantic_view" &&
+          call.request.view.id === "tasks" &&
+          call.request.view.sections.some((section) => section.label?.includes("Deploy carefully")),
+      ),
+    ).toBe(true);
+    await runtime.stop();
+  });
+
+  test("retries an undelivered terminal outcome after runtime restart", async () => {
+    let outcome: TurnOutcome | undefined = {
+      turnId: "turn-recover",
+      principalId: "principal-recover",
+      address: { transport: "test", account: "account", channel: "recover" },
+      state: "completed",
+      text: "Recovered result",
+      createdAt: 100,
+      attemptCount: 0,
+      replyTo: { transport: "test", messageId: "source-recover" },
+    };
+    const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore & GatewayPrincipalStore = {
+      putTurnLifecycle: () => {},
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: () => [],
+      getPrincipal: (id) => (id === "principal-recover" ? { id, roles: ["owner"] } : undefined),
+      putTurnOutcome: (next) => {
+        outcome = next;
+      },
+      getTurnOutcome: () => outcome,
+      listPendingTurnOutcomes: () => (outcome?.deliveredAt === undefined ? [outcome] : []),
+      recordTurnOutcomeAttempt: (_id, attemptedAt) => {
+        if (outcome) outcome = { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt };
+      },
+      markTurnOutcomeDelivered: (_id, deliveredAt) => {
+        if (outcome === undefined || outcome.deliveredAt !== undefined) return false;
+        outcome = { ...outcome, deliveredAt };
+        return true;
+      },
+    };
+    const runtime = createRuntime({ config, delivery: delivery(), turnStore, now: () => 500 });
+    await runtime.start();
+    expect(deliveries.find((call) => call.method === "send" && textFromContent(call.content) === "Recovered result")).toBeDefined();
+    expect(outcome).toMatchObject({ attemptCount: 1, lastAttemptAt: 500, deliveredAt: 500 });
+    await runtime.stop();
+  });
+
+  test("recovers a terminal result after its initial delivery fails", async () => {
+    const outcomes = new Map<string, TurnOutcome>();
+    const turns = new Map<string, TurnLifecycle>();
+    const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore & GatewayPrincipalStore = {
+      putTurnLifecycle: (turn) => turns.set(turn.id, turn),
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: () => [],
+      getPrincipal: (id) => ({ id, roles: ["owner"] }),
+      putTurnOutcome: (outcome) => outcomes.set(outcome.turnId, outcome),
+      getTurnOutcome: (id) => outcomes.get(id),
+      listPendingTurnOutcomes: () => [...outcomes.values()].filter((outcome) => outcome.deliveredAt === undefined),
+      recordTurnOutcomeAttempt: (id, attemptedAt) => {
+        const outcome = outcomes.get(id);
+        if (outcome) outcomes.set(id, { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt });
+      },
+      markTurnOutcomeDelivered: (id, deliveredAt) => {
+        const outcome = outcomes.get(id);
+        if (outcome === undefined || outcome.deliveredAt !== undefined) return false;
+        outcomes.set(id, { ...outcome, deliveredAt });
+        return true;
+      },
+    };
+    const unavailableDelivery: GatewayDelivery = {
+      ...delivery(),
+      finalize: async () => {
+        throw new Error("Telegram delivery unavailable");
+      },
+    };
+    const first = createRuntime({ config, delivery: unavailableDelivery, turnStore, now: () => 100 });
+    await first.start();
+    await first.handleInbound(message("delivery-recovery", "Deliver the result"));
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Durable result" }] }] });
+    await first.waitUntilIdle();
+    expect(outcomes.get("delivery-recovery-Deliver the result")).toMatchObject({
+      state: "completed",
+      text: "Durable result",
+    });
+    expect(outcomes.get("delivery-recovery-Deliver the result")?.deliveredAt).toBeUndefined();
+    await first.stop();
+
+    const second = createRuntime({ config, delivery: delivery(), turnStore, now: () => 200 });
+    await second.start();
+    expect(outcomes.get("delivery-recovery-Deliver the result")).toMatchObject({
+      attemptCount: expect.any(Number),
+      deliveredAt: 200,
+    });
+    expect(deliveries.some((call) => call.method === "send" && textFromContent(call.content) === "Durable result")).toBe(true);
+    await second.stop();
+  });
+
+  test("continues and revises a terminal task with its durable context", async () => {
+    const prior: TurnLifecycle = {
+      id: "prior-task",
+      principalId: "principal-continuation",
+      address: { transport: "test", account: "account", channel: "continuation" },
+      prompt: "Prepare the release",
+      state: "completed",
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+    };
+    const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore = {
+      putTurnLifecycle: () => {},
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: (address) =>
+        JSON.stringify(address) === JSON.stringify(prior.address) ? [prior] : [],
+      putTurnOutcome: () => {},
+      getTurnOutcome: (id) =>
+        id === prior.id
+          ? {
+              turnId: prior.id,
+              principalId: prior.principalId,
+              address: prior.address,
+              state: "completed",
+              text: "Release prepared",
+              createdAt: 2,
+              attemptCount: 1,
+              deliveredAt: 2,
+            }
+          : undefined,
+    };
+    const runtime = createRuntime({ config, delivery: delivery(), turnStore });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    await runtime.handleInbound(message("continuation", "/task_continue prior-task Add deployment notes"));
+    expect(JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content.text).toBe(
+      "Continue this prior task. Original request:\nPrepare the release\n\nNew instruction:\nAdd deployment notes",
+    );
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }] });
+    await runtime.waitUntilIdle();
+
+    await runtime.handleInbound(message("continuation", "/task_revise prior-task Include a rollback plan"));
+    expect(JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content.text).toBe(
+      "Revise this prior task. Original request:\nPrepare the release\n\nPrevious result:\nRelease prepared\n\nNew instruction:\nInclude a rollback plan",
+    );
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Revised" }] }] });
+    await runtime.waitUntilIdle();
+    await runtime.stop();
+  });
+
+  test("routes failure-card details and retry controls through the persisted task", async () => {
+    const retryable: TurnLifecycle = {
+      id: "retryable",
+      principalId: "principal-retry",
+      address: { transport: "test", account: "account", channel: "retry" },
+      prompt: "Finish the deployment",
+      state: "interrupted",
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+      error: "Provider socket timed out",
+    };
+    const turns = new Map<string, TurnLifecycle>([[retryable.id, retryable]]);
+    const turnStore: GatewayTurnLifecycleStore = {
+      putTurnLifecycle: (turn) => turns.set(turn.id, turn),
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: (address) =>
+        [...turns.values()].filter((turn) => JSON.stringify(turn.address) === JSON.stringify(address)),
+    };
+    const runtime = createRuntime({ config, delivery: delivery(), turnStore });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    await runtime.handleInbound(message("retry", "/task_details retryable"));
+    const details = deliveries.findLast((call) => call.method === "presentUi")?.request;
+    if (details?.type !== "semantic_view") throw new Error("expected task details card");
+    expect(details.view.state).toBe("cancelled");
+    expect(details.view.sections).toEqual(
+      expect.arrayContaining([{ id: "details", label: "Details", text: "Provider socket timed out", tone: "muted" }]),
+    );
+    expect(details.view.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ command: "/task_retry retryable" }),
+        expect.objectContaining({ command: "/task_details retryable hide" }),
+      ]),
+    );
+    await runtime.handleInbound(message("retry", "/task_details retryable hide"));
+    const collapsed = deliveries.findLast((call) => call.method === "presentUi")?.request;
+    if (collapsed?.type !== "semantic_view") throw new Error("expected collapsed task card");
+    expect(collapsed.view.sections.some((section) => section.id === "details")).toBe(false);
+    await runtime.handleInbound(message("retry", "/task_details unavailable"));
+    expect(textFromContent(deliveries.findLast((call) => call.method === "send")?.content)).toBe(
+      "That task is no longer available.",
+    );
+    await runtime.handleInbound(message("retry", "/task_retry retryable"));
+    expect(rpc.sent).toContainEqual({
+      type: "prompt",
+      message: expect.stringContaining("Resume this unfinished task. Original request:\\nFinish the deployment"),
+    });
     await runtime.stop();
   });
 
@@ -795,6 +1022,9 @@ describe("RpcGatewayRuntime", () => {
     await waitFor(() => calls.includes("discard"));
 
     expect(calls).toEqual(["discard"]);
+    expect(deliveries.find((call) => call.method === "finalize")).toMatchObject({
+      content: { text: "The task completed, but OMP produced no final summary. Ask for a summary of the completed work." },
+    });
     await runtime.stop();
   });
 
@@ -886,9 +1116,37 @@ describe("RpcGatewayRuntime", () => {
       "prompt transport leaked detail",
     );
     const promptFailure = deliveries.find(
-      (call) => call.method === "send" && textFromContent(call.content)?.startsWith("I couldn't start that request."),
+      (call) => call.method === "send" && textFromContent(call.content) === "That task's recovery card is ready below.",
     );
-    expect(textFromContent(promptFailure?.content)).not.toContain("prompt transport leaked detail");
+    expect(promptFailure).toBeDefined();
+    await waitFor(() =>
+      deliveries.some(
+        (call) =>
+          call.method === "presentUi" &&
+          call.request?.type === "semantic_view" &&
+          call.request.view.state === "failed",
+      ),
+    );
+    const failureCard = deliveries.findLast(
+      (call) =>
+        call.method === "presentUi" &&
+        call.request?.type === "semantic_view" &&
+        call.request.view.state === "failed",
+    )?.request;
+    expect(failureCard).toMatchObject({
+      type: "semantic_view",
+      view: {
+        sections: expect.arrayContaining([
+          expect.objectContaining({ id: "error", text: "This task could not finish." }),
+        ]),
+        actions: expect.arrayContaining([
+          expect.objectContaining({ label: "↻ Retry" }),
+          expect.objectContaining({ label: "🔍 View details" }),
+          expect.objectContaining({ label: "📋 Open task" }),
+          expect.objectContaining({ label: "✨ Start fresh" }),
+        ]),
+      },
+    });
     expect(await runtime.statusText()).toContain("Prompt failed: prompt transport leaked detail");
 
     await runtime.handleInbound(message("errors", "Start again"));
@@ -1411,6 +1669,7 @@ describe("RpcGatewayRuntime", () => {
       "stop",
       "new",
       "tasks",
+      "result",
       "help",
     ]);
     expect(runtimeCommandMenu().map(({ command }) => command)).not.toContain("shell");
@@ -1426,7 +1685,7 @@ describe("RpcGatewayRuntime", () => {
     expect(home).toMatchObject({
       type: "semantic_view",
       view: {
-        title: "🟢 OmpClaw · Idle",
+        title: "🟢 Ready",
         actions: expect.arrayContaining([{ id: "model", label: "🤖 Model", command: "/model" }]),
       },
     });
@@ -1438,16 +1697,32 @@ describe("RpcGatewayRuntime", () => {
     expect(modelPage).toMatchObject({
       type: "semantic_view",
       view: {
-        id: "home",
-        title: "Choose a model",
+        id: "model",
+        title: "🤖 Model",
         actions: expect.arrayContaining([
-          expect.objectContaining({ label: "✓ model", command: "/model provider/model" }),
-          { id: "back", label: "Back to Home", command: "/home" },
+          expect.objectContaining({ label: "✓ provider · 1", command: "/model provider provider" }),
+          { id: "cancel", label: "Cancel", command: "/home" },
         ]),
       },
     });
 
-    await runtime.handleInbound(message("commands", "/model provider/model"));
+    await runtime.handleInbound(message("commands", "/model provider provider"));
+    const providerPage = deliveries
+      .filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view")
+      .at(-1)?.request;
+    expect(providerPage).toMatchObject({
+      type: "semantic_view",
+      view: {
+        id: "model",
+        title: "🤖 provider models 1/1",
+        actions: expect.arrayContaining([
+          expect.objectContaining({ label: "✓ Model", command: "/model select provider model" }),
+          { id: "back", label: "← Back", command: "/model" },
+        ]),
+      },
+    });
+
+    await runtime.handleInbound(message("commands", "/model select provider model"));
     const rpc = FakeOmpRpcClient.instances[0];
     expect(rpc.sent).toContainEqual(
       expect.objectContaining({
@@ -1459,7 +1734,7 @@ describe("RpcGatewayRuntime", () => {
     expect(
       deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
         ?.request,
-    ).toMatchObject({ type: "semantic_view", view: { title: "🟢 OmpClaw · Idle" } });
+    ).toMatchObject({ type: "semantic_view", view: { title: "🟢 Ready" } });
     await runtime.stop();
   });
 
@@ -1485,8 +1760,8 @@ describe("RpcGatewayRuntime", () => {
       expect(home).toMatchObject({
         type: "semantic_view",
         view: {
-          sections: expect.arrayContaining([{ id: "mode", label: "Mode", text: `${label} · inherit` }]),
-          actions: expect.arrayContaining([{ id: "autonomy", label: "🛡 Autonomy", command: "/autonomy" }]),
+          sections: expect.arrayContaining([{ id: "settings", text: expect.stringContaining(label) }]),
+          actions: expect.arrayContaining([{ id: "permissions", label: "🛡 Permissions", command: "/permissions" }]),
         },
       });
 
@@ -1618,6 +1893,7 @@ describe("RpcGatewayRuntime", () => {
     await runtime.handleInbound(message("commands", "/subagents"));
     await runtime.handleInbound(message("commands", "/new"));
     await runtime.handleInbound(message("commands", "/status"));
+    await runtime.handleInbound(message("commands", "/stats"));
     await expect(runtime.switchSession("/sessions/resume.jsonl")).resolves.toBe(true);
 
     expect(rpc.sent.map((command) => command.type)).toEqual(
@@ -1628,6 +1904,7 @@ describe("RpcGatewayRuntime", () => {
         "get_subagents",
         "new_session",
         "get_state",
+        "get_session_stats",
         "switch_session",
       ]),
     );

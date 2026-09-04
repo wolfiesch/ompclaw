@@ -249,6 +249,32 @@ describe("GatewayStore", () => {
     store.close();
   });
 
+  test("persists OMP command discovery and caps per-principal command recency", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    first.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    first.replaceOmpAvailableCommands([
+      { name: "deploy", description: "Ship the current branch", source: "skill" },
+      { name: "/inspect", description: "Inspect a task", source: "builtin" },
+      { name: "not a command", description: "Ignored" },
+    ]);
+    for (let index = 0; index < 21; index += 1) {
+      first.recordCommandUsage("operator-42", `skill-${index}`, index);
+    }
+    first.close();
+
+    const restarted = new GatewayStore(path);
+    expect(restarted.listOmpAvailableCommands()).toEqual([
+      { name: "deploy", description: "Ship the current branch", source: "skill" },
+      { name: "inspect", description: "Inspect a task", source: "builtin" },
+    ]);
+    const recent = restarted.listRecentCommandUsage("operator-42");
+    expect(recent).toHaveLength(20);
+    expect(recent[0]).toBe("skill-20");
+    expect(recent).not.toContain("skill-0");
+    restarted.close();
+  });
+
   test("supports the pending interaction lifecycle", () => {
     const store = new GatewayStore(temporaryDatabase());
     const pending = {
@@ -551,6 +577,18 @@ describe("GatewayStore", () => {
       createdAt: 100,
       updatedAt: 200,
     });
+    first.appendTurnTimelineEvent({
+      turnId: "turn-running",
+      at: 150,
+      kind: "queued",
+      text: "Task received",
+    });
+    first.appendTurnTimelineEvent({
+      turnId: "turn-running",
+      at: 200,
+      kind: "tool_started",
+      text: "Running tests",
+    });
     first.putTurnLifecycle({
       id: "turn-complete",
       principalId: "operator-42",
@@ -560,6 +598,16 @@ describe("GatewayStore", () => {
       createdAt: 300,
       updatedAt: 400,
       finishedAt: 400,
+    });
+    first.putTurnOutcome({
+      turnId: "turn-complete",
+      principalId: "operator-42",
+      address: { ...ownerAddress, thread: "topic-1" },
+      state: "completed",
+      text: "Release summary",
+      createdAt: 400,
+      attemptCount: 0,
+      replyTo: { transport: "telegram", messageId: "request-42" },
     });
     first.close();
 
@@ -577,9 +625,33 @@ describe("GatewayStore", () => {
         finishedAt: 500,
       },
     ]);
+    expect(restarted.listTurnTimelineEvents("turn-running")).toEqual([
+      { turnId: "turn-running", at: 150, kind: "queued", text: "Task received" },
+      { turnId: "turn-running", at: 200, kind: "tool_started", text: "Running tests" },
+    ]);
     expect(restarted.listTurnLifecycles({ ...ownerAddress, thread: "topic-1" })).toEqual([
       expect.objectContaining({ id: "turn-complete", state: "completed" }),
     ]);
+    expect(restarted.listPendingTurnOutcomes()).toEqual([
+      {
+        turnId: "turn-complete",
+        principalId: "operator-42",
+        address: { ...ownerAddress, thread: "topic-1" },
+        state: "completed",
+        text: "Release summary",
+        createdAt: 400,
+        attemptCount: 0,
+        replyTo: { transport: "telegram", messageId: "request-42" },
+      },
+    ]);
+    restarted.recordTurnOutcomeAttempt("turn-complete", 550);
+    expect(restarted.markTurnOutcomeDelivered("turn-complete", 600)).toBe(true);
+    expect(restarted.getTurnOutcome("turn-complete")).toMatchObject({
+      attemptCount: 1,
+      lastAttemptAt: 550,
+      deliveredAt: 600,
+    });
+    expect(restarted.listPendingTurnOutcomes()).toEqual([]);
     restarted.close();
   });
 

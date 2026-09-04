@@ -78,6 +78,11 @@ export interface GatewayUpdatesConfig {
   readonly healthTimeoutMs: number;
 }
 
+export interface GatewayQuickLaneConfig {
+  readonly enabled: boolean;
+}
+
+
 export interface GatewayConfig {
   readonly workspace: string;
   readonly stateDir: string;
@@ -88,6 +93,7 @@ export interface GatewayConfig {
     readonly websocket?: GatewayWebSocketConfig;
   };
   readonly automation: GatewayAutomationConfig;
+  readonly quickLane: GatewayQuickLaneConfig;
   readonly learning: GatewayLearningConfig;
   readonly updates: GatewayUpdatesConfig;
 }
@@ -142,7 +148,7 @@ export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()):
   const root = object(value, "OmpClaw config");
   rejectUnknown(
     root,
-    ["workspace", "stateDir", "profile", "omp", "transports", "automation", "learning", "updates"],
+    ["workspace", "stateDir", "profile", "omp", "transports", "automation", "quickLane", "learning", "updates"],
     "OmpClaw config",
   );
 
@@ -154,10 +160,11 @@ export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()):
   const omp = parseOmp(root.omp, cwd);
   const transports = parseTransports(root.transports);
   const automation = parseAutomation(root.automation);
+  const quickLane = parseQuickLane(root.quickLane);
   const learning = parseLearning(root.learning);
   const updates = parseUpdates(root.updates, cwd);
 
-  return { workspace, stateDir, profile, omp, transports, automation, learning, updates };
+  return { workspace, stateDir, profile, omp, transports, automation, quickLane, learning, updates };
 }
 
 /** Resolve only the env names carried by config, keeping token values out of it. */
@@ -400,6 +407,13 @@ function parseAutomation(value: unknown): GatewayAutomationConfig {
     retryDelayMs: integer(automation.retryDelayMs, "automation.retryDelayMs", 1_000, 3_600_000, 15_000),
     maxAttempts: integer(automation.maxAttempts, "automation.maxAttempts", 1, 10, 3),
   };
+}
+
+function parseQuickLane(value: unknown): GatewayQuickLaneConfig {
+  if (value === undefined) return { enabled: true };
+  const quickLane = object(value, "quickLane");
+  rejectUnknown(quickLane, ["enabled"], "quickLane");
+  return { enabled: boolean(quickLane.enabled, "quickLane.enabled", true) };
 }
 
 function parseLearning(value: unknown): GatewayLearningConfig {

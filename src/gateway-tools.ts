@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
+import { Cron } from "croner";
 import {
   formatScheduledJob,
   type GatewayAutomationControl,
@@ -149,6 +150,28 @@ const automationHostTools: readonly RpcHostToolDefinition[] = [
     },
   },
   {
+    name: "ompclaw_watch",
+    label: "Watch recurring task",
+    description: "Create a recurring check-and-notify job that runs in this gateway and reports to the active conversation.",
+    loadMode: "essential",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", minLength: 1, maxLength: 120, description: "Short label for what is being watched." },
+        prompt: { type: "string", minLength: 1, maxLength: 16_000, description: "Recurring check instruction and notify criteria." },
+        everyMinutes: { type: "integer", minimum: 1, maximum: 60, description: "Run interval in minutes (1-60)." },
+        cron: { type: "string", minLength: 1, maxLength: 256, description: "Cron expression for a recurring watch schedule." },
+        timezone: { type: "string", minLength: 1, maxLength: 128, description: "IANA timezone for a cron schedule." },
+      },
+      required: ["name", "prompt"],
+      oneOf: [
+        { required: ["everyMinutes"], not: { required: ["cron"] } },
+        { required: ["cron"], not: { required: ["everyMinutes"] } },
+      ],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "ompclaw_update_job",
     label: "Update scheduled job",
     description: "Update a durable job owned by the active principal. Supplying at or cron replaces its schedule.",
@@ -274,6 +297,9 @@ export async function executeGatewayHostTool(
       return executeAsk(call.arguments, context, signal);
     case "ompclaw_schedule_job":
       return executeScheduleJob(call.arguments, context);
+    case "ompclaw_watch":
+    case "watch":
+      return executeWatch(call.arguments, context);
     case "ompclaw_update_job":
       return executeUpdateJob(call.arguments, context);
     case "ompclaw_list_jobs":
@@ -374,6 +400,70 @@ function executeScheduleJob(arguments_: unknown, context: GatewayHostToolContext
     ...(optionalNonEmptyString(argumentsRecord, "timezone") === undefined ? {} : { timezone: optionalNonEmptyString(argumentsRecord, "timezone") }),
   }, scheduledContext(context));
   return { job: formatScheduledJob(job) };
+}
+
+function executeWatch(
+  arguments_: unknown,
+  context: GatewayHostToolContext,
+): { id: string; name: string; job: string } {
+  const automation = requireAutomation(context);
+  const argumentsRecord = parseArguments(arguments_, ["name", "prompt", "everyMinutes", "cron", "timezone"]);
+
+  const rawName = requiredNonEmptyString(argumentsRecord, "name").trim();
+  if (rawName.length === 0) {
+    throw new Error("name must not be empty");
+  }
+  const name = rawName.startsWith("watch: ") ? rawName : `watch: ${rawName}`;
+  if (name.length > 120) {
+    throw new Error("name must be at most 113 characters");
+  }
+
+  const prompt = requiredNonEmptyString(argumentsRecord, "prompt");
+  if (prompt.trim().length === 0) {
+    throw new Error("prompt must not be empty");
+  }
+  if (prompt.length > 16_000) {
+    throw new Error("job prompt must be a non-empty string of at most 16000 characters");
+  }
+
+  const everyMinutes = optionalPositiveInteger(argumentsRecord, "everyMinutes");
+  const cron = optionalNonEmptyString(argumentsRecord, "cron");
+
+  if ((everyMinutes === undefined) === (cron === undefined)) {
+    throw new Error("Specify exactly one of everyMinutes or cron");
+  }
+
+  const timezone = optionalNonEmptyString(argumentsRecord, "timezone");
+  if (timezone !== undefined) {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(new Date(0));
+    } catch {
+      throw new Error(`Invalid IANA timezone ${timezone}`);
+    }
+  }
+
+  const cronExpression = everyMinutes !== undefined ? `*/${everyMinutes} * * * *` : cron!;
+  try {
+    new Cron(cronExpression, { paused: true, ...(timezone === undefined ? {} : { timezone }) });
+  } catch (error) {
+    throw new Error(`Invalid cron schedule: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const job = automation.create(
+    {
+      name,
+      prompt,
+      cron: cronExpression,
+      ...(timezone === undefined ? {} : { timezone }),
+    },
+    scheduledContext(context),
+  );
+
+  return {
+    id: job.id,
+    name: job.name,
+    job: formatScheduledJob(job),
+  };
 }
 
 function executeUpdateJob(arguments_: unknown, context: GatewayHostToolContext): { job: string } {
@@ -533,5 +623,17 @@ function optionalBoolean(argumentsRecord: RpcRecord, key: string): boolean | und
   if (!Object.hasOwn(argumentsRecord, key)) return undefined;
   const value = argumentsRecord[key];
   if (typeof value !== "boolean") throw new Error(`${key} must be a boolean`);
+  return value;
+}
+
+function optionalPositiveInteger(argumentsRecord: RpcRecord, key: string): number | undefined {
+  if (!Object.hasOwn(argumentsRecord, key) || argumentsRecord[key] === undefined) return undefined;
+  const value = argumentsRecord[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${key} must be a positive integer`);
+  }
+  if (value > 60) {
+    throw new Error(`${key} must be between 1 and 60 (use cron for longer schedules)`);
+  }
   return value;
 }

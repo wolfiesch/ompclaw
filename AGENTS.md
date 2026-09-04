@@ -2,7 +2,7 @@
 
 ## Default Context
 
-OmpClaw is a Bun/TypeScript gateway that gives authenticated Telegram and WebSocket clients access to one persistent Oh My Pi session. Unless a task explicitly says otherwise, preserve the one-process, one-session ownership model.
+OmpClaw is a Bun/TypeScript gateway that gives authenticated Telegram and WebSocket clients access to a primary persistent Oh My Pi session plus one isolated quick-answer session. Preserve this one-process, two-OMP-child model: the main session owns interactive work and durable gateway state; the quick lane is explicitly routed, FIFO, and has no durable `GatewayStore` state beyond its own OMP session file.
 
 ## Architecture Boundaries
 
@@ -11,7 +11,8 @@ OmpClaw is a Bun/TypeScript gateway that gives authenticated Telegram and WebSoc
 | `src/gateway-app.ts` | Application lifecycle and dependency wiring |
 | `src/gateway-core.ts` | Authenticated message and delivery boundary |
 | `src/gateway-store.ts` | Durable SQLite state and conversation bindings |
-| `src/rpc-*.ts` | OMP RPC process, protocol, client, and UI translation |
+| `src/rpc-*.ts` | OMP RPC process, protocol, client, prompt, and UI translation |
+| `src/gateway-quicklane.ts` | Explicit quick-lane routing, lazy second child lifecycle, and FIFO queue |
 | `src/transports/telegram/` | Telegram authentication, polling, formatting, and delivery |
 | `src/transports/websocket/` | Local authenticated WebSocket protocol |
 | `src/gateway-scheduler.ts` | Durable scheduled work and retry policy |

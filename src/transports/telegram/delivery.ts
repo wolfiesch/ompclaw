@@ -15,7 +15,50 @@ import { chunkLabeled, renderMarkdownParts, TELEGRAM_MAX_CHARS } from "./formatt
 const DRAFT_MARKER = "draft:";
 const TYPING_MARKER = "typing:";
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-const TELEGRAM_PHOTO_EXTENSIONS = new Set([".avif", ".jpeg", ".jpg", ".png", ".webp"]);
+export type OutboundMediaKind = "photo" | "video" | "audio" | "voice" | "animation" | "document";
+
+export interface OutboundMediaRoute {
+  readonly method: "sendPhoto" | "sendVideo" | "sendAudio" | "sendVoice" | "sendAnimation" | "sendDocument";
+  readonly field: "photo" | "video" | "audio" | "voice" | "animation" | "document";
+}
+
+export const MEDIA_ROUTES: Readonly<Record<OutboundMediaKind, OutboundMediaRoute>> = {
+  photo: { method: "sendPhoto", field: "photo" },
+  video: { method: "sendVideo", field: "video" },
+  audio: { method: "sendAudio", field: "audio" },
+  voice: { method: "sendVoice", field: "voice" },
+  animation: { method: "sendAnimation", field: "animation" },
+  document: { method: "sendDocument", field: "document" },
+};
+
+export const TELEGRAM_PHOTO_EXTENSIONS: Readonly<Record<string, true>> = {
+  ".avif": true,
+  ".heic": true,
+  ".heif": true,
+  ".jpeg": true,
+  ".jpg": true,
+  ".png": true,
+  ".webp": true,
+};
+
+export const TELEGRAM_VIDEO_EXTENSIONS: Readonly<Record<string, true>> = {
+  ".m4v": true,
+  ".mkv": true,
+  ".mov": true,
+  ".mp4": true,
+  ".qt": true,
+  ".webm": true,
+};
+
+export const TELEGRAM_AUDIO_EXTENSIONS: Readonly<Record<string, true>> = {
+  ".aac": true,
+  ".flac": true,
+  ".m4a": true,
+  ".mp3": true,
+  ".wav": true,
+  ".wave": true,
+  ".wma": true,
+};
 const TELEGRAM_CAPTION_MAX_CHARS = 1_024;
 const TELEGRAM_ALBUM_MAX_ITEMS = 10;
 
@@ -177,10 +220,129 @@ function safeUploadName(requested: string | undefined): string | undefined {
   return leaf.length === 0 ? undefined : leaf.slice(0, 255);
 }
 
-function photoAttachment(path: string, mediaType: string | undefined): boolean {
-  if (mediaType !== undefined) return mediaType.toLowerCase().startsWith("image/") && mediaType !== "image/gif";
-  return TELEGRAM_PHOTO_EXTENSIONS.has(extname(path).toLowerCase());
+/**
+ * Checks whether an artifact filename is clearly voice-note shaped.
+ *
+ * Limitation note: Ogg and Opus containers can carry either music or voice speech.
+ * Without inspecting audio codecs or audio content, we strictly require the filename
+ * or path to explicitly match a voice-note pattern (e.g. "voice.ogg", "voice-note.opus").
+ * Any undecidable or ambiguous ogg/opus audio is safely routed to sendAudio so music
+ * is never misrouted as a voice note.
+ */
+export function isVoiceNoteShaped(filename: string | undefined): boolean {
+  if (filename === undefined) return false;
+  const leaf = basename(filename.replaceAll("\\", "/")).toLowerCase();
+  return (
+    /(?:^|[._-])voice(?:[._-]?(?:note|message))?(?:[._-]|$)/i.test(leaf) ||
+    leaf.startsWith("voice")
+  );
 }
+
+/**
+ * Classifies an outbound attachment into a native Telegram media category using
+ * MIME type and file extension tables.
+ *
+ * Dispatch rules:
+ * - audio/mpeg, wav, flac, m4a -> sendAudio
+ * - ogg/opus voice-style audio -> sendVoice ONLY when clearly voice-note shaped; otherwise sendAudio
+ * - video/mp4, video/webm, quicktime -> sendVideo
+ * - short silent loops / gif -> sendAnimation when cheaply detectable (image/gif or .gif); otherwise sendVideo
+ * - images -> sendPhoto (preserving raster photo support; vector SVGs fall back to sendDocument)
+ * - everything else -> sendDocument
+ *
+ * Detection limitations:
+ * 1. Animated short loops: Video-container silent loops (e.g. silent looping MP4s) cannot be cheaply
+ *    distinguished from standard videos without probing container headers or decoding streams.
+ *    Therefore, sendAnimation is reserved for GIFs (image/gif or .gif), and video files safely default to sendVideo.
+ * 2. Voice notes vs audio tracks: Container formats like Ogg/Opus do not distinguish music from spoken
+ *    voice notes in headers alone. We classify as sendVoice only when the filename explicitly matches
+ *    voice note conventions, falling back to sendAudio to protect music.
+ */
+export function classifyOutboundMedia(
+  path: string,
+  filename: string | undefined,
+  mediaType: string | undefined,
+): OutboundMediaKind {
+  const effectiveName = filename ?? basename(path);
+  const ext = (extname(effectiveName) || extname(path)).toLowerCase();
+  const normalizedMime = mediaType?.toLowerCase().trim();
+
+  // 1. MIME-based classification
+  if (normalizedMime !== undefined && normalizedMime !== "application/octet-stream" && normalizedMime.length > 0) {
+    if (normalizedMime === "image/gif") return "animation";
+    if (normalizedMime === "image/svg+xml") return "document";
+    if (normalizedMime.startsWith("image/")) return "photo";
+
+    if (
+      normalizedMime.startsWith("video/") ||
+      normalizedMime === "application/x-quicktimeplayer"
+    ) {
+      return "video";
+    }
+
+    if (
+      normalizedMime === "audio/ogg" ||
+      normalizedMime === "audio/opus" ||
+      normalizedMime === "application/ogg"
+    ) {
+      return isVoiceNoteShaped(effectiveName) ? "voice" : "audio";
+    }
+
+    if (normalizedMime.startsWith("audio/")) {
+      return isVoiceNoteShaped(effectiveName) ? "voice" : "audio";
+    }
+  }
+
+  // 2. Extension-based classification
+  if (ext === ".gif") return "animation";
+  if (ext === ".svg") return "document";
+
+  if (Object.hasOwn(TELEGRAM_PHOTO_EXTENSIONS, ext)) return "photo";
+  if (Object.hasOwn(TELEGRAM_VIDEO_EXTENSIONS, ext)) return "video";
+
+  if (ext === ".ogg" || ext === ".opus" || ext === ".oga") {
+    return isVoiceNoteShaped(effectiveName) ? "voice" : "audio";
+  }
+
+  if (Object.hasOwn(TELEGRAM_AUDIO_EXTENSIONS, ext)) return "audio";
+
+  return "document";
+}
+
+export type MediaGroupItemType = "photo" | "video" | "audio" | "document";
+
+/**
+ * Resolves the native Telegram media group item types for a batch of attachments (2-10 items).
+ *
+ * Telegram grouping rules:
+ * - Photos and videos can be mixed together in the same media group (InputMediaPhoto / InputMediaVideo).
+ * - Audio files can be grouped together in an album, but ONLY with other audio files (InputMediaAudio).
+ * - Documents can be grouped together in an album, but ONLY with other documents (InputMediaDocument).
+ * - Animations and voice notes cannot be sent in a media group natively.
+ * - Any mixed group (e.g. photo + document, video + audio) or group containing types that cannot
+ *   be natively grouped together falls back to a documents group (every item sent as InputMediaDocument).
+ */
+export function resolveMediaGroupTypes(
+  group: readonly { readonly kind: OutboundMediaKind }[],
+): readonly MediaGroupItemType[] {
+  const allVisual = group.every((item) => item.kind === "photo" || item.kind === "video");
+  if (allVisual) {
+    return group.map((item) => (item.kind === "video" ? "video" : "photo"));
+  }
+
+  const allAudio = group.every((item) => item.kind === "audio");
+  if (allAudio) {
+    return group.map(() => "audio");
+  }
+
+  const allDocument = group.every((item) => item.kind === "document");
+  if (allDocument) {
+    return group.map(() => "document");
+  }
+
+  return group.map(() => "document");
+}
+
 
 export class Outbound {
   readonly #account: string;
@@ -606,10 +768,11 @@ export class Outbound {
         if (!details.isFile()) throw new Error(`Telegram attachment is not a regular file: ${path}`);
         if (details.size > MAX_ATTACHMENT_BYTES)
           throw new Error(`Telegram attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes`);
+        const filename = safeUploadName(attachment.name);
         return {
           path,
-          filename: safeUploadName(attachment.name),
-          photo: photoAttachment(path, attachment.mediaType),
+          filename,
+          kind: classifyOutboundMedia(path, filename, attachment.mediaType),
         };
       }),
     );
@@ -618,27 +781,28 @@ export class Outbound {
     let pendingCaption = caption;
     let index = 0;
     while (index < prepared.length) {
-      const current = prepared[index]!;
-      let albumEnd = index;
-      while (albumEnd < prepared.length && albumEnd - index < TELEGRAM_ALBUM_MAX_ITEMS && prepared[albumEnd]!.photo) {
-        albumEnd += 1;
-      }
-      const group = this.#uploadMany === undefined ? [] : prepared.slice(index, albumEnd);
+      const remaining = prepared.length - index;
+      const batchSize = Math.min(remaining, TELEGRAM_ALBUM_MAX_ITEMS);
+      const group = this.#uploadMany === undefined ? [] : prepared.slice(index, index + batchSize);
       if (group.length >= 2) {
+        const groupTypes = resolveMediaGroupTypes(group);
         const media = (plain: boolean): string =>
           JSON.stringify(
-            group.map((_item, groupIndex) => ({
-              type: "photo",
-              media: `attach://photo${groupIndex}`,
-              ...(groupIndex !== 0 || pendingCaption === undefined
-                ? {}
-                : {
-                  caption: plain ? pendingCaption.plainText : pendingCaption.wireText,
-                  ...(plain || pendingCaption.parseMode === undefined
-                    ? {}
-                    : { parse_mode: pendingCaption.parseMode }),
-                }),
-            })),
+            group.map((_item, groupIndex) => {
+              const type = groupTypes[groupIndex]!;
+              return {
+                type,
+                media: `attach://${type}${groupIndex}`,
+                ...(groupIndex !== 0 || pendingCaption === undefined
+                  ? {}
+                  : {
+                    caption: plain ? pendingCaption.plainText : pendingCaption.wireText,
+                    ...(plain || pendingCaption.parseMode === undefined
+                      ? {}
+                      : { parse_mode: pendingCaption.parseMode }),
+                  }),
+              };
+            }),
           );
         const fields: Record<string, string | number | undefined> = {
           chat_id: address.channel,
@@ -653,7 +817,7 @@ export class Outbound {
             "sendMediaGroup",
             fields,
             group.map((item, groupIndex) => ({
-              field: `photo${groupIndex}`,
+              field: `${groupTypes[groupIndex]!}${groupIndex}`,
               path: item.path,
               filename: item.filename,
             })),
@@ -666,7 +830,7 @@ export class Outbound {
             "sendMediaGroup",
             { ...fields, media: media(true) },
             group.map((item, groupIndex) => ({
-              field: `photo${groupIndex}`,
+              field: `${groupTypes[groupIndex]!}${groupIndex}`,
               path: item.path,
               filename: item.filename,
             })),
@@ -681,8 +845,10 @@ export class Outbound {
         continue;
       }
 
-      const method = current.photo ? "sendPhoto" : "sendDocument";
-      const field = current.photo ? "photo" : "document";
+      const current = prepared[index]!;
+      const route = MEDIA_ROUTES[current.kind];
+      const method = route.method;
+      const field = route.field;
       const fields: Record<string, string | number | undefined> = {
         chat_id: address.channel,
         message_thread_id: topicId(address),

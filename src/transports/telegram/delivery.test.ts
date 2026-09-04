@@ -29,7 +29,10 @@ afterEach(async () => {
   await Promise.all(scratch.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-function harness(call?: (method: string, payload: Record<string, unknown>) => Promise<unknown>) {
+function harness(
+  call?: (method: string, payload: Record<string, unknown>) => Promise<unknown>,
+  options: { readonly multiUpload?: boolean } = {},
+) {
   const calls: TelegramInvocation[] = [];
   const uploads: Array<
     TelegramInvocation & {
@@ -55,10 +58,13 @@ function harness(call?: (method: string, payload: Record<string, unknown>) => Pr
       uploads.push({ method, payload: fields, file });
       return { message_id: ++messageId };
     },
-    uploadTelegramMany: async (method, fields, files) => {
-      multiUploads.push({ method, payload: fields, files });
-      return files.map(() => ({ message_id: ++messageId }));
-    },
+    uploadTelegramMany:
+      options.multiUpload === false
+        ? undefined
+        : async (method, fields, files) => {
+          multiUploads.push({ method, payload: fields, files });
+          return files.map(() => ({ message_id: ++messageId }));
+        },
   });
   return { outbound, calls, uploads, multiUploads };
 }
@@ -268,7 +274,7 @@ describe("Telegram outbound delivery", () => {
     const report = join(directory, "report.txt");
     await writeFile(image, "png");
     await writeFile(report, "report");
-    const { outbound, uploads } = harness();
+    const { outbound, uploads } = harness(undefined, { multiUpload: false });
 
     const receipt = await outbound.send(
       address,
@@ -376,5 +382,220 @@ describe("Telegram outbound delivery", () => {
     await expect(outbound.send({ ...address, channel: "99" }, { text: "x" }, context)).rejects.toThrow(
       "not authorized",
     );
+  });
+
+  test("dispatches single attachments by MIME and extension to native Telegram methods", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-media-dispatch-"));
+    scratch.push(directory);
+
+    const cases: Array<{
+      filename: string;
+      mediaType?: string;
+      expectedMethod: string;
+      expectedField: string;
+    }> = [
+      // Audio
+      { filename: "song.mp3", mediaType: "audio/mpeg", expectedMethod: "sendAudio", expectedField: "audio" },
+      { filename: "track.wav", expectedMethod: "sendAudio", expectedField: "audio" },
+      { filename: "music.flac", expectedMethod: "sendAudio", expectedField: "audio" },
+      { filename: "recording.m4a", expectedMethod: "sendAudio", expectedField: "audio" },
+      // Voice vs Audio
+      { filename: "voice.ogg", mediaType: "audio/ogg", expectedMethod: "sendVoice", expectedField: "voice" },
+      { filename: "voice-note.opus", mediaType: "audio/opus", expectedMethod: "sendVoice", expectedField: "voice" },
+      { filename: "my_voice_message.ogg", expectedMethod: "sendVoice", expectedField: "voice" },
+      { filename: "music.ogg", mediaType: "audio/ogg", expectedMethod: "sendAudio", expectedField: "audio" },
+      { filename: "podcast.opus", expectedMethod: "sendAudio", expectedField: "audio" },
+      { filename: "invoice.ogg", expectedMethod: "sendAudio", expectedField: "audio" },
+      // Video
+      { filename: "clip.mp4", mediaType: "video/mp4", expectedMethod: "sendVideo", expectedField: "video" },
+      { filename: "screencast.webm", mediaType: "video/webm", expectedMethod: "sendVideo", expectedField: "video" },
+      { filename: "capture.mov", expectedMethod: "sendVideo", expectedField: "video" },
+      // Animation
+      { filename: "reaction.gif", mediaType: "image/gif", expectedMethod: "sendAnimation", expectedField: "animation" },
+      { filename: "anim.gif", expectedMethod: "sendAnimation", expectedField: "animation" },
+      // Photo
+      { filename: "diagram.png", mediaType: "image/png", expectedMethod: "sendPhoto", expectedField: "photo" },
+      { filename: "photo.jpg", expectedMethod: "sendPhoto", expectedField: "photo" },
+      { filename: "snap.webp", expectedMethod: "sendPhoto", expectedField: "photo" },
+      // Document / fallback
+      { filename: "vector.svg", mediaType: "image/svg+xml", expectedMethod: "sendDocument", expectedField: "document" },
+      { filename: "notes.txt", mediaType: "text/plain", expectedMethod: "sendDocument", expectedField: "document" },
+      { filename: "archive.zip", expectedMethod: "sendDocument", expectedField: "document" },
+    ];
+
+    for (const item of cases) {
+      const filePath = join(directory, item.filename);
+      await writeFile(filePath, "content");
+      const { outbound, uploads } = harness();
+
+      await outbound.send(
+        address,
+        {
+          attachments: [
+            {
+              url: pathToFileURL(filePath).href,
+              name: item.filename,
+              mediaType: item.mediaType,
+            },
+          ],
+        },
+        context,
+      );
+
+      expect(uploads).toHaveLength(1);
+      expect(uploads[0]?.method).toBe(item.expectedMethod);
+      expect(uploads[0]?.file.field).toBe(item.expectedField);
+      expect(uploads[0]?.file.filename).toBe(item.filename);
+    }
+  });
+
+  test("routes photo and video attachments together in a native media group", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-pv-group-"));
+    scratch.push(directory);
+    const photoPath = join(directory, "photo.png");
+    const videoPath = join(directory, "video.mp4");
+    await writeFile(photoPath, "photo-bytes");
+    await writeFile(videoPath, "video-bytes");
+    const { outbound, multiUploads, uploads } = harness();
+
+    await outbound.send(
+      address,
+      {
+        text: "Visual album",
+        attachments: [
+          { url: pathToFileURL(photoPath).href, name: "photo.png", mediaType: "image/png" },
+          { url: pathToFileURL(videoPath).href, name: "video.mp4", mediaType: "video/mp4" },
+        ],
+      },
+      context,
+    );
+
+    expect(uploads).toHaveLength(0);
+    expect(multiUploads).toHaveLength(1);
+    expect(multiUploads[0]?.method).toBe("sendMediaGroup");
+    const media = JSON.parse(String(multiUploads[0]?.payload.media)) as Array<Record<string, unknown>>;
+    expect(media).toHaveLength(2);
+    expect(media[0]?.type).toBe("photo");
+    expect(media[0]?.media).toBe("attach://photo0");
+    expect(media[0]?.caption).toBe("Visual album");
+    expect(media[1]?.type).toBe("video");
+    expect(media[1]?.media).toBe("attach://video1");
+    expect(media[1]?.caption).toBeUndefined();
+    expect(multiUploads[0]?.files.map((f) => f.field)).toEqual(["photo0", "video1"]);
+  });
+
+  test("routes audio attachments together in a native audio media group", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-audio-group-"));
+    scratch.push(directory);
+    const song1 = join(directory, "song1.mp3");
+    const song2 = join(directory, "song2.wav");
+    await writeFile(song1, "audio1");
+    await writeFile(song2, "audio2");
+    const { outbound, multiUploads, uploads } = harness();
+
+    await outbound.send(
+      address,
+      {
+        text: "Audio album",
+        attachments: [
+          { url: pathToFileURL(song1).href, name: "song1.mp3", mediaType: "audio/mpeg" },
+          { url: pathToFileURL(song2).href, name: "song2.wav" },
+        ],
+      },
+      context,
+    );
+
+    expect(uploads).toHaveLength(0);
+    expect(multiUploads).toHaveLength(1);
+    expect(multiUploads[0]?.method).toBe("sendMediaGroup");
+    const media = JSON.parse(String(multiUploads[0]?.payload.media)) as Array<Record<string, unknown>>;
+    expect(media).toHaveLength(2);
+    expect(media[0]?.type).toBe("audio");
+    expect(media[1]?.type).toBe("audio");
+    expect(media[0]?.caption).toBe("Audio album");
+    expect(media[1]?.caption).toBeUndefined();
+    expect(multiUploads[0]?.files.map((f) => f.field)).toEqual(["audio0", "audio1"]);
+  });
+
+  test("falls back mixed attachments (photo + document, video + audio) to a document media group", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-mixed-group-"));
+    scratch.push(directory);
+    const photoPath = join(directory, "photo.png");
+    const docPath = join(directory, "spec.pdf");
+    await writeFile(photoPath, "photo");
+    await writeFile(docPath, "pdf");
+    const { outbound, multiUploads, uploads } = harness();
+
+    await outbound.send(
+      address,
+      {
+        text: "Mixed attachments",
+        attachments: [
+          { url: pathToFileURL(photoPath).href, name: "photo.png", mediaType: "image/png" },
+          { url: pathToFileURL(docPath).href, name: "spec.pdf", mediaType: "application/pdf" },
+        ],
+      },
+      context,
+    );
+
+    expect(uploads).toHaveLength(0);
+    expect(multiUploads).toHaveLength(1);
+    expect(multiUploads[0]?.method).toBe("sendMediaGroup");
+    const media = JSON.parse(String(multiUploads[0]?.payload.media)) as Array<Record<string, unknown>>;
+    expect(media).toHaveLength(2);
+    // Both items must fall back to document group
+    expect(media[0]?.type).toBe("document");
+    expect(media[0]?.media).toBe("attach://document0");
+    expect(media[0]?.caption).toBe("Mixed attachments");
+    expect(media[1]?.type).toBe("document");
+    expect(media[1]?.media).toBe("attach://document1");
+    expect(media[1]?.caption).toBeUndefined();
+    expect(multiUploads[0]?.files.map((f) => f.field)).toEqual(["document0", "document1"]);
+  });
+
+  test("mediaGroup retries with plain text caption on Markdown parse failure", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-mg-parse-"));
+    scratch.push(directory);
+    const p1 = join(directory, "one.png");
+    const p2 = join(directory, "two.png");
+    await writeFile(p1, "p1");
+    await writeFile(p2, "p2");
+
+    let attempts = 0;
+    let secondAttemptMedia: Array<Record<string, unknown>> = [];
+    const outbound = new Outbound({
+      token: "token",
+      account: "primary",
+      authorizeAddress: () => true,
+      nextDraftId: () => 1,
+      callTelegram: async () => ({ message_id: 1 }),
+      uploadTelegram: async () => ({ message_id: 1 }),
+      uploadTelegramMany: async (_method, fields, files) => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new TgError("Bad Request: can't parse entities in caption", 400);
+        }
+        secondAttemptMedia = JSON.parse(String(fields.media)) as Array<Record<string, unknown>>;
+        return files.map((_, i) => ({ message_id: 200 + i }));
+      },
+    });
+
+    const receipts = await outbound.send(
+      address,
+      {
+        text: "**malformed _markdown",
+        format: "markdown",
+        attachments: [
+          { url: pathToFileURL(p1).href, name: "one.png" },
+          { url: pathToFileURL(p2).href, name: "two.png" },
+        ],
+      },
+      context,
+    );
+
+    expect(attempts).toBe(2);
+    expect(receipts.messageId).toBe("200");
+    expect(secondAttemptMedia[0]?.caption).toBe("**malformed _markdown");
+    expect(secondAttemptMedia[0]?.parse_mode).toBeUndefined();
   });
 });

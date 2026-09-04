@@ -6,16 +6,22 @@ import type {
   ConversationAddress,
   InboundMessage,
   OutboundReceipt,
+  Principal,
   TransportIdentity,
 } from "./gateway-types";
 import { executeGatewayHostTool, gatewayHostToolDefinitions, type GatewayDelivery } from "./gateway-tools";
 import { ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
 import type { GatewayUpdateControl } from "./gateway-update";
 import type {
+  GatewayCommandCatalogStore,
+  GatewayPrincipalStore,
   GatewaySemanticViewStore,
   GatewayTurnLifecycleStore,
+  GatewayTurnOutcomeStore,
+  GatewayTurnTimelineStore,
   TurnLifecycle,
   TurnLifecycleState,
+  TurnTimelineEventKind,
 } from "./gateway-store";
 import type { SemanticView } from "./gateway-views";
 import {
@@ -25,11 +31,7 @@ import {
   type RpcClient,
   type RpcCommandInput,
 } from "./rpc-client";
-import {
-  type RpcRuntimeConfig,
-  buildOmpChildEnv,
-  buildOmpRpcArgv,
-} from "./rpc-config";
+import { type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-config";
 import {
   type RpcExtensionUiRequest,
   type RpcHostToolCall,
@@ -47,13 +49,22 @@ import { RpcGatewayUiBroker, type RpcGatewayUiTarget } from "./rpc-ui";
 import {
   homeSemanticView,
   informationSemanticView,
+  modelPageSemanticView,
+  modelProviderSemanticView,
+  moreSemanticView,
+  scheduledJobDeleteConfirmSemanticView,
+  scheduledJobDeleteSettledSemanticView,
+  scheduledJobDetailSemanticView,
   scheduledJobsSemanticView,
   sessionChoiceSemanticView,
+  taskHistorySemanticView,
   taskSemanticView,
   type TaskSemanticActivity,
   type TaskSemanticTodoPhase,
 } from "./rpc-semantic-views";
 import { isRecord } from "./type-guards";
+
+import { CommandCatalog, type OmpAvailableCommand } from "./command-catalog";
 
 import { formatPromptInput, type FormattedPromptInput } from "./rpc-prompt";
 import {
@@ -83,12 +94,20 @@ export interface RpcRuntimeLogger {
   error(message: string): void;
 }
 
-type RpcRuntimeStore = GatewayTurnLifecycleStore & Partial<Pick<GatewaySemanticViewStore, "getSemanticView">>;
+type RpcRuntimeStore = GatewayTurnLifecycleStore &
+  Partial<
+    GatewayPrincipalStore &
+      GatewayTurnOutcomeStore &
+      Pick<GatewayCommandCatalogStore, "replaceOmpAvailableCommands"> &
+      Pick<GatewaySemanticViewStore, "getSemanticView"> &
+      GatewayTurnTimelineStore
+  >;
 
 export interface RpcGatewayRuntimeOptions {
   readonly config: RpcRuntimeConfig;
   readonly delivery: GatewayDelivery;
   readonly sessionFile?: string;
+  readonly isQuickAskArmed?: (address: ConversationAddress) => boolean;
   readonly onSessionState?: (state: RpcSessionState) => void;
   readonly automation?: GatewayAutomationControl;
   readonly turnStore?: RpcRuntimeStore;
@@ -101,7 +120,7 @@ export interface RpcGatewayRuntimeOptions {
 interface RuntimeStatus {
   state?: RpcSessionState;
   currentTool?: string;
-  availableCommands: Array<{ name: string; description?: string; source?: string }>;
+  availableCommands: OmpAvailableCommand[];
   subagents: RpcRecord[];
   lastError?: string;
 }
@@ -141,7 +160,6 @@ interface ActiveTurn extends GatewayTurnTarget {
   };
 }
 
-
 const require = createRequire(import.meta.url);
 const packageVersion = (() => {
   try {
@@ -151,7 +169,6 @@ const packageVersion = (() => {
     return "unknown";
   }
 })();
-
 
 function taskTodoPhases(value: unknown): readonly TaskSemanticTodoPhase[] {
   if (!Array.isArray(value)) return [];
@@ -176,19 +193,6 @@ function taskTodoPhases(value: unknown): readonly TaskSemanticTodoPhase[] {
     return tasks.length === 0 ? [] : [{ name, tasks }];
   });
 }
-
-function lifecycleLabel(state: TurnLifecycleState): string {
-  const labels: Record<TurnLifecycleState, string> = {
-    queued: "Queued",
-    running: "Working",
-    completed: "Done",
-    stopped: "Stopped",
-    failed: "Failed",
-    interrupted: "Interrupted",
-  };
-  return labels[state];
-}
-
 
 /** One persistent OMP RPC session served through authenticated gateway transports. */
 export class RpcGatewayRuntime {
@@ -229,6 +233,7 @@ export class RpcGatewayRuntime {
     this.#options.turnStore?.interruptActiveTurns(this.#now());
     try {
       await this.#startRpc();
+      await this.#recoverPendingTurnOutcomes();
       this.#log.info(`[ompclaw rpc] OMP ${this.#status.state?.sessionId ?? "session"} started`);
     } catch (error) {
       await this.stop();
@@ -361,7 +366,7 @@ export class RpcGatewayRuntime {
       this.#status.lastError = `Queued request failed: ${detail}`;
       await this.#send(
         delivery,
-        "I couldn't start that queued request. Send it again, or use /status for details.",
+        "I couldn't start that queued request. Your original message is still here—send it again when you're ready.",
       ).catch(() => undefined);
     });
     return settled;
@@ -414,14 +419,11 @@ export class RpcGatewayRuntime {
       this.#options.config.autonomyMode = mode;
       await this.#startRpc();
       const approval = ompApprovalModeForAutonomy(mode);
-      this.#log.info(
-        `[ompclaw rpc] Autonomy switched to ${mode}${approval ? ` (--approval-mode ${approval})` : ""}`,
-      );
+      this.#log.info(`[ompclaw rpc] Autonomy switched to ${mode}${approval ? ` (--approval-mode ${approval})` : ""}`);
     } finally {
       this.#recycling = false;
     }
   }
-
 
   /** Queue a scheduler-owned prompt and resolve only after its terminal OMP event. */
   async handleScheduled(message: InboundMessage): Promise<void> {
@@ -521,6 +523,13 @@ export class RpcGatewayRuntime {
     this.#status.state = state;
     this.#persistSession(state);
     this.#restartAttempt = 0;
+    try {
+      await this.#refreshAvailableCommands();
+    } catch (error) {
+      this.#log.warn(
+        `[ompclaw rpc] Unable to refresh available commands: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async #handleRpcExit(error: Error): Promise<void> {
@@ -544,7 +553,10 @@ export class RpcGatewayRuntime {
     if (active) {
       active.scheduledCompletion?.reject(error);
       const outcome = this.#options.config.autoRestart ? "OmpClaw is restarting it." : "OmpClaw will remain offline.";
-      await this.#send(active, `OMP stopped unexpectedly. ${outcome}\n\nUse /status for details.`).catch(() => {});
+      await this.#send(
+        active,
+        `OMP stopped unexpectedly. ${outcome}\n\nThe task card now has recovery controls.`,
+      ).catch(() => {});
     }
     if (!this.#options.config.autoRestart) return;
     const delays = [1_000, 2_000, 5_000, 10_000, 30_000];
@@ -576,18 +588,11 @@ export class RpcGatewayRuntime {
       const detail = frame.error ?? "unknown error";
       this.#status.lastError = `${frame.command}: ${detail}`;
       this.#log.warn(`[ompclaw rpc] ${frame.command} failed: ${detail}`);
-      await this.#sendRuntimeMessage("OMP couldn't complete that operation. Try again, or use /status for details.");
+      await this.#sendRuntimeMessage("OMP couldn't complete that operation. The current task card has recovery controls when an action is available.");
       return;
     }
     if (frame.type === "available_commands_update" && Array.isArray(frame.commands)) {
-      this.#status.availableCommands = frame.commands
-        .filter(isRecord)
-        .map((command) => ({
-          name: typeof command.name === "string" ? command.name : "",
-          description: typeof command.description === "string" ? command.description : undefined,
-          source: typeof command.source === "string" ? command.source : undefined,
-        }))
-        .filter((command) => command.name.length > 0);
+      this.#setAvailableCommands(frame.commands);
       return;
     }
     if (frame.type === "subagent_lifecycle" || frame.type === "subagent_progress") {
@@ -607,6 +612,7 @@ export class RpcGatewayRuntime {
     }
     if (frame.type === "agent_start") {
       await this.#setTurnLifecycle("running");
+      this.#recordTurnTimeline("started", "Agent started");
       if (this.#status.state) this.#status.state.isStreaming = true;
       const active = this.#activeTurn;
       if (active) this.#startTypingHeartbeat(active);
@@ -618,6 +624,7 @@ export class RpcGatewayRuntime {
       this.#status.currentTool = activity;
       const active = this.#activeTurn;
       if (active) active.activities.push({ toolName, text: activity, state: "active" });
+      this.#recordTurnTimeline("tool_started", activity);
       await this.#setTurnLifecycle("running", { currentTool: activity });
       return;
     }
@@ -631,6 +638,7 @@ export class RpcGatewayRuntime {
       if (active && activityIndex !== undefined && activityIndex >= 0) {
         const activity = active.activities[activityIndex]!;
         active.activities[activityIndex] = { ...activity, state: "completed" };
+        this.#recordTurnTimeline("tool_completed", activity.text);
       }
       if (toolName === "todo") {
         try {
@@ -669,12 +677,15 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "agent_end" && frame.isTerminal !== false) {
-      if (this.#status.state) this.#status.state.isStreaming = false;
       const active = this.#activeTurn;
       const terminalState = this.#terminalState(frame.messages);
+      const terminalText = finalAssistantText(frame.messages);
+      const visibleTerminalText =
+        terminalText || active?.previewText || this.#missingTerminalSummaryText(terminalState);
       let finalDelivered = false;
       try {
-        finalDelivered = await this.#finalizeAssistantText(finalAssistantText(frame.messages));
+        await this.#finalizeAssistantText(visibleTerminalText, terminalState);
+        finalDelivered = terminalText.trim().length > 0;
         await this.#setTurnLifecycle(terminalState);
         active?.scheduledCompletion?.resolve();
       } catch (error) {
@@ -742,9 +753,7 @@ export class RpcGatewayRuntime {
       this.#status.lastError = `Prompt failed: ${detail}`;
       await this.#setTurnLifecycle("failed", { error: detail });
       this.#clearActiveDelivery(delivery);
-      await this.#send(delivery, "I couldn't start that request. Try again, or use /status for details.").catch(
-        () => {},
-      );
+      await this.#send(delivery, "That task's recovery card is ready below.").catch(() => {});
       throw error;
     }
   }
@@ -766,7 +775,7 @@ export class RpcGatewayRuntime {
       this.#queueSourceReaction(delivery, "👎");
       await this.#send(
         delivery,
-        `I couldn't queue that ${mode === "followup" ? "follow-up" : "correction"}. Send it again, or use /status for details.`,
+        `I couldn't queue that ${mode === "followup" ? "follow-up" : "correction"}. Your original message is still here—send it again when you're ready.`,
       ).catch(() => {});
       throw error;
     }
@@ -784,18 +793,20 @@ export class RpcGatewayRuntime {
       if (name === "start") await reply(assistantWelcome());
       else if (name === "help") await reply(runtimeHelp(this.#options.config.allowRpcBash));
       else if (name === "home") await this.#homeCommand(delivery);
+      else if (name === "more") await this.#moreCommand(delivery);
       else if (name === "status") {
         const now = this.#now();
         await this.#presentSemanticView(
           delivery,
           informationSemanticView("Session status", await this.statusText(), now, now),
         );
-      } else if (name === "stop") {
+      }
+      else if (name === "stop") {
         await this.#sendRpc({ type: "abort" });
         await reply("Stop requested.");
       } else if (name === "new") {
         const created = await this.newSession();
-        await reply(created ? "Started a new OMP session." : "New session cancelled.");
+        await reply(created ? "Started a new chat." : "New chat cancelled.");
       } else if (name === "steer" || name === "followup") {
         if (!args) await reply(`Usage: /${name} <message>`);
         else {
@@ -807,7 +818,7 @@ export class RpcGatewayRuntime {
         await this.#refreshState();
         await reply("Compaction complete.");
       } else if (name === "model") await this.#modelCommand(delivery, args, reply);
-      else if (name === "autonomy") await this.#autonomyCommand(delivery, args, reply);
+      else if (name === "autonomy" || name === "permissions") await this.#autonomyCommand(delivery, args, reply, name);
       else if (name === "thinking") await this.#thinkingCommand(delivery, args, reply);
       else if (name === "fast")
         await this.#booleanCommand(delivery, "set_fast_mode", args, this.#status.state?.fastModeEnabled, reply);
@@ -821,26 +832,71 @@ export class RpcGatewayRuntime {
         );
       else if (name === "retry") await this.#retryCommand(args, reply);
       else if (name === "queue") await this.#queueCommand(args, reply);
-      else if (name === "tasks") await reply(this.#tasksText(delivery.address));
+      else if (name === "tasks") await this.#tasksCommand(delivery);
+      else if (name === "task_retry") await this.#taskRetryCommand(delivery, args, reply);
+      else if (name === "task_continue" || name === "task_revise")
+        await this.#taskContinuationCommand(delivery, args, name === "task_revise" ? "revise" : "continue", reply);
+      else if (name === "result") await this.#resultCommand(delivery, args, reply);
+      else if (name === "task_details") await this.#taskDetailsCommand(delivery, args, reply);
       else if (name === "stats") await reply(valueText(await this.#requestData({ type: "get_session_stats" })));
       else if (name === "todos") await reply(this.#todosText());
       else if (name === "subagents") await this.#subagentsCommand(reply);
       else if (name === "commands") await this.#commandsCommand(reply);
-      else if (name === "jobs") await this.#jobsCommand(delivery, reply);
-      else if (name === "job_pause" || name === "job_resume" || name === "job_run" || name === "job_delete") {
+      else if (name === "jobs" || name === "schedules") await this.#jobsCommand(delivery, reply);
+      else if (name === "job" || name === "schedule") await this.#jobDetailCommand(delivery, args.trim(), reply);
+      else if (name === "job_delete_confirm") await this.#jobDeleteConfirmCommand(delivery, args.trim(), reply);
+      else if (name === "schedule_create") {
+        if (args.trim()) {
+          await this.handleInbound({
+            id: `cmd-${this.#now()}`,
+            sentAt: this.#now(),
+            identity: delivery.identity,
+            principal: delivery.deliveryContext.principal,
+            address: delivery.address,
+            content: { text: args.trim() },
+          });
+        } else {
+          await reply("Usage: /schedule_create <instructions>");
+        }
+      } else if (name === "job_edit") {
+        const parts = args.trim().split(/\s+/);
+        const id = parts[0];
+        const instruction = parts.slice(1).join(" ");
+        if (id && instruction) {
+          await this.handleInbound({
+            id: `cmd-${this.#now()}`,
+            sentAt: this.#now(),
+            identity: delivery.identity,
+            principal: delivery.deliveryContext.principal,
+            address: delivery.address,
+            content: { text: `Update scheduled job ${id}: ${instruction}` },
+          });
+        } else {
+          await reply("Usage: /job_edit <job id> <instructions>");
+        }
+      } else if (name === "job_pause" || name === "job_resume" || name === "job_run" || name === "job_delete") {
         const automation = this.#options.automation;
         if (automation === undefined) await reply("OmpClaw automation is disabled.");
         else if (!args) await reply(`Usage: /${name} <job id>`);
         else {
           const principalId = delivery.deliveryContext.principal.id;
+          const jobId = args.trim();
           if (name === "job_delete") {
-            if (!automation.remove(args, principalId)) {
-              await reply(`Scheduled job ${args} was not found.`);
+            const job = automation.list(principalId).find((j) => j.id === jobId);
+            const jobName = job?.name ?? jobId;
+            if (!automation.remove(jobId, principalId)) {
+              await reply(`Scheduled job ${jobId} was not found.`);
               return true;
             }
-          } else if (name === "job_run") automation.runNow(args, principalId);
-          else automation.setEnabled(args, principalId, name === "job_resume");
-          await this.#jobsCommand(delivery, reply);
+            const now = this.#now();
+            await this.#presentSemanticView(delivery, scheduledJobDeleteSettledSemanticView(jobName, now, now));
+          } else if (name === "job_run") {
+            automation.runNow(jobId, principalId);
+            await this.#jobDetailCommand(delivery, jobId, reply);
+          } else {
+            automation.setEnabled(jobId, principalId, name === "job_resume");
+            await this.#jobDetailCommand(delivery, jobId, reply);
+          }
         }
       } else if (name === "history") await this.#historyCommand(args, reply);
       else if (name === "branch") await this.#branchCommand(args, reply);
@@ -887,7 +943,7 @@ export class RpcGatewayRuntime {
         error instanceof RpcCommandError ? error.message : error instanceof Error ? error.message : String(error);
       this.#status.lastError = `${name}: ${message}`;
       this.#log.warn(`[ompclaw rpc] ${name} command failed: ${message}`);
-      await reply("That command failed. Try again, or use /status for details.");
+      await reply("That command failed. It was not applied, so you can try it again.");
     }
     return true;
   }
@@ -895,9 +951,41 @@ export class RpcGatewayRuntime {
   async #homeCommand(delivery: GatewayTurnTarget): Promise<void> {
     await this.#refreshState();
     const now = this.#now();
+    const active = this.#activeTurn;
+    const isStreaming = this.#status.state?.isStreaming === true;
+    const isBusy = active !== undefined || isStreaming;
+    const activeTask = isBusy
+      ? {
+          title: active?.lifecycle?.prompt ?? this.#status.state?.sessionName?.trim() ?? "Active task",
+          startedAt: active?.lifecycle?.createdAt ?? now,
+          currentStep: active?.activities?.findLast?.((a) => a.state === "active")?.text ?? this.#status.currentTool,
+        }
+      : undefined;
+
     await this.#presentSemanticView(
       delivery,
       homeSemanticView({
+        state: this.#status.state,
+        autonomyMode: this.#options.config.autonomyMode,
+        autonomyLabel: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode],
+        activeTask,
+        quickAskArmed: isBusy && this.#options.isQuickAskArmed?.(delivery.address) === true,
+        version: now,
+        updatedAt: now,
+      }),
+    );
+  }
+
+  async showHome(message: InboundMessage): Promise<void> {
+    await this.#homeCommand(this.#deliveryFor(message));
+  }
+
+  async #moreCommand(delivery: GatewayTurnTarget): Promise<void> {
+    await this.#refreshState();
+    const now = this.#now();
+    await this.#presentSemanticView(
+      delivery,
+      moreSemanticView({
         state: this.#status.state,
         autonomyMode: this.#options.config.autonomyMode,
         autonomyLabel: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode],
@@ -920,53 +1008,141 @@ export class RpcGatewayRuntime {
     );
   }
 
+  async #jobDetailCommand(
+    delivery: GatewayTurnTarget,
+    id: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const automation = this.#options.automation;
+    if (automation === undefined) {
+      await reply("OmpClaw automation is disabled.");
+      return;
+    }
+    const principalId = delivery.deliveryContext.principal.id;
+    const job = automation.list(principalId).find((j) => j.id === id);
+    if (!job) {
+      await reply(`Scheduled job ${id} was not found.`);
+      return;
+    }
+    const now = this.#now();
+    await this.#presentSemanticView(delivery, scheduledJobDetailSemanticView(job, now, now));
+  }
+
+  async #jobDeleteConfirmCommand(
+    delivery: GatewayTurnTarget,
+    id: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const automation = this.#options.automation;
+    if (automation === undefined) {
+      await reply("OmpClaw automation is disabled.");
+      return;
+    }
+    const principalId = delivery.deliveryContext.principal.id;
+    const job = automation.list(principalId).find((j) => j.id === id);
+    if (!job) {
+      await reply(`Scheduled job ${id} was not found.`);
+      return;
+    }
+    const now = this.#now();
+    await this.#presentSemanticView(delivery, scheduledJobDeleteConfirmSemanticView(job, now, now));
+  }
+
   async #modelCommand(
     delivery: GatewayTurnTarget,
     args: string,
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
-    const selection = args;
-    if (!selection) {
+    const selection = args.trim();
+    const command = selection.split(/\s+/);
+    const current =
+      this.#status.state?.model?.provider !== undefined && this.#status.state.model.id !== undefined
+        ? { provider: this.#status.state.model.provider, id: this.#status.state.model.id }
+        : undefined;
+    if (selection.length === 0 || command[0] === "provider" || command[0] === "page") {
       const data = await this.#requestData<{ models: Array<{ provider?: string; id?: string }> }>({
         type: "get_available_models",
       });
       const models = data.models.filter(
         (model): model is { provider: string; id: string } =>
-          typeof model.provider === "string" && typeof model.id === "string",
+          typeof model.provider === "string" &&
+          model.provider.length > 0 &&
+          typeof model.id === "string" &&
+          model.id.length > 0,
       );
-      const current = `${this.#status.state?.model?.provider ?? "?"}/${this.#status.state?.model?.id ?? "?"}`;
       const now = this.#now();
+      if (selection.length === 0) {
+        await this.#presentSemanticView(
+          delivery,
+          modelProviderSemanticView({
+            models,
+            ...(current === undefined ? {} : { current }),
+            version: now,
+            updatedAt: now,
+          }),
+        );
+        return;
+      }
+      const encodedProvider = command[1];
+      if (encodedProvider === undefined || command.length !== (command[0] === "page" ? 3 : 2)) {
+        await reply("Usage: /model <provider>/<model-id>");
+        return;
+      }
+      let provider: string;
+      try {
+        provider = decodeURIComponent(encodedProvider);
+      } catch {
+        await reply("That model provider is not available.");
+        return;
+      }
+      const page = command[0] === "page" ? Number(command[2]) : 0;
+      if (!Number.isSafeInteger(page) || page < 0 || !models.some((model) => model.provider === provider)) {
+        await reply("That model provider is not available.");
+        return;
+      }
       await this.#presentSemanticView(
         delivery,
-        sessionChoiceSemanticView({
-          title: "Choose a model",
-          summary: "The selection applies to this OMP session.",
-          choices: models.map((model, index) => {
-            const value = `${model.provider}/${model.id}`;
-            return {
-              id: `model${index}`,
-              label: model.id,
-              description: model.provider,
-              command: `/model ${value}`,
-              selected: value === current,
-            };
-          }),
+        modelPageSemanticView({
+          models,
+          ...(current === undefined ? {} : { current }),
+          provider,
+          page,
+          pageSize: 8,
           version: now,
           updatedAt: now,
         }),
       );
       return;
     }
-    const split = selection.indexOf("/");
-    if (split <= 0 || split === selection.length - 1) {
-      await reply("Usage: /model <provider>/<model-id>");
-      return;
+    if (command[0] === "select") {
+      const encodedProvider = command[1];
+      const encodedModel = command[2];
+      if (encodedProvider === undefined || encodedModel === undefined || command.length !== 3) {
+        await reply("Usage: /model <provider>/<model-id>");
+        return;
+      }
+      try {
+        await this.#sendRpc({
+          type: "set_model",
+          provider: decodeURIComponent(encodedProvider),
+          modelId: decodeURIComponent(encodedModel),
+        });
+      } catch {
+        await reply("That model is not available.");
+        return;
+      }
+    } else {
+      const split = selection.indexOf("/");
+      if (split <= 0 || split === selection.length - 1) {
+        await reply("Usage: /model <provider>/<model-id>");
+        return;
+      }
+      await this.#sendRpc({
+        type: "set_model",
+        provider: selection.slice(0, split),
+        modelId: selection.slice(split + 1),
+      });
     }
-    await this.#sendRpc({
-      type: "set_model",
-      provider: selection.slice(0, split),
-      modelId: selection.slice(split + 1),
-    });
     await this.#refreshState();
     await this.#homeCommand(delivery);
   }
@@ -975,21 +1151,25 @@ export class RpcGatewayRuntime {
     delivery: GatewayTurnTarget,
     args: string,
     reply: (text: string) => Promise<void>,
+    commandName = "permissions",
   ): Promise<void> {
     const selection = args.trim();
+    const isPermissions = commandName === "permissions";
+    const commandPrefix = isPermissions ? "/permissions" : "/autonomy";
+    const label = isPermissions ? "Permissions" : "Autonomy";
     if (!selection) {
       const current = this.#options.config.autonomyMode;
       const now = this.#now();
       await this.#presentSemanticView(
         delivery,
         sessionChoiceSemanticView({
-          title: "Choose autonomy mode",
+          title: isPermissions ? "Choose permissions mode" : "Choose autonomy mode",
           summary: "Governs whether OMP requests tool approval or runs autonomously.",
           choices: AUTONOMY_MODES.map((mode) => ({
             id: mode,
             label: AUTONOMY_MODE_LABELS[mode],
             description: AUTONOMY_MODE_DESCRIPTIONS[mode],
-            command: `/autonomy ${mode}`,
+            command: `${commandPrefix} ${mode}`,
             selected: mode === current,
           })),
           version: now,
@@ -1002,7 +1182,7 @@ export class RpcGatewayRuntime {
       const now = this.#now();
       await this.#presentSemanticView(
         delivery,
-        informationSemanticView("Autonomy", autonomyText(this.#options.config.autonomyMode), now, now),
+        informationSemanticView(label, autonomyText(this.#options.config.autonomyMode, label), now, now),
       );
       return;
     }
@@ -1016,11 +1196,11 @@ export class RpcGatewayRuntime {
       return;
     }
     if (mode === this.#options.config.autonomyMode) {
-      await reply(`Autonomy is already set to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
+      await reply(`${label} is already set to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
       return;
     }
     await this.setAutonomyMode(mode);
-    await reply(`Autonomy switched to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
+    await reply(`${label} switched to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
     await this.#homeCommand(delivery);
   }
 
@@ -1067,26 +1247,15 @@ export class RpcGatewayRuntime {
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
     const selection = args;
-    const label = command === "set_fast_mode" ? "Fast mode" : "Auto-compaction";
-    if (!selection) {
-      const commandName = command === "set_fast_mode" ? "fast" : "autocompact";
-      const now = this.#now();
-      await this.#presentSemanticView(
-        delivery,
-        sessionChoiceSemanticView({
-          title: label,
-          summary:
-            command === "set_fast_mode"
-              ? "Fast mode favors lower-latency responses."
-              : "Auto-compaction keeps long sessions within their context window.",
-          choices: [
-            { id: "on", label: "On", command: `/${commandName} on`, selected: current === true },
-            { id: "off", label: "Off", command: `/${commandName} off`, selected: current !== true },
-          ],
-          version: now,
-          updatedAt: now,
-        }),
-      );
+    if (!selection || selection === "toggle") {
+      const next = !current;
+      await this.#sendRpc({ type: command, enabled: next });
+      await this.#refreshState();
+      if (command === "set_auto_compaction") {
+        await this.#moreCommand(delivery);
+      } else {
+        await this.#homeCommand(delivery);
+      }
       return;
     }
     if (selection !== "on" && selection !== "off") {
@@ -1095,7 +1264,11 @@ export class RpcGatewayRuntime {
     }
     await this.#sendRpc({ type: command, enabled: selection === "on" });
     await this.#refreshState();
-    await this.#homeCommand(delivery);
+    if (command === "set_auto_compaction") {
+      await this.#moreCommand(delivery);
+    } else {
+      await this.#homeCommand(delivery);
+    }
   }
 
   async #retryCommand(args: string, reply: (text: string) => Promise<void>): Promise<void> {
@@ -1147,15 +1320,17 @@ export class RpcGatewayRuntime {
   }
 
   async #commandsCommand(reply: (text: string) => Promise<void>): Promise<void> {
-    const data = await this.#requestData<{ commands: Array<{ name: string; description?: string; source?: string }> }>({
-      type: "get_available_commands",
+    await this.#refreshAvailableCommands();
+    const catalog = new CommandCatalog({
+      ompCommands: this.#status.availableCommands,
+      allowRpcBash: this.#options.config.allowRpcBash,
     });
-    this.#status.availableCommands = data.commands;
-    await reply(
-      data.commands
-        .map((command) => `/${command.name}${command.description ? ` — ${command.description}` : ""}`)
-        .join("\n"),
-    );
+    const lines = catalog.groups().flatMap((group) => [
+      group.name,
+      ...group.entries.map((command) => `/${command.name}${command.description ? ` — ${command.description}` : ""}`),
+      "",
+    ]);
+    await reply(lines.join("\n").trimEnd());
   }
 
   async #historyCommand(args: string, reply: (text: string) => Promise<void>): Promise<void> {
@@ -1234,6 +1409,26 @@ export class RpcGatewayRuntime {
     const phases = this.#status.state?.todoPhases;
     if (!Array.isArray(phases) || phases.length === 0) return "No active todos.";
     return phases.map(valueText).join("\n\n");
+  }
+
+  async #refreshAvailableCommands(): Promise<void> {
+    const data = await this.#requestData<{ commands?: unknown }>({ type: "get_available_commands" });
+    if (!Array.isArray(data.commands)) throw new Error("OMP returned an invalid command catalog");
+    this.#setAvailableCommands(data.commands);
+  }
+
+  #setAvailableCommands(commands: readonly unknown[]): void {
+    const available: OmpAvailableCommand[] = [];
+    for (const candidate of commands) {
+      if (!isRecord(candidate) || typeof candidate.name !== "string") continue;
+      available.push({
+        name: candidate.name,
+        ...(typeof candidate.description === "string" ? { description: candidate.description } : {}),
+        ...(typeof candidate.source === "string" ? { source: candidate.source } : {}),
+      });
+    }
+    this.#status.availableCommands = available;
+    this.#options.turnStore?.replaceOmpAvailableCommands?.(available);
   }
 
   async #refreshStateRequired(): Promise<RpcSessionState> {
@@ -1332,6 +1527,23 @@ export class RpcGatewayRuntime {
     return this.#options.now?.() ?? Date.now();
   }
 
+  #recordTurnTimeline(kind: TurnTimelineEventKind, text: string): void {
+    const turn = this.#activeTurn?.lifecycle;
+    if (!turn) return;
+    try {
+      this.#options.turnStore?.appendTurnTimelineEvent?.({
+        turnId: turn.id,
+        at: this.#now(),
+        kind,
+        text: text.slice(0, 1_000),
+      });
+    } catch (error) {
+      this.#log.warn(
+        `[ompclaw rpc] Unable to persist task timeline: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   async #startTurn(
     delivery: GatewayTurnTarget,
     message: InboundMessage,
@@ -1360,6 +1572,7 @@ export class RpcGatewayRuntime {
       activities: [],
       ...(scheduledCompletion === undefined ? {} : { scheduledCompletion }),
     };
+    this.#recordTurnTimeline("queued", "Task received");
     this.#queueSourceReaction(this.#activeTurn, "👀");
     this.#startTypingHeartbeat(this.#activeTurn);
     this.#startTaskHeartbeat(this.#activeTurn);
@@ -1389,8 +1602,19 @@ export class RpcGatewayRuntime {
     };
     active.lifecycle = updated;
     this.#options.turnStore?.putTurnLifecycle(updated);
+    if (terminal) {
+      const text =
+        state === "failed"
+          ? `Task failed${change.error ? `: ${change.error.slice(0, 240)}` : ""}`
+          : state === "interrupted"
+            ? `Task interrupted${change.error ? `: ${change.error.slice(0, 240)}` : ""}`
+            : state === "stopped"
+              ? "Task stopped"
+              : "Task completed";
+      this.#recordTurnTimeline(state, text);
+    }
     if (state === "queued") return;
-    if (terminal && !active.statusVisible) {
+    if (terminal && !active.statusVisible && state !== "failed" && state !== "interrupted") {
       clearTimeout(active.statusTimer);
       active.statusTimer = undefined;
       active.statusPending = undefined;
@@ -1438,7 +1662,12 @@ export class RpcGatewayRuntime {
       active.statusHeartbeat = false;
       if (lifecycle !== undefined) await this.#renderTurnCard(active, lifecycle, heartbeat);
       if (active.statusPending !== undefined) {
-        this.#queueTurnCard(active, active.statusPending, Boolean(active.statusUrgent), Boolean(active.statusHeartbeat));
+        this.#queueTurnCard(
+          active,
+          active.statusPending,
+          Boolean(active.statusUrgent),
+          Boolean(active.statusHeartbeat),
+        );
       }
     });
   }
@@ -1483,16 +1712,150 @@ export class RpcGatewayRuntime {
     );
   }
 
-  #tasksText(address: ConversationAddress): string {
-    const turns = this.#options.turnStore?.listTurnLifecycles(address, 10) ?? [];
-    if (turns.length === 0) return "No persisted tasks for this conversation.";
-    return turns
-      .map((turn) => {
-        const activity = turn.currentTool ? ` | ${turn.currentTool} ` : "";
-        const error = turn.error ? " | Use /status for details." : "";
-        return `${lifecycleLabel(turn.state)} | ${turn.prompt}${activity}${error} `;
-      })
-      .join("\n");
+  async #tasksCommand(delivery: GatewayTurnTarget): Promise<void> {
+    const turns = this.#options.turnStore?.listTurnLifecycles(delivery.address, 20) ?? [];
+    const now = this.#now();
+    await this.#presentSemanticView(
+      delivery,
+      taskHistorySemanticView(
+        turns.map((lifecycle) => ({
+          lifecycle,
+          events: this.#options.turnStore?.listTurnTimelineEvents?.(lifecycle.id, 6) ?? [],
+        })),
+        now,
+        now,
+      ),
+    );
+  }
+
+  #ownedTask(delivery: GatewayTurnTarget, id: string): TurnLifecycle | undefined {
+    return this.#options.turnStore
+      ?.listTurnLifecycles(delivery.address, 100)
+      .find((candidate) => candidate.id === id && candidate.principalId === delivery.deliveryContext.principal.id);
+  }
+
+  async #resultCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const id = args.trim();
+    if (!id) {
+      await reply("Usage: /result <task-id>");
+      return;
+    }
+    const task = this.#ownedTask(delivery, id);
+    const outcome = this.#options.turnStore?.getTurnOutcome?.(id);
+    if (task === undefined || outcome === undefined || outcome.principalId !== delivery.deliveryContext.principal.id) {
+      await reply("That task result is no longer available.");
+      return;
+    }
+    await this.#options.delivery.send(
+      delivery.address,
+      {
+        text: outcome.text,
+        format: "markdown",
+        ...(outcome.replyTo === undefined ? {} : { replyTo: outcome.replyTo }),
+      },
+      delivery.deliveryContext,
+    );
+  }
+
+  async #taskDetailsCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const [id, mode, ...extra] = args.trim().split(/\s+/);
+    if (id === undefined || (mode !== undefined && mode !== "hide") || extra.length > 0) {
+      await reply("That task is no longer available.");
+      return;
+    }
+    const task = this.#ownedTask(delivery, id);
+    if (task === undefined) {
+      await reply("That task is no longer available.");
+      return;
+    }
+    if (task.error === undefined) {
+      await reply("No additional error details are available for this task.");
+      return;
+    }
+    const now = this.#now();
+    await this.#presentSemanticView(delivery, taskSemanticView(task, [], now, [], false, mode !== "hide"));
+  }
+
+  async #taskRetryCommand(
+    delivery: GatewayTurnTarget,
+    id: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const previous = this.#ownedTask(delivery, id);
+    if (previous === undefined) {
+      await reply("That task is no longer available in this conversation.");
+      return;
+    }
+    if (previous.state !== "failed" && previous.state !== "interrupted" && previous.state !== "stopped") {
+      await reply("Only stopped, failed, or interrupted tasks can be retried.");
+      return;
+    }
+    if (this.#currentTurnBusy()) {
+      await reply("Wait for the current task to finish before retrying another task.");
+      return;
+    }
+    await this.handleInbound({
+      id: `task-retry:${previous.id}:${this.#now()}`,
+      sentAt: this.#now(),
+      identity: delivery.identity,
+      address: delivery.address,
+      principal: delivery.deliveryContext.principal,
+      content: { text: `Resume this unfinished task. Original request:\n${previous.prompt}` },
+      edited: false,
+    });
+  }
+
+  async #taskContinuationCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    mode: "continue" | "revise",
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const [id, ...instructionParts] = args.trim().split(/\s+/);
+    const instruction = instructionParts.join(" ").trim();
+    if (id === undefined || instruction.length === 0) {
+      await reply(`Usage: /task_${mode} <task-id> <message>`);
+      return;
+    }
+    const previous = this.#ownedTask(delivery, id);
+    if (previous === undefined) {
+      await reply("That task is no longer available in this conversation.");
+      return;
+    }
+    if (this.#currentTurnBusy()) {
+      await reply("Wait for the current task to finish before continuing another task.");
+      return;
+    }
+    const outcome = this.#options.turnStore?.getTurnOutcome?.(previous.id);
+    const priorResult =
+      mode === "revise"
+        ? `\n\nPrevious result:\n${outcome?.text ?? "No final result was recorded."}`
+        : "";
+    await this.handleInbound({
+      id: `task-${mode}:${previous.id}:${this.#now()}`,
+      sentAt: this.#now(),
+      identity: delivery.identity,
+      address: delivery.address,
+      principal: delivery.deliveryContext.principal,
+      content: {
+        text: `${mode === "continue" ? "Continue" : "Revise"} this prior task. Original request:\n${previous.prompt}${priorResult}\n\nNew instruction:\n${instruction}`,
+      },
+      edited: false,
+    });
+  }
+
+  #missingTerminalSummaryText(state: "completed" | "stopped" | "failed"): string {
+    if (state === "stopped") return "The task stopped before OMP produced a final summary. Use /tasks to resume it.";
+    if (state === "failed") return "The task failed before OMP produced a final summary. Its task card has recovery controls.";
+    return "The task completed, but OMP produced no final summary. Ask for a summary of the completed work.";
   }
 
   #terminalState(messages: unknown): "completed" | "stopped" | "failed" {
@@ -1523,8 +1886,46 @@ export class RpcGatewayRuntime {
         : previous.then(() => this.#reactToSource(delivery, emoji));
     this.#reactionQueues.set(key, queued);
     void queued.finally(() => {
+
       if (this.#reactionQueues.get(key) === queued) this.#reactionQueues.delete(key);
     });
+  }
+
+  async #recoverPendingTurnOutcomes(): Promise<void> {
+    const store = this.#options.turnStore;
+    if (
+      store === undefined ||
+      typeof store.listPendingTurnOutcomes !== "function" ||
+      typeof store.getPrincipal !== "function" ||
+      typeof store.recordTurnOutcomeAttempt !== "function" ||
+      typeof store.markTurnOutcomeDelivered !== "function"
+    ) {
+      return;
+    }
+    for (const outcome of store.listPendingTurnOutcomes()) {
+      const principal: Principal | undefined = store.getPrincipal(outcome.principalId);
+      if (principal === undefined) {
+        this.#log.warn(`[ompclaw rpc] Unable to recover outcome ${outcome.turnId}: principal no longer exists`);
+        continue;
+      }
+      try {
+        store.recordTurnOutcomeAttempt(outcome.turnId, this.#now());
+        await this.#options.delivery.send(
+          outcome.address,
+          {
+            text: outcome.text,
+            format: "markdown",
+            ...(outcome.replyTo === undefined ? {} : { replyTo: outcome.replyTo }),
+          },
+          { principal, origin: outcome.address },
+        );
+        store.markTurnOutcomeDelivered(outcome.turnId, this.#now());
+      } catch (error) {
+        this.#log.warn(
+          `[ompclaw rpc] Unable to recover outcome ${outcome.turnId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
   }
 
   async #reactToSource(delivery: GatewayTurnTarget | undefined, emoji: string): Promise<void> {
@@ -1563,9 +1964,25 @@ export class RpcGatewayRuntime {
     active.previewText = text;
   }
 
-  async #finalizeAssistantText(text: string): Promise<boolean> {
+  async #finalizeAssistantText(
+    text: string,
+    state: Extract<TurnLifecycleState, "completed" | "stopped" | "failed">,
+  ): Promise<boolean> {
     const active = this.#activeTurn;
-    if (!active || text.trim().length === 0 || active.finalText === text) return false;
+    const lifecycle = active?.lifecycle;
+    if (!active || !lifecycle || text.trim().length === 0 || active.finalText === text) return false;
+    const now = this.#now();
+    this.#options.turnStore?.putTurnOutcome?.({
+      turnId: lifecycle.id,
+      principalId: lifecycle.principalId,
+      address: lifecycle.address,
+      state,
+      text,
+      createdAt: now,
+      attemptCount: 0,
+      ...(active.sourceReceipt === undefined ? {} : { replyTo: active.sourceReceipt }),
+    });
+    this.#options.turnStore?.recordTurnOutcomeAttempt?.(lifecycle.id, now);
     const receipts = await this.#options.delivery.finalize(
       active.address,
       active.receipt,
@@ -1573,6 +1990,7 @@ export class RpcGatewayRuntime {
       active.deliveryContext,
     );
     active.receipt = receipts[0] ?? active.receipt;
+    this.#options.turnStore?.markTurnOutcomeDelivered?.(lifecycle.id, this.#now());
     active.previewText = text;
     active.finalText = text;
     return true;
@@ -1597,12 +2015,7 @@ export class RpcGatewayRuntime {
     const pulse = (): void => {
       if (this.#activeTurn !== active || active.lifecycle === undefined) return;
       if (active.lifecycle.state === "queued" || active.lifecycle.state === "running") {
-        this.#queueTurnCard(
-          active,
-          { ...active.lifecycle, updatedAt: this.#now() },
-          false,
-          true,
-        );
+        this.#queueTurnCard(active, { ...active.lifecycle, updatedAt: this.#now() }, false, true);
       }
       active.heartbeatTimer = setTimeout(pulse, RpcGatewayRuntime.#TURN_CARD_HEARTBEAT_MS);
       active.heartbeatTimer.unref?.();

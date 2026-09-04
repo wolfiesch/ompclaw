@@ -2,7 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## 0.12.0 (2026-09-04)
+
+### Added
+
+- Add agent-authored `ompclaw_watch` host tool to create recurring check-and-notify jobs directly from conversation context with `everyMinutes` or `cron` schedule, delivering turn results back to the requesting chat.
+- Replace Telegram approval prompts with in-message decision cards that visibly settle approved, denied, or expired requests; long OMP clarifications use numbered choices and a correlated typed “Other answer”.
+- Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
+- Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
+- Persist terminal task outcomes before transport delivery, replay undelivered outcomes after restart, and expose them through `/result <task-id>` and terminal task cards.
+- Add paginated Telegram model cards that choose a provider before its models, retain the current selection, and return to the same message on navigation.
+- Add an authorized searchable Telegram command and skill catalog through `/commands` and inline mode, with ranked results, durable per-principal recency, paginated picker cards, and private/group-scoped native menus.
+- Redesign Telegram Home control surface with distinct Idle ("🟢 Ready", hero session title, combined model and reasoning settings, and direct state-exposing Fast toggle) and Busy ("🟡 Working · <elapsed>", active task title, current step, Open task, and single-tap Stop) states, moving context details, auto-compaction, queue size, and session identifiers under a More sub-surface.
+- Humanize scheduled job rules and next runs with local natural-language cron formatting ("Every day at 9:00 AM", "Every weekday at 9:00 AM", "Every 30 minutes") with exotic-expression fallback, and relative run times with friendly timezone names ("in 45 min", "Today at 9:00 AM Pacific", "Tomorrow at 9:00 AM Pacific").
+- Add Schedule Detail surface with state-exposing Pause/Resume, Run now, Edit, and a dedicated confirmation card for Schedule Delete that settles in-message.
+- Add a single durable Telegram pairing journey card that updates in place for approval, rejection, expiry, retry, connected Home access, and dismissible command examples.
+- Print the bot's `https://t.me/<botusername>` deep link during successful interactive setup.
+- Refresh the Telegram Bot API description and short description at setup and gateway startup, plus a derivable friendly name without making profile API failures fatal.
+- Add table-driven native Telegram media dispatch for outbound attachments, sending audio (`sendAudio`), voice notes (`sendVoice`), video (`sendVideo`), animations (`sendAnimation`), photos (`sendPhoto`), and documents (`sendDocument`) by MIME type and file extension, with native `sendMediaGroup` grouping for visual and audio sets and automatic fallback to documents for mixed media batches.
+- Add actionable Telegram failure cards with a plain-language cause, one-tap retry, expandable bounded details, task history, and fresh-start controls.
+- Add an explicit, lazy quick-answer lane: `/quick <question>` always uses its own FIFO OMP child, while busy task cards and Home can arm one unrelated follow-up without interrupting the main turn.
+
+### Changed
+
+- Rename user-facing controls and commands: Jobs → Schedules, Autonomy → Permissions, and New session → New chat.
+
+### Fixed
+
+- Always finalize a Telegram task with a visible outcome when OMP omits its terminal assistant text, while retaining the existing safeguard that prevents an empty response from activating an armed update.
+- Expire and replace Telegram catalog search cards so old searches no longer linger.
 
 ## 0.11.0 (2026-09-03)
 

@@ -6,7 +6,14 @@ import {
   type SemanticView,
   type StoredSemanticView,
 } from "./gateway-views";
-import { scheduledJobsSemanticView, sessionChoiceSemanticView } from "./rpc-semantic-views";
+import {
+  scheduledJobDeleteConfirmSemanticView,
+  scheduledJobDetailSemanticView,
+  scheduledJobsSemanticView,
+  sessionChoiceSemanticView,
+  taskHistorySemanticView,
+  taskSemanticView,
+} from "./rpc-semantic-views";
 
 function semanticView(overrides: Partial<SemanticView> = {}): SemanticView {
   return {
@@ -80,6 +87,34 @@ describe("semantic views", () => {
     ).toThrow("action ids must be unique");
   });
 
+  test("keeps prompt-backed actions bounded to simple gateway slash commands", () => {
+    const view = semanticView({
+      actions: [
+        {
+          id: "steer",
+          label: "Add instruction",
+          input: { title: "Steer", prompt: "Reply with an instruction.", command: "/steer" },
+        },
+      ],
+    });
+    expect(normalizeSemanticView(view).actions[0]).toMatchObject({
+      input: { title: "Steer", prompt: "Reply with an instruction.", command: "/steer" },
+    });
+    expect(() =>
+      validateSemanticView(
+        semanticView({
+          actions: [
+            {
+              id: "unsafe",
+              label: "Unsafe",
+              input: { title: "Unsafe", prompt: "No.", command: "/steer now" },
+            },
+          ],
+        }),
+      ),
+    ).toThrow("simple slash command");
+  });
+
   test("rejects malformed durable records before persistence", () => {
     expect(() =>
       normalizeStoredSemanticView(
@@ -126,39 +161,121 @@ describe("runtime semantic projections", () => {
   });
 
   test("projects scheduled jobs into actionable cards", () => {
-    const view = scheduledJobsSemanticView(
-      [
-        {
-          id: "job-1",
-          principalId: "operator-42",
-          identity: { transport: "telegram", account: "default", subject: "42" },
-          address: { transport: "telegram", account: "default", channel: "42" },
-          name: "Morning brief",
-          prompt: "Summarize updates",
-          schedule: { kind: "cron", expression: "0 9 * * *", timezone: "America/Los_Angeles" },
-          enabled: true,
-          nextRunAt: 200,
-          attemptCount: 0,
-          successCount: 2,
-          failureCount: 0,
-          createdAt: 10,
-          updatedAt: 100,
-        },
-      ],
-      7,
-      100,
-    );
+    const job = {
+      id: "job-1",
+      principalId: "operator-42",
+      identity: { transport: "telegram", account: "default", subject: "42" },
+      address: { transport: "telegram", account: "default", channel: "42" },
+      name: "Morning brief",
+      prompt: "Summarize updates",
+      schedule: { kind: "cron" as const, expression: "0 9 * * *", timezone: "America/Los_Angeles" },
+      enabled: true,
+      nextRunAt: 200,
+      attemptCount: 0,
+      successCount: 2,
+      failureCount: 0,
+      createdAt: 10,
+      updatedAt: 100,
+    };
+    const view = scheduledJobsSemanticView([job], 7, 100);
 
     validateSemanticView(view);
     expect(view.sections[0]).toMatchObject({
-      label: "Morning brief",
-      text: expect.stringContaining("Cron · 0 9 * * * · America/Los_Angeles"),
+      label: "🟢 Morning brief",
+      text: expect.stringContaining("Next:"),
     });
     expect(view.actions.map(({ command }) => command)).toEqual([
-      "/job_pause job-1",
-      "/job_run job-1",
-      "/job_delete job-1",
+      "/job job-1",
+      undefined,
       "/home",
     ]);
+
+    const detail = scheduledJobDetailSemanticView(job, 8, 100);
+    validateSemanticView(detail);
+    expect(detail.actions.map(({ command }) => command)).toEqual([
+      "/job_run job-1",
+      "/job_pause job-1",
+      undefined,
+      "/job_delete_confirm job-1",
+      "/schedules",
+    ]);
+
+    const confirm = scheduledJobDeleteConfirmSemanticView(job, 9, 100);
+    validateSemanticView(confirm);
+    expect(confirm.actions.map(({ command }) => command)).toEqual([
+      "/job_delete job-1",
+      "/job job-1",
+    ]);
+  });
+
+  test("projects task steering and recovery into durable cards", () => {
+    const lifecycle = {
+      id: "task-1",
+      principalId: "operator-42",
+      address: { transport: "telegram", account: "default", channel: "42" },
+      prompt: "Deploy the service",
+      state: "interrupted" as const,
+      createdAt: 10,
+      updatedAt: 20,
+      finishedAt: 20,
+      error: "OMP restarted",
+    };
+    const active = taskSemanticView({ ...lifecycle, state: "running", finishedAt: undefined }, [], 7);
+    expect(active.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "steer", input: expect.objectContaining({ command: "/steer" }) }),
+        expect.objectContaining({ id: "followup", input: expect.objectContaining({ command: "/followup" }) }),
+      ]),
+    );
+    const failed = taskSemanticView({ ...lifecycle, state: "failed" }, [], 8);
+    expect(failed.sections).toEqual(
+      expect.arrayContaining([
+        {
+          id: "error",
+          label: "What happened",
+          text: "The OMP session was interrupted.",
+          tone: "danger",
+        },
+      ]),
+    );
+    expect(failed.sections.map((section) => section.text).join("\n")).not.toContain("Use /status");
+    expect(failed.actions.map((action) => action.command)).toEqual([
+      "/result task-1",
+      undefined,
+      undefined,
+      "/task_retry task-1",
+      "/task_details task-1",
+      "/tasks",
+      "/new",
+    ]);
+    expect(failed.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "continue",
+          input: expect.objectContaining({ command: "/task_continue", argument: "task-1" }),
+        }),
+        expect.objectContaining({
+          id: "revise",
+          input: expect.objectContaining({ command: "/task_revise", argument: "task-1" }),
+        }),
+      ]),
+    );
+    const detailed = taskSemanticView({ ...lifecycle, state: "failed" }, [], 9, [], false, true);
+    expect(detailed.sections).toEqual(
+      expect.arrayContaining([{ id: "details", label: "Details", text: "OMP restarted", tone: "muted" }]),
+    );
+    expect(detailed.actions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "details", command: "/task_details task-1 hide" })]),
+    );
+    const timeline = taskHistorySemanticView(
+      [{ lifecycle, events: [{ turnId: "task-1", at: 10, kind: "queued", text: "Task received" }] }],
+      8,
+      20,
+    );
+    validateSemanticView(timeline);
+    expect(timeline.actions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ command: "/task_retry task-1" })]),
+    );
+    expect(timeline.sections[0]?.text).toContain("Task received");
   });
 });

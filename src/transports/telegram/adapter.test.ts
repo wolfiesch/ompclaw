@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PairingRequestView } from "../../gateway-pairing";
+import { taskSemanticView } from "../../rpc-semantic-views";
+import type { PendingInteraction } from "../../gateway-store";
 import type { Principal } from "../../gateway-types";
 import type { SemanticView } from "../../gateway-views";
 import { TgError } from "./bot-api";
@@ -46,7 +48,10 @@ describe("Telegram transport lifecycle", () => {
     expect(adapter.capabilities.maxMessageLength).toBe(Number.MAX_SAFE_INTEGER);
     expect(calls[0]).toEqual({
       method: "setMyCommands",
-      payload: { commands: [{ command: "home", description: "Open control center" }] },
+      payload: {
+        commands: [{ command: "home", description: "Open control center" }],
+        scope: { type: "all_private_chats" },
+      },
     });
     expect(poller.started).toBe(true);
     await adapter.stop();
@@ -61,6 +66,25 @@ describe("Telegram transport lifecycle", () => {
     expect(poller.started).toBe(true);
     expect(warnings).toEqual([expect.stringContaining("command menu registration failed: menu unavailable")]);
     await adapter.stop();
+  });
+
+  test("refreshes the Bot API profile without blocking startup on a rejected update", async () => {
+    const { calls, poller, warnings } = await fixture({
+      botIdentity: { first_name: "OmpClaw" },
+      botProfileError: new Error("profile unavailable"),
+    });
+    expect(calls.map((call) => call.method)).toContain("getMe");
+    expect(calls.map((call) => call.method)).toEqual(
+      expect.arrayContaining(["setMyDescription", "setMyShortDescription", "setMyName"]),
+    );
+    expect(poller.started).toBe(true);
+    expect(warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("bot profile setMyDescription failed: profile unavailable"),
+        expect.stringContaining("bot profile setMyShortDescription failed: profile unavailable"),
+        expect.stringContaining("bot profile setMyName failed: profile unavailable"),
+      ]),
+    );
   });
 
   test("stops polling when pairing approval monitor startup fails", async () => {
@@ -166,6 +190,7 @@ describe("Telegram transport lifecycle", () => {
         setCheckpoint: () => {},
         putPendingInteraction: () => {},
         deletePendingInteraction: () => {},
+        listPendingInteractions: () => [],
         listPendingInboundMessages: () => [],
         listPendingIngressCompositions: () => [],
       },
@@ -177,6 +202,210 @@ describe("Telegram transport lifecycle", () => {
   });
 });
 
+
+describe("Telegram command catalog", () => {
+  test("registers compact private and group-scoped native menus", async () => {
+    const { calls } = await fixture({
+      commands: [
+        { command: "start", description: "Start" },
+        { command: "home", description: "Home" },
+        { command: "help", description: "Help" },
+        { command: "status", description: "Status" },
+        { command: "stop", description: "Stop" },
+        { command: "new", description: "New conversation" },
+      ],
+    });
+
+    expect(calls.filter((call) => call.method === "setMyCommands")).toEqual([
+      {
+        method: "setMyCommands",
+        payload: {
+          commands: [
+            { command: "start", description: "Start" },
+            { command: "home", description: "Home" },
+            { command: "help", description: "Help" },
+            { command: "status", description: "Status" },
+            { command: "stop", description: "Stop" },
+            { command: "new", description: "New conversation" },
+          ],
+          scope: { type: "all_private_chats" },
+        },
+      },
+      {
+        method: "setMyCommands",
+        payload: {
+          commands: [
+            { command: "help", description: "Help" },
+            { command: "status", description: "Status" },
+            { command: "stop", description: "Stop" },
+            { command: "new", description: "New conversation" },
+            { command: "start", description: "Start" },
+          ],
+          scope: { type: "all_group_chats" },
+        },
+      },
+    ]);
+  });
+
+  test("answers authorized inline queries with ranked command results and argument previews", async () => {
+    const { adapter, api } = await fixture({
+      ompCommands: [{ name: "format", description: "Format a response", source: "skill" }],
+      recentCommands: ["format"],
+    });
+
+    await adapter.handleUpdate({
+      update_id: 90,
+      inline_query: { id: "inline-1", from: { id: 42 }, query: "f --json", offset: "" },
+    });
+
+    const answer = api.last("answerInlineQuery");
+    expect(answer.payload).toMatchObject({
+      inline_query_id: "inline-1",
+      cache_time: 0,
+      is_personal: true,
+    });
+    if (!Array.isArray(answer.payload.results)) throw new Error("expected inline results");
+    expect(answer.payload.results[0]).toMatchObject({
+      type: "article",
+      id: "format",
+      title: "/format",
+      description: "Format a response\nArguments: --json",
+      input_message_content: { message_text: "/format --json" },
+    });
+  });
+
+  test("fails closed for unauthorized inline queries", async () => {
+    const { adapter, api, received } = await fixture({
+      ompCommands: [{ name: "private-skill", description: "Private automation", source: "skill" }],
+      resolve: () => undefined,
+    });
+
+    await adapter.handleUpdate({
+      update_id: 91,
+      inline_query: { id: "inline-unauthorized", from: { id: 99 }, query: "private", offset: "" },
+    });
+
+    expect(api.last("answerInlineQuery").payload).toMatchObject({
+      inline_query_id: "inline-unauthorized",
+      results: [],
+    });
+    expect(received).toEqual([]);
+  });
+
+  test("renders grouped catalog listings and routes search-card selections through ingress", async () => {
+    const { adapter, calls, commandUsage, received } = await fixture({
+      ompCommands: [{ name: "deploy", description: "Ship the current branch", source: "skill" }],
+    });
+
+    await adapter.handleUpdate({ update_id: 92, message: message({ text: "/commands" }) });
+    expect(sentMessage(calls).payload.text).toContain("Everyday");
+    expect(received).toEqual([]);
+
+    await adapter.handleUpdate({ update_id: 93, message: message({ message_id: 11, text: "/commands deploy" }) });
+    const card = sentMessage(calls);
+    expect(card.payload.text).toContain("Command search");
+    expect(card.payload.text).toContain("/deploy");
+
+    await adapter.handleUpdate({
+      update_id: 94,
+      callback_query: {
+        id: "catalog-pick",
+        from: { id: 42 },
+        data: callbackData(card, "/deploy"),
+        message: message({ message_id: 202, text: "Command search" }),
+      },
+    });
+
+    expect(received).toEqual([
+      expect.objectContaining({
+        content: { text: "/deploy" },
+        id: "telegram:primary:command-catalog:94",
+      }),
+    ]);
+    expect(commandUsage).toEqual(["deploy"]);
+  });
+
+  test("replaces a prior catalog search card for the same sender", async () => {
+    let nextId = 0;
+    const { adapter, calls, received } = await fixture({
+      ompCommands: [{ name: "deploy", description: "Ship the current branch", source: "skill" }],
+      randomId: () => `catalog-${++nextId}`,
+    });
+
+    await adapter.handleUpdate({ update_id: 95, message: message({ text: "/commands deploy" }) });
+    const first = sentMessage(calls);
+    await adapter.handleUpdate({ update_id: 96, message: message({ message_id: 11, text: "/commands deploy" }) });
+    const second = sentMessage(calls);
+
+    await adapter.handleUpdate({
+      update_id: 97,
+      callback_query: {
+        id: "catalog-prior",
+        from: { id: 42 },
+        data: callbackData(first, "/deploy"),
+        message: message({ message_id: 201, text: "Command search" }),
+      },
+    });
+    expect(received).toEqual([]);
+    expect(sentMessage(calls, "answerCallbackQuery").payload).toMatchObject({
+      callback_query_id: "catalog-prior",
+      text: "This command search has expired.",
+    });
+
+    await adapter.handleUpdate({
+      update_id: 98,
+      callback_query: {
+        id: "catalog-current",
+        from: { id: 42 },
+        data: callbackData(second, "/deploy"),
+        message: message({ message_id: 202, text: "Command search" }),
+      },
+    });
+    expect(received).toEqual([expect.objectContaining({ content: { text: "/deploy" } })]);
+  });
+
+  test("rejects an expired catalog card without dispatching a command", async () => {
+    let now = 1_800_000_000_000;
+    const { adapter, calls, received } = await fixture({
+      ompCommands: [{ name: "deploy", description: "Ship the current branch", source: "skill" }],
+      now: () => now,
+      randomId: () => "catalog-expired",
+    });
+
+    await adapter.handleUpdate({ update_id: 99, message: message({ text: "/commands deploy" }) });
+    const card = sentMessage(calls);
+    now += 10_001;
+    await adapter.handleUpdate({
+      update_id: 100,
+      callback_query: {
+        id: "catalog-expired",
+        from: { id: 42 },
+        data: callbackData(card, "/deploy"),
+        message: message({ message_id: 201, text: "Command search" }),
+      },
+    });
+
+    expect(received).toEqual([]);
+    expect(sentMessage(calls, "answerCallbackQuery").payload).toEqual({
+      callback_query_id: "catalog-expired",
+      text: "This command search has expired.",
+    });
+  });
+
+  test("clears catalog card expiry timers when stopping", async () => {
+    const clear = spyOn(globalThis, "clearTimeout");
+    try {
+      const { adapter } = await fixture({
+        ompCommands: [{ name: "deploy", description: "Ship the current branch", source: "skill" }],
+      });
+      await adapter.handleUpdate({ update_id: 101, message: message({ text: "/commands deploy" }) });
+      await adapter.stop();
+      expect(clear).toHaveBeenCalledTimes(1);
+    } finally {
+      clear.mockRestore();
+    }
+  });
+});
 describe("Telegram typing", () => {
   test("sends a one-shot typing action to the conversation topic", async () => {
     const { adapter, calls } = await fixture();
@@ -185,7 +414,7 @@ describe("Telegram typing", () => {
 
     await adapter.typing(address, context);
 
-    expect(calls).toEqual([
+    expect(calls.filter((call) => call.method === "sendChatAction")).toEqual([
       {
         method: "sendChatAction",
         payload: { chat_id: "-100", message_thread_id: 19, action: "typing" },
@@ -457,6 +686,42 @@ describe("Telegram inbound conversion", () => {
       targetId: "task-build-1",
       targetSummary: "Build Pipeline: Running integration tests",
     });
+
+    semanticViews.set(["telegram", "primary", "42", "", "task-result-1"].join("\0"), {
+      principalId: "operator-42",
+      address,
+      view: {
+        schemaVersion: 1,
+        id: "task-result-1",
+        kind: "result",
+        version: 1,
+        state: "completed",
+        title: "Release result",
+        summary: "Deploy the release",
+      },
+      contentHash: "b".repeat(64),
+      receipts: [{ messageId: "124", index: 0 }],
+      createdAt: 101,
+      updatedAt: 101,
+    });
+    await adapter.handleUpdate({
+      update_id: 17,
+      message: message({
+        message_id: 32,
+        reply_to_message: message({
+          message_id: 124,
+          from: { id: 10, username: "ompclawbot", is_bot: true },
+          text: "Release result\nDeploy the release",
+        }),
+        text: "Add the rollback plan",
+      }),
+    });
+    expect(received[1]?.replyContext).toMatchObject({
+      messageId: "124",
+      targetKind: "turn_result",
+      targetId: "task-result-1",
+      targetSummary: "Release result: Deploy the release",
+    });
   });
 
   test("pairs an unresolved private sender without dispatching the inbound task", async () => {
@@ -481,16 +746,10 @@ describe("Telegram inbound conversion", () => {
         requests.splice(0, requests.length, request);
         return { status: "created" as const, result: { code: "ABCD2345", request } };
       },
+      list: () => requests,
       listUnconfirmedApprovals: () => requests.filter((request) => request.state === "approved"),
-      completeConfirmation: (identity: PairingRequestView["identity"]) => {
-        const index = requests.findIndex(
-          (request) =>
-            request.identity.transport === identity.transport &&
-            request.identity.account === identity.account &&
-            request.identity.subject === identity.subject,
-        );
-        if (index < 0) return false;
-        requests.splice(index, 1);
+      completeConfirmation: () => {
+        if (confirmationsCompleted > 0) return false;
         confirmationsCompleted += 1;
         return true;
       },
@@ -506,8 +765,14 @@ describe("Telegram inbound conversion", () => {
     });
 
     expect(harness.received).toEqual([]);
-    expect(sentMessage(harness.calls).payload.text).toContain("Pairing code: ABCD2345");
-    expect(sentMessage(harness.calls).payload.text).toContain("ompclaw pairing-approve ABCD2345");
+    const welcome = sentMessage(harness.calls).payload;
+    expect(welcome.text).toContain("Welcome to OmpClaw");
+    expect(welcome.text).toContain("not authorized yet");
+    expect(welcome.text).toContain("Pairing request: sent");
+    expect(welcome.text).toContain("Pairing code: ABCD2345");
+    expect(welcome.text).toContain(
+      "The gateway operator must approve this request. This message updates automatically.",
+    );
 
     pairedPrincipal = { id: "operator:telegram:primary:99", roles: ["operator"] };
     requests[0] = {
@@ -517,19 +782,104 @@ describe("Telegram inbound conversion", () => {
       principalId: pairedPrincipal.id,
     };
     await harness.flushPairingApprovals();
-    expect(sentMessage(harness.calls).payload.text).toBe("Paired. Send your first task.");
+    const connected = harness.api.last("editMessageText").payload;
+    expect(connected.text).toContain("✅ Connected");
+    expect(connected.text).toContain("messages, voice notes, photos, and files");
+    expect(connected.reply_markup).toEqual({
+      inline_keyboard: [
+        [
+          { text: "Open Home", callback_data: "omppair:home" },
+          { text: "See examples", callback_data: "omppair:examples" },
+        ],
+      ],
+    });
 
+    await harness.adapter.handleUpdate({
+      update_id: 8,
+      callback_query: {
+        id: "examples",
+        from: { id: 99 },
+        data: "omppair:examples",
+        message: message({ message_id: Number(connected.message_id) }),
+      },
+    });
+    expect(harness.api.last("editMessageText").payload.text).toContain("Examples");
+    expect(harness.api.last("editMessageText").payload.text).toContain("/home — open the control center");
+
+    await harness.adapter.handleUpdate({
+      update_id: 9,
+      callback_query: {
+        id: "dismiss",
+        from: { id: 99 },
+        data: "omppair:dismiss",
+        message: message({ message_id: Number(connected.message_id) }),
+      },
+    });
+    expect(harness.api.last("editMessageText").payload.text).not.toContain("Examples");
     expect(confirmationsCompleted).toBe(1);
-    const confirmationCount = harness.calls.filter(
-      (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
-    ).length;
     await harness.flushPairingApprovals();
     expect(confirmationsCompleted).toBe(1);
-    expect(
-      harness.calls.filter(
-        (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
-      ),
-    ).toHaveLength(confirmationCount);
+  });
+
+  test("settles rejected and expired pairing cards in place with retry controls", async () => {
+    const requests: PairingRequestView[] = [];
+    let codeNumber = 0;
+    const pairing = {
+      requestFromTransport: (
+        identity: PairingRequestView["identity"],
+        address: PairingRequestView["address"],
+        createdAt: number,
+      ) => {
+        codeNumber += 1;
+        const request: PairingRequestView = {
+          identity,
+          address,
+          state: "pending",
+          failedAttempts: 0,
+          maxAttempts: 5,
+          createdAt,
+          expiresAt: createdAt + 600_000,
+        };
+        requests.splice(0, requests.length, request);
+        return { status: "created" as const, result: { code: `PAIR${codeNumber}`, request } };
+      },
+      list: () => requests,
+      listUnconfirmedApprovals: () => [],
+      completeConfirmation: () => false,
+    };
+    const harness = await fixture({ pairing, resolve: () => undefined });
+    await harness.adapter.handleUpdate({
+      update_id: 10,
+      message: message({ from: { id: 99 }, text: "hello" }),
+    });
+    const sentCount = harness.calls.filter((call) => call.method === "sendMessage").length;
+
+    requests[0] = { ...requests[0]!, state: "rejected", resolvedAt: 1_800_000_000_001 };
+    await harness.flushPairingApprovals();
+    const rejected = harness.api.last("editMessageText").payload;
+    expect(rejected.text).toContain("Pairing request rejected");
+    expect(rejected.reply_markup).toEqual({
+      inline_keyboard: [[{ text: "Retry pairing", callback_data: "omppair:retry" }]],
+    });
+    expect(harness.calls.filter((call) => call.method === "sendMessage")).toHaveLength(sentCount);
+
+    await harness.adapter.handleUpdate({
+      update_id: 11,
+      callback_query: {
+        id: "retry",
+        from: { id: 99 },
+        data: "omppair:retry",
+        message: message({ message_id: Number(rejected.message_id) }),
+      },
+    });
+    requests[0] = { ...requests[0]!, state: "expired", resolvedAt: 1_800_000_000_002 };
+    await harness.flushPairingApprovals();
+    const expired = harness.api.last("editMessageText").payload;
+    expect(expired.text).toContain("Pairing request expired");
+    expect(expired.reply_markup).toEqual({
+      inline_keyboard: [[{ text: "Retry pairing", callback_data: "omppair:retry" }]],
+    });
+    expect(harness.calls.filter((call) => call.method === "sendMessage")).toHaveLength(sentCount);
   });
 
   test("keeps unresolved group senders silent when runtime pairing is enabled", async () => {
@@ -706,6 +1056,135 @@ describe("Telegram interactive UI", () => {
     });
     await expect(answer).resolves.toEqual({ type: "confirm", confirmed: true });
     expect(pending.size).toBe(0);
+    expect(calls.findLast((call) => call.method === "editMessageText")?.payload.text).toContain("✅ Approved");
+  });
+
+  test("renders a numbered clarification card and captures an other reply", async () => {
+    const { adapter, calls } = await fixture();
+    const answer = adapter.presentUi(
+      baseAddress,
+      {
+        type: "select",
+        presentation: "decision",
+        title: "Clarify the target",
+        options: [
+          { value: "staging", label: "Staging", description: "Use the staging environment." },
+          { value: "production", label: "Production", description: "Use the production environment." },
+        ],
+      },
+      delivery,
+    );
+    await flush();
+    const prompt = sentMessage(calls);
+    expect(prompt.payload.text).toContain("1. Staging\nUse the staging environment.");
+    expect(callbackData(prompt, "Other answer")).toContain(":other");
+    await adapter.handleUpdate({
+      update_id: 12,
+      callback_query: {
+        id: "other",
+        from: { id: 42 },
+        data: callbackData(prompt, "Other answer"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    await adapter.handleUpdate({
+      update_id: 13,
+      message: message({
+        message_id: 44,
+        text: "Use the canary environment.",
+        reply_to_message: message({ message_id: 201 }),
+      }),
+    });
+    await expect(answer).resolves.toEqual({ type: "select", selected: ["Use the canary environment."] });
+  });
+
+  test("replays persisted provider and model pickers on their original receipts", async () => {
+    const now = 1_800_000_000_000;
+    const interaction = (
+      id: string,
+      title: string,
+      options: readonly { readonly value: string; readonly label: string }[],
+      page: number,
+      messageId: string,
+    ): PendingInteraction => ({
+      id,
+      address: baseAddress,
+      kind: "select",
+      payload: {
+        schemaVersion: 1,
+        principalId: owner.id,
+        request: { title, options, multiple: false },
+        selected: [],
+        page,
+        awaitingAnswer: false,
+        promptMessageId: messageId,
+      },
+      createdAt: now,
+      expiresAt: now + 10_000,
+    });
+    const { adapter, calls, pending } = await fixture({
+      pendingInteractions: [
+        interaction(
+          "provider-page",
+          "Choose a provider",
+          [
+            { value: "openai", label: "OpenAI · 2" },
+            { value: "anthropic", label: "Anthropic · 1" },
+          ],
+          0,
+          "201",
+        ),
+        interaction(
+          "model-page",
+          "OpenAI models",
+          Array.from({ length: 10 }, (_, index) => ({ value: `gpt-5-${index + 1}`, label: `GPT-5 ${index + 1}` })),
+          1,
+          "202",
+        ),
+      ],
+    });
+    const modelMarkup = calls.find(
+      (call) => call.method === "editMessageReplyMarkup" && call.payload.message_id === 202,
+    );
+    const providerMarkup = calls.find(
+      (call) => call.method === "editMessageReplyMarkup" && call.payload.message_id === 201,
+    );
+    if (modelMarkup === undefined || providerMarkup === undefined) throw new Error("expected replayed picker markup");
+
+    await adapter.handleUpdate({
+      update_id: 30,
+      callback_query: {
+        id: "previous-page",
+        from: { id: 42 },
+        data: callbackData(modelMarkup, "← Prev"),
+        message: message({ message_id: 202 }),
+      },
+    });
+    const refreshedModelMarkup = calls.findLast((call) => call.method === "editMessageReplyMarkup");
+    if (refreshedModelMarkup === undefined) throw new Error("expected refreshed model picker markup");
+    expect(callbackData(refreshedModelMarkup, "GPT-5 1")).toContain("ompui");
+
+    const pickProvider = callbackData(providerMarkup, "OpenAI · 2");
+    await adapter.handleUpdate({
+      update_id: 31,
+      callback_query: {
+        id: "pick-provider",
+        from: { id: 42 },
+        data: pickProvider,
+        message: message({ message_id: 201 }),
+      },
+    });
+    await adapter.handleUpdate({
+      update_id: 32,
+      callback_query: {
+        id: "pick-provider-again",
+        from: { id: 42 },
+        data: pickProvider,
+        message: message({ message_id: 201 }),
+      },
+    });
+    expect(pending.has("provider-page")).toBe(false);
+    expect(calls.findLast((call) => call.method === "answerCallbackQuery")?.payload.text).toContain("expired");
   });
 
   test("accepts text input only as a reply to the correlated prompt", async () => {
@@ -780,6 +1259,114 @@ describe("Telegram interactive UI", () => {
     });
 
     expect(received[0]).toMatchObject({ content: { text: "/status" }, address: baseAddress });
+  });
+
+  test("routes recovery controls from a failed task card and refreshes stale task taps", async () => {
+    const { adapter, calls, received } = await fixture();
+    const lifecycle = {
+      id: "task-failed",
+      principalId: owner.id,
+      address: baseAddress,
+      prompt: "Deploy the release",
+      state: "failed" as const,
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+      error: "Provider socket timed out\n    at transport.send (rpc.ts:44)",
+    };
+    const initial = taskSemanticView(lifecycle, [], 1);
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view: initial }, delivery);
+    const card = sentMessage(calls);
+    expect(card.payload.text).toContain("The task took longer than expected.");
+    expect(card.payload.text).not.toContain("transport.send");
+    expect(card.payload.reply_markup).toMatchObject({
+      inline_keyboard: [
+        [{ text: "📄 View result" }, { text: "➕ Continue" }],
+        [{ text: "✏️ Revise" }, { text: "↻ Retry" }],
+        [{ text: "🔍 View details" }, { text: "📋 Open task" }],
+        [{ text: "✨ Start fresh" }],
+      ],
+    });
+
+    for (const [updateId, label, command] of [
+      [20, "📄 View result", "/result task-failed"],
+      [21, "↻ Retry", "/task_retry task-failed"],
+      [22, "🔍 View details", "/task_details task-failed"],
+      [23, "📋 Open task", "/tasks"],
+      [24, "✨ Start fresh", "/new"],
+    ] as const) {
+      await adapter.handleUpdate({
+        update_id: updateId,
+        callback_query: {
+          id: `failure-${updateId}`,
+          from: { id: 42 },
+          data: callbackData(card, label),
+          message: message({ message_id: 201 }),
+        },
+      });
+      expect(received.at(-1)).toMatchObject({ content: { text: command } });
+    }
+
+    const detailed = taskSemanticView(lifecycle, [], 2, [], false, true);
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view: detailed }, delivery);
+    calls.splice(0);
+    await adapter.handleUpdate({
+      update_id: 25,
+      callback_query: {
+        id: "stale-failure",
+        from: { id: 42 },
+        data: callbackData(card, "↻ Retry"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    expect(received).toHaveLength(5);
+    expect(calls.find((entry) => entry.method === "editMessageText")?.payload.text).toContain("Provider socket timed out");
+    expect(calls.findLast((entry) => entry.method === "answerCallbackQuery")?.payload.text).toBe(
+      "Updated to the latest controls.",
+    );
+  });
+
+  test("routes a semantic prompt action through a correlated instruction reply", async () => {
+    const { adapter, calls, received } = await fixture();
+    const view: SemanticView = {
+      schemaVersion: 1,
+      id: "task-1",
+      kind: "task",
+      version: 1,
+      state: "active",
+      title: "Working",
+      sections: [],
+      actions: [
+        {
+          id: "steer",
+          label: "Add instruction",
+          input: { title: "Steer task", prompt: "Reply with a correction.", command: "/steer" },
+        },
+      ],
+      updatedAt: 1,
+    };
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view }, delivery);
+    const card = sentMessage(calls);
+    await adapter.handleUpdate({
+      update_id: 17,
+      callback_query: {
+        id: "semantic-steer",
+        from: { id: 42 },
+        data: callbackData(card, "Add instruction"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    await flush();
+    await adapter.handleUpdate({
+      update_id: 18,
+      message: message({
+        message_id: 44,
+        text: "Use the staging environment.",
+        reply_to_message: message({ message_id: 202 }),
+      }),
+    });
+    await flush();
+    expect(received).toEqual([expect.objectContaining({ content: { text: "/steer Use the staging environment." } })]);
   });
 
   test("refreshes a stale semantic callback without dispatching its action", async () => {
@@ -932,6 +1519,37 @@ describe("Telegram interactive UI", () => {
       },
     });
     expect(received[0]).toMatchObject({ content: { text: "/stop" }, address: baseAddress });
+  });
+
+  test("adds the quick-ask toggle to busy task cards and maps it to /quick-arm", async () => {
+    const { adapter, calls, received } = await fixture();
+    await adapter.presentUi(baseAddress, { type: "status", key: "Task", text: "Working\nDeploying" }, delivery);
+    const card = sentMessage(calls);
+    expect(callbackData(card, "⚡ Quick ask")).toBe("ompctl:quick-arm");
+
+    await adapter.handleUpdate({
+      update_id: 16,
+      callback_query: {
+        id: "quick-arm",
+        from: { id: 42 },
+        data: callbackData(card, "⚡ Quick ask"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    expect(received[0]).toMatchObject({ content: { text: "/quick-arm" }, address: baseAddress });
+
+    await adapter.presentUi(
+      baseAddress,
+      { type: "status", key: "quick-ask", text: "⚡ Quick ask armed — send your question" },
+      delivery,
+    );
+    expect(calls.findLast((entry) => entry.method === "editMessageText")?.payload).toMatchObject({
+      reply_markup: {
+        inline_keyboard: expect.arrayContaining([
+          [{ text: "⚡ Quick ask armed — send your question", callback_data: "ompctl:quick-arm" }],
+        ]),
+      },
+    });
   });
 
   test("rejects a stop button click from a different authorized principal", async () => {

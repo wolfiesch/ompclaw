@@ -9,10 +9,19 @@ export type SemanticViewActionStyle = "default" | "primary" | "danger";
 
 export type SemanticViewSectionTone = "default" | "muted" | "success" | "warning" | "danger";
 
+export interface SemanticViewActionInput {
+  readonly title: string;
+  readonly prompt: string;
+  readonly command: string;
+  /** A single opaque command argument supplied by the trusted semantic view. */
+  readonly argument?: string;
+}
+
 export interface SemanticViewAction {
   readonly id: string;
   readonly label: string;
   readonly command?: string;
+  readonly input?: SemanticViewActionInput;
   readonly style?: SemanticViewActionStyle;
   readonly enabled?: boolean;
 }
@@ -99,6 +108,24 @@ function validateSemanticViewAction(value: unknown, context: string): asserts va
   validateOpaqueIdentifier(value.id, `${context} id`);
   requiredText(value.label, `${context} label`);
   if (value.command !== undefined) requiredText(value.command, `${context} command`);
+  if (value.input !== undefined) {
+    if (!isRecord(value.input)) throw new Error(`${context} input must be an object`);
+    requiredText(value.input.title, `${context} input title`);
+    requiredText(value.input.prompt, `${context} input prompt`);
+    requiredText(value.input.command, `${context} input command`);
+    if (!/^\/[a-z][a-z_]*$/.test(value.input.command)) {
+      throw new Error(`${context} input command must be a simple slash command`);
+    }
+    if (
+      value.input.argument !== undefined &&
+      (typeof value.input.argument !== "string" || !/^[A-Za-z0-9:_-]{1,256}$/.test(value.input.argument))
+    ) {
+      throw new Error(`${context} input argument must be a single opaque token`);
+    }
+  }
+  if (value.command !== undefined && value.input !== undefined) {
+    throw new Error(`${context} cannot define both command and input`);
+  }
   if (value.style !== undefined && value.style !== "default" && value.style !== "primary" && value.style !== "danger") {
     throw new Error(`${context} style is invalid`);
   }
@@ -222,6 +249,15 @@ export function normalizeSemanticView(value: unknown): SemanticView {
       id: action.id,
       label: action.label,
       ...(action.command === undefined ? {} : { command: action.command }),
+      ...(action.input === undefined
+        ? {}
+        : {
+            input: {
+              title: action.input.title,
+              prompt: action.input.prompt,
+              command: action.input.command,
+            },
+          }),
       ...(action.style === undefined ? {} : { style: action.style }),
       ...(action.enabled === undefined ? {} : { enabled: action.enabled }),
     })),

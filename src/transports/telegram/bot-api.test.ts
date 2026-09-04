@@ -156,6 +156,31 @@ describe("Telegram request helpers", () => {
     expect(bodies[0]?.get("chat_id")).toBe("42");
     await expect(downloadFileBytes("secret", "reports/payload.bin")).resolves.toEqual(payload);
   });
+  test("uploads native media files with specific methods and fields", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-media-upload-"));
+    scratch.push(directory);
+    const path = join(directory, "audio.mp3");
+    await writeFile(path, new Uint8Array([1, 2, 3]));
+    const urls: string[] = [];
+    const fields: string[] = [];
+
+    globalThis.fetch = (async (url, init) => {
+      urls.push(String(url));
+      if (init?.body instanceof FormData) {
+        fields.push(Array.from(init.body.keys()).join(","));
+      }
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 42 } }), { status: 200 });
+    }) as typeof fetch;
+
+    await expect(tgUpload<{ message_id: number }>(
+      "secret",
+      "sendAudio",
+      { chat_id: 123 },
+      { field: "audio", path, filename: "audio.mp3" },
+    )).resolves.toEqual({ message_id: 42 });
+    expect(urls[0]).toBe("https://api.telegram.org/botsecret/sendAudio");
+    expect(fields[0]).toContain("audio");
+  });
 
   test("explains webhook conflicts when metadata is available", async () => {
     globalThis.fetch = (async () => new Response(JSON.stringify({
@@ -248,6 +273,6 @@ describe("long poller", () => {
 
     expect(handled).toEqual([4, 7]);
     expect(offsets).toEqual([0]);
-    expect(allowed).toEqual([["message", "edited_message", "callback_query", "stopped_message_generation"]]);
+    expect(allowed).toEqual([["message", "edited_message", "callback_query", "inline_query", "stopped_message_generation"]]);
   });
 });
