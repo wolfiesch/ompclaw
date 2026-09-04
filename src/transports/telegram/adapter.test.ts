@@ -686,6 +686,42 @@ describe("Telegram inbound conversion", () => {
       targetId: "task-build-1",
       targetSummary: "Build Pipeline: Running integration tests",
     });
+
+    semanticViews.set(["telegram", "primary", "42", "", "task-result-1"].join("\0"), {
+      principalId: "operator-42",
+      address,
+      view: {
+        schemaVersion: 1,
+        id: "task-result-1",
+        kind: "result",
+        version: 1,
+        state: "completed",
+        title: "Release result",
+        summary: "Deploy the release",
+      },
+      contentHash: "b".repeat(64),
+      receipts: [{ messageId: "124", index: 0 }],
+      createdAt: 101,
+      updatedAt: 101,
+    });
+    await adapter.handleUpdate({
+      update_id: 17,
+      message: message({
+        message_id: 32,
+        reply_to_message: message({
+          message_id: 124,
+          from: { id: 10, username: "ompclawbot", is_bot: true },
+          text: "Release result\nDeploy the release",
+        }),
+        text: "Add the rollback plan",
+      }),
+    });
+    expect(received[1]?.replyContext).toMatchObject({
+      messageId: "124",
+      targetKind: "turn_result",
+      targetId: "task-result-1",
+      targetSummary: "Release result: Deploy the release",
+    });
   });
 
   test("pairs an unresolved private sender without dispatching the inbound task", async () => {
@@ -1245,7 +1281,8 @@ describe("Telegram interactive UI", () => {
     expect(card.payload.text).not.toContain("transport.send");
     expect(card.payload.reply_markup).toMatchObject({
       inline_keyboard: [
-        [{ text: "📄 View result" }, { text: "↻ Retry" }],
+        [{ text: "📄 View result" }, { text: "➕ Continue" }],
+        [{ text: "✏️ Revise" }, { text: "↻ Retry" }],
         [{ text: "🔍 View details" }, { text: "📋 Open task" }],
         [{ text: "✨ Start fresh" }],
       ],

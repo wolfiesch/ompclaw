@@ -241,11 +241,25 @@ describe("runtime semantic projections", () => {
     expect(failed.sections.map((section) => section.text).join("\n")).not.toContain("Use /status");
     expect(failed.actions.map((action) => action.command)).toEqual([
       "/result task-1",
+      undefined,
+      undefined,
       "/task_retry task-1",
       "/task_details task-1",
       "/tasks",
       "/new",
     ]);
+    expect(failed.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "continue",
+          input: expect.objectContaining({ command: "/task_continue", argument: "task-1" }),
+        }),
+        expect.objectContaining({
+          id: "revise",
+          input: expect.objectContaining({ command: "/task_revise", argument: "task-1" }),
+        }),
+      ]),
+    );
     const detailed = taskSemanticView({ ...lifecycle, state: "failed" }, [], 9, [], false, true);
     expect(detailed.sections).toEqual(
       expect.arrayContaining([{ id: "details", label: "Details", text: "OMP restarted", tone: "muted" }]),

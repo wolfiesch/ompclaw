@@ -263,7 +263,8 @@ describe("Telegram UI scenario golden", () => {
           "⚠️ The task took longer than expected.",
         ].join("\n"),
         buttons: [
-          ["📄 View result", "↻ Retry"],
+          ["📄 View result", "➕ Continue"],
+          ["✏️ Revise", "↻ Retry"],
           ["🔍 View details", "📋 Open task"],
           ["✨ Start fresh"],
         ],
@@ -285,7 +286,8 @@ describe("Telegram UI scenario golden", () => {
           "Provider socket timed out",
         ].join("\n"),
         buttons: [
-          ["📄 View result", "↻ Retry"],
+          ["📄 View result", "➕ Continue"],
+          ["✏️ Revise", "↻ Retry"],
           ["Hide details", "📋 Open task"],
           ["✨ Start fresh"],
         ],

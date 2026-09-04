@@ -509,6 +509,107 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
+  test("recovers a terminal result after its initial delivery fails", async () => {
+    const outcomes = new Map<string, TurnOutcome>();
+    const turns = new Map<string, TurnLifecycle>();
+    const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore & GatewayPrincipalStore = {
+      putTurnLifecycle: (turn) => turns.set(turn.id, turn),
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: () => [],
+      getPrincipal: (id) => ({ id, roles: ["owner"] }),
+      putTurnOutcome: (outcome) => outcomes.set(outcome.turnId, outcome),
+      getTurnOutcome: (id) => outcomes.get(id),
+      listPendingTurnOutcomes: () => [...outcomes.values()].filter((outcome) => outcome.deliveredAt === undefined),
+      recordTurnOutcomeAttempt: (id, attemptedAt) => {
+        const outcome = outcomes.get(id);
+        if (outcome) outcomes.set(id, { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt });
+      },
+      markTurnOutcomeDelivered: (id, deliveredAt) => {
+        const outcome = outcomes.get(id);
+        if (outcome === undefined || outcome.deliveredAt !== undefined) return false;
+        outcomes.set(id, { ...outcome, deliveredAt });
+        return true;
+      },
+    };
+    const unavailableDelivery: GatewayDelivery = {
+      ...delivery(),
+      finalize: async () => {
+        throw new Error("Telegram delivery unavailable");
+      },
+    };
+    const first = createRuntime({ config, delivery: unavailableDelivery, turnStore, now: () => 100 });
+    await first.start();
+    await first.handleInbound(message("delivery-recovery", "Deliver the result"));
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Durable result" }] }] });
+    await first.waitUntilIdle();
+    expect(outcomes.get("delivery-recovery-Deliver the result")).toMatchObject({
+      state: "completed",
+      text: "Durable result",
+    });
+    expect(outcomes.get("delivery-recovery-Deliver the result")?.deliveredAt).toBeUndefined();
+    await first.stop();
+
+    const second = createRuntime({ config, delivery: delivery(), turnStore, now: () => 200 });
+    await second.start();
+    expect(outcomes.get("delivery-recovery-Deliver the result")).toMatchObject({
+      attemptCount: expect.any(Number),
+      deliveredAt: 200,
+    });
+    expect(deliveries.some((call) => call.method === "send" && textFromContent(call.content) === "Durable result")).toBe(true);
+    await second.stop();
+  });
+
+  test("continues and revises a terminal task with its durable context", async () => {
+    const prior: TurnLifecycle = {
+      id: "prior-task",
+      principalId: "principal-continuation",
+      address: { transport: "test", account: "account", channel: "continuation" },
+      prompt: "Prepare the release",
+      state: "completed",
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+    };
+    const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore = {
+      putTurnLifecycle: () => {},
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: (address) =>
+        JSON.stringify(address) === JSON.stringify(prior.address) ? [prior] : [],
+      putTurnOutcome: () => {},
+      getTurnOutcome: (id) =>
+        id === prior.id
+          ? {
+              turnId: prior.id,
+              principalId: prior.principalId,
+              address: prior.address,
+              state: "completed",
+              text: "Release prepared",
+              createdAt: 2,
+              attemptCount: 1,
+              deliveredAt: 2,
+            }
+          : undefined,
+    };
+    const runtime = createRuntime({ config, delivery: delivery(), turnStore });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    await runtime.handleInbound(message("continuation", "/task_continue prior-task Add deployment notes"));
+    expect(JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content.text).toBe(
+      "Continue this prior task. Original request:\nPrepare the release\n\nNew instruction:\nAdd deployment notes",
+    );
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }] });
+    await runtime.waitUntilIdle();
+
+    await runtime.handleInbound(message("continuation", "/task_revise prior-task Include a rollback plan"));
+    expect(JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content.text).toBe(
+      "Revise this prior task. Original request:\nPrepare the release\n\nPrevious result:\nRelease prepared\n\nNew instruction:\nInclude a rollback plan",
+    );
+    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Revised" }] }] });
+    await runtime.waitUntilIdle();
+    await runtime.stop();
+  });
+
   test("routes failure-card details and retry controls through the persisted task", async () => {
     const retryable: TurnLifecycle = {
       id: "retryable",
@@ -1792,6 +1893,7 @@ describe("RpcGatewayRuntime", () => {
     await runtime.handleInbound(message("commands", "/subagents"));
     await runtime.handleInbound(message("commands", "/new"));
     await runtime.handleInbound(message("commands", "/status"));
+    await runtime.handleInbound(message("commands", "/stats"));
     await expect(runtime.switchSession("/sessions/resume.jsonl")).resolves.toBe(true);
 
     expect(rpc.sent.map((command) => command.type)).toEqual(
@@ -1802,6 +1904,7 @@ describe("RpcGatewayRuntime", () => {
         "get_subagents",
         "new_session",
         "get_state",
+        "get_session_stats",
         "switch_session",
       ]),
     );

@@ -150,6 +150,26 @@ export function taskSemanticView(
     : [];
   const terminalActions = [
     { id: "result", label: "📄 View result", command: `/result ${lifecycle.id}`, style: "primary" as const },
+    {
+      id: "continue",
+      label: "➕ Continue",
+      input: {
+        title: "Continue this task",
+        prompt: "Reply with the work to do next.",
+        command: "/task_continue",
+        argument: lifecycle.id,
+      },
+    },
+    {
+      id: "revise",
+      label: "✏️ Revise",
+      input: {
+        title: "Revise this result",
+        prompt: "Reply with what should change.",
+        command: "/task_revise",
+        argument: lifecycle.id,
+      },
+    },
     ...recoveryActions,
   ];
   return {

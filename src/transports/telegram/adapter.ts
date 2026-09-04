@@ -1504,7 +1504,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
         sentAt: this.#clock(),
         identity,
         address,
-        content: { text: `${input.command} ${response.value.trim()}` },
+        content: { text: [input.command, input.argument, response.value.trim()].filter(Boolean).join(" ") },
         edited: false,
       },
       context.signal,

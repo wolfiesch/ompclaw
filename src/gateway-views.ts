@@ -13,6 +13,8 @@ export interface SemanticViewActionInput {
   readonly title: string;
   readonly prompt: string;
   readonly command: string;
+  /** A single opaque command argument supplied by the trusted semantic view. */
+  readonly argument?: string;
 }
 
 export interface SemanticViewAction {
@@ -113,6 +115,12 @@ function validateSemanticViewAction(value: unknown, context: string): asserts va
     requiredText(value.input.command, `${context} input command`);
     if (!/^\/[a-z][a-z_]*$/.test(value.input.command)) {
       throw new Error(`${context} input command must be a simple slash command`);
+    }
+    if (
+      value.input.argument !== undefined &&
+      (typeof value.input.argument !== "string" || !/^[A-Za-z0-9:_-]{1,256}$/.test(value.input.argument))
+    ) {
+      throw new Error(`${context} input argument must be a single opaque token`);
     }
   }
   if (value.command !== undefined && value.input !== undefined) {

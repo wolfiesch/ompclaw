@@ -833,6 +833,8 @@ export class RpcGatewayRuntime {
       else if (name === "queue") await this.#queueCommand(args, reply);
       else if (name === "tasks") await this.#tasksCommand(delivery);
       else if (name === "task_retry") await this.#taskRetryCommand(delivery, args, reply);
+      else if (name === "task_continue" || name === "task_revise")
+        await this.#taskContinuationCommand(delivery, args, name === "task_revise" ? "revise" : "continue", reply);
       else if (name === "result") await this.#resultCommand(delivery, args, reply);
       else if (name === "task_details") await this.#taskDetailsCommand(delivery, args, reply);
       else if (name === "stats") await reply(valueText(await this.#requestData({ type: "get_session_stats" })));
@@ -1801,6 +1803,45 @@ export class RpcGatewayRuntime {
       address: delivery.address,
       principal: delivery.deliveryContext.principal,
       content: { text: `Resume this unfinished task. Original request:\n${previous.prompt}` },
+      edited: false,
+    });
+  }
+
+  async #taskContinuationCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    mode: "continue" | "revise",
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const [id, ...instructionParts] = args.trim().split(/\s+/);
+    const instruction = instructionParts.join(" ").trim();
+    if (id === undefined || instruction.length === 0) {
+      await reply(`Usage: /task_${mode} <task-id> <message>`);
+      return;
+    }
+    const previous = this.#ownedTask(delivery, id);
+    if (previous === undefined) {
+      await reply("That task is no longer available in this conversation.");
+      return;
+    }
+    if (this.#currentTurnBusy()) {
+      await reply("Wait for the current task to finish before continuing another task.");
+      return;
+    }
+    const outcome = this.#options.turnStore?.getTurnOutcome?.(previous.id);
+    const priorResult =
+      mode === "revise"
+        ? `\n\nPrevious result:\n${outcome?.text ?? "No final result was recorded."}`
+        : "";
+    await this.handleInbound({
+      id: `task-${mode}:${previous.id}:${this.#now()}`,
+      sentAt: this.#now(),
+      identity: delivery.identity,
+      address: delivery.address,
+      principal: delivery.deliveryContext.principal,
+      content: {
+        text: `${mode === "continue" ? "Continue" : "Revise"} this prior task. Original request:\n${previous.prompt}${priorResult}\n\nNew instruction:\n${instruction}`,
+      },
       edited: false,
     });
   }
