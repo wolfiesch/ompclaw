@@ -2,7 +2,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { GatewayScheduler, ScheduledDispatchBusyError } from "./gateway-scheduler";
+import {
+  GatewayScheduler,
+  ScheduledDispatchBusyError,
+  formatFriendlyNextRun,
+  formatHumanSchedule,
+  formatScheduledJob,
+  friendlyTimezoneName,
+  humanizeCron,
+} from "./gateway-scheduler";
 import { GatewayStore } from "./gateway-store";
 
 const directories: string[] = [];
@@ -165,5 +173,69 @@ describe("GatewayScheduler", () => {
     expect(dispatched).toEqual([job.id]);
     expect(restarted.get(job.id, principal.id)?.successCount).toBe(1);
     restartedStore.close();
+  });
+});
+
+describe("humanized schedule formatting", () => {
+  test("formats common cron patterns into human-readable text", () => {
+    expect(humanizeCron("0 9 * * *")).toBe("Every day at 9:00 AM");
+    expect(humanizeCron("30 14 * * *")).toBe("Every day at 2:30 PM");
+    expect(humanizeCron("0 0 * * *")).toBe("Every day at 12:00 AM");
+    expect(humanizeCron("0 9 * * 1")).toBe("Every Monday at 9:00 AM");
+    expect(humanizeCron("0 9 * * 5")).toBe("Every Friday at 9:00 AM");
+    expect(humanizeCron("0 9 * * 1-5")).toBe("Every weekday at 9:00 AM");
+    expect(humanizeCron("*/30 * * * *")).toBe("Every 30 minutes");
+    expect(humanizeCron("*/5 * * * *")).toBe("Every 5 minutes");
+    expect(humanizeCron("0 * * * *")).toBe("Every hour");
+    expect(humanizeCron("0 */2 * * *")).toBe("Every 2 hours");
+  });
+
+  test("falls back to raw expression for exotic crons", () => {
+    expect(humanizeCron("23 4 1,15 * 2")).toBe("23 4 1,15 * 2");
+    expect(humanizeCron("0 0 1 1 *")).toBe("0 0 1 1 *");
+  });
+
+  test("formats friendly timezone names", () => {
+    expect(friendlyTimezoneName("America/Los_Angeles")).toBe("Pacific");
+    expect(friendlyTimezoneName("America/New_York")).toBe("Eastern");
+    expect(friendlyTimezoneName("UTC")).toBe("UTC");
+    expect(friendlyTimezoneName(undefined)).toBeUndefined();
+  });
+
+  test("formats human schedule with timezone", () => {
+    expect(formatHumanSchedule({ kind: "cron", expression: "0 9 * * *", timezone: "America/Los_Angeles" })).toBe(
+      "Every day at 9:00 AM (Pacific)",
+    );
+    expect(formatHumanSchedule({ kind: "cron", expression: "23 4 1,15 * 2", timezone: "America/Los_Angeles" })).toBe(
+      "23 4 1,15 * 2 (Pacific)",
+    );
+  });
+
+  test("formats friendly relative next runs and scheduled job strings", () => {
+    const now = Date.parse("2026-09-03T16:00:00Z"); // 9:00 AM PDT
+    expect(formatFriendlyNextRun(undefined, now, undefined, false)).toBe("Paused");
+    expect(formatFriendlyNextRun(undefined, now, undefined, true)).toBe("None scheduled");
+    expect(formatFriendlyNextRun(now + 45 * 60_000, now, "America/Los_Angeles")).toBe("in 45 min");
+    expect(formatFriendlyNextRun(now + 3 * 3600_000, now, "America/Los_Angeles")).toBe("Today at 12:00 PM Pacific");
+    expect(formatFriendlyNextRun(now + 24 * 3600_000, now, "America/Los_Angeles")).toBe("Tomorrow at 9:00 AM Pacific");
+
+    const job = {
+      id: "job-1",
+      principalId: "p-1",
+      identity: { transport: "telegram" as const, account: "default", subject: "42" },
+      address: { transport: "telegram" as const, account: "default", channel: "42" },
+      name: "report",
+      prompt: "daily summary",
+      schedule: { kind: "cron" as const, expression: "0 9 * * *", timezone: "America/Los_Angeles" },
+      enabled: true,
+      nextRunAt: now + 3600_000,
+      attemptCount: 0,
+      successCount: 1,
+      failureCount: 0,
+      createdAt: now - 86400_000,
+      updatedAt: now,
+    };
+    expect(formatScheduledJob(job, now)).toContain("report");
+    expect(formatScheduledJob(job, now)).toContain("Every day at 9:00 AM (Pacific)");
   });
 });

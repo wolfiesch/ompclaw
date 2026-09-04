@@ -343,9 +343,6 @@ export function resolveMediaGroupTypes(
   return group.map(() => "document");
 }
 
-function photoAttachment(path: string, mediaType: string | undefined): boolean {
-  return classifyOutboundMedia(path, undefined, mediaType) === "photo";
-}
 
 export class Outbound {
   readonly #account: string;

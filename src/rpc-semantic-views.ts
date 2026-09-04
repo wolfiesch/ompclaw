@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { formatFriendlyNextRun, formatHumanSchedule } from "./gateway-scheduler";
 import type { AutonomyMode } from "./rpc-config";
 import type { RpcSessionState } from "./rpc-protocol";
 import type { ScheduledJob, TurnLifecycle, TurnTimelineEvent } from "./gateway-store";
@@ -22,10 +23,18 @@ export interface TaskSemanticTodoPhase {
   readonly tasks: readonly TaskSemanticTodo[];
 }
 
+export interface HomeActiveTask {
+  readonly title: string;
+  readonly currentStep?: string;
+  readonly startedAt: number;
+  readonly taskId?: string;
+}
+
 export interface HomeSemanticViewInput {
   readonly state?: RpcSessionState;
   readonly autonomyMode: AutonomyMode;
   readonly autonomyLabel: string;
+  readonly activeTask?: HomeActiveTask;
   readonly version: number;
   readonly updatedAt: number;
 }
@@ -312,7 +321,7 @@ export interface ModelPageSemanticViewInput extends ModelProviderSemanticViewInp
   readonly pageSize: number;
 }
 
-function modelDisplayName(id: string): string {
+export function modelDisplayName(id: string): string {
   return id
     .split(/[-_]/)
     .filter((part) => part.length > 0)
@@ -421,9 +430,17 @@ export function informationSemanticView(
   };
 }
 
-function jobSchedule(job: ScheduledJob): string {
-  if (job.schedule.kind === "at") return `Once · ${new Date(job.schedule.at).toISOString()}`;
-  return `Cron · ${job.schedule.expression}${job.schedule.timezone ? ` · ${job.schedule.timezone}` : ""}`;
+export function friendlyModelName(model?: { provider?: string; id?: string }): string {
+  if (!model?.id) return model?.provider ?? "Unknown model";
+  const name = modelDisplayName(model.id);
+  return name.replace(/\bGPT (\d+)\b/g, "GPT-$1");
+}
+
+export function reasoningLabel(level?: string): string {
+  if (!level || level === "inherit") return "Inherited reasoning";
+  if (level === "off") return "Reasoning off";
+  if (level === "xhigh") return "Extra high reasoning";
+  return `${level[0]?.toUpperCase()}${level.slice(1)} reasoning`;
 }
 
 export function scheduledJobsSemanticView(
@@ -438,45 +455,144 @@ export function scheduledJobsSemanticView(
     kind: "decision",
     version,
     state: "waiting",
-    title: "Scheduled jobs",
+    title: "🗓 Schedules",
     summary:
       jobs.length === 0
         ? "No scheduled jobs"
-        : `${jobs.length} job${jobs.length === 1 ? "" : "s"}${jobs.length > visible.length ? ` · showing ${visible.length}` : ""}`,
-    sections: visible.map((job, index) => ({
-      id: `job${index}`,
-      label: job.name,
-      text: [
-        job.enabled ? "Active" : "Paused",
-        jobSchedule(job),
-        job.nextRunAt === undefined ? undefined : `Next · ${new Date(job.nextRunAt).toISOString()}`,
-        job.lastError === undefined ? undefined : `Last error · ${boundedSummary(job.lastError)}`,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      tone: job.lastError === undefined ? (job.enabled ? "default" : "muted") : "danger",
-    })),
+        : `${jobs.length} schedule${jobs.length === 1 ? "" : "s"}${jobs.length > visible.length ? ` · showing ${visible.length}` : ""}`,
+    sections: visible.map((job, index) => {
+      const timezone = job.schedule.kind === "cron" ? job.schedule.timezone : undefined;
+      return {
+        id: `job${index}`,
+        label: `${job.enabled ? "🟢" : "⏸"} ${job.name}`,
+        text: [
+          `Next: ${formatFriendlyNextRun(job.nextRunAt, updatedAt, timezone, job.enabled)}`,
+          job.lastError === undefined ? undefined : `Last error: ${boundedSummary(job.lastError)}`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        tone: job.lastError === undefined ? (job.enabled ? "default" : "muted") : "danger",
+      };
+    }),
     actions: [
-      ...visible.flatMap((job, index) => [
-        {
-          id: `${job.enabled ? "pause" : "resume"}${index}`,
-          label: `${job.enabled ? "Pause" : "Resume"} · ${boundedSummary(job.name).slice(0, 32)}`,
-          command: `/${job.enabled ? "job_pause" : "job_resume"} ${job.id}`,
+      ...visible.map((job, index) => ({
+        id: `job${index}`,
+        label: boundedSummary(job.name).slice(0, 32),
+        command: `/job ${job.id}`,
+      })),
+      {
+        id: "create",
+        label: "Create schedule",
+        input: {
+          title: "Create schedule",
+          prompt: "Reply with what you want to schedule (e.g. 'Every morning at 9am summarize PRs').",
+          command: "/schedule_create",
         },
-        {
-          id: `run${index}`,
-          label: `Run now · ${boundedSummary(job.name).slice(0, 32)}`,
-          command: `/job_run ${job.id}`,
-          style: "primary" as const,
+      },
+      { id: "home", label: "← Home", command: "/home" },
+    ],
+    updatedAt,
+  };
+}
+
+export function scheduledJobDetailSemanticView(job: ScheduledJob, version: number, updatedAt: number): SemanticView {
+  return {
+    schemaVersion: 1,
+    id: "home",
+    kind: "decision",
+    version,
+    state: "waiting",
+    title: `${job.enabled ? "🟢" : "⏸"} ${job.name}`,
+    summary: job.prompt ? boundedSummary(job.prompt) : "Schedule details",
+    sections: [
+      { id: "schedule", label: "Schedule", text: formatHumanSchedule(job.schedule) },
+      {
+        id: "next",
+        label: "Next run",
+        text: formatFriendlyNextRun(
+          job.nextRunAt,
+          updatedAt,
+          job.schedule.kind === "cron" ? job.schedule.timezone : undefined,
+          job.enabled,
+        ),
+      },
+      {
+        id: "status",
+        label: "Status",
+        text: `${job.enabled ? "Active" : "Paused"} · ${job.successCount} succeeded, ${job.failureCount} failed`,
+      },
+      ...(job.lastError === undefined
+        ? []
+        : [{ id: "error", label: "Last error", text: boundedSummary(job.lastError), tone: "danger" as const }]),
+    ],
+    actions: [
+      { id: "run", label: "Run now", command: `/job_run ${job.id}`, style: "primary" as const },
+      {
+        id: job.enabled ? "pause" : "resume",
+        label: job.enabled ? "Pause" : "Resume",
+        command: `/${job.enabled ? "job_pause" : "job_resume"} ${job.id}`,
+      },
+      {
+        id: "edit",
+        label: "Edit",
+        input: {
+          title: `Edit ${job.name}`,
+          prompt: "Reply with the updated schedule instructions or cron expression.",
+          command: "/job_edit",
         },
-        {
-          id: `delete${index}`,
-          label: `Delete · ${boundedSummary(job.name).slice(0, 32)}`,
-          command: `/job_delete ${job.id}`,
-          style: "danger" as const,
-        },
-      ]),
-      { id: "back", label: "Back to Home", command: "/home" },
+      },
+      { id: "delete", label: "Delete", command: `/job_delete_confirm ${job.id}`, style: "danger" as const },
+      { id: "back", label: "← Back", command: "/schedules" },
+    ],
+    updatedAt,
+  };
+}
+
+export function scheduledJobDeleteConfirmSemanticView(
+  job: ScheduledJob,
+  version: number,
+  updatedAt: number,
+): SemanticView {
+  return {
+    schemaVersion: 1,
+    id: "home",
+    kind: "decision",
+    version,
+    state: "waiting",
+    title: "Delete schedule?",
+    summary: `Delete "${job.name}" permanently?`,
+    sections: [
+      {
+        id: "warning",
+        text: "This schedule will be permanently deleted.",
+        tone: "danger",
+      },
+    ],
+    actions: [
+      { id: "delete", label: "Delete schedule", command: `/job_delete ${job.id}`, style: "danger" as const },
+      { id: "cancel", label: "Cancel", command: `/job ${job.id}` },
+    ],
+    updatedAt,
+  };
+}
+
+export function scheduledJobDeleteSettledSemanticView(
+  jobName: string,
+  version: number,
+  updatedAt: number,
+): SemanticView {
+  return {
+    schemaVersion: 1,
+    id: "home",
+    kind: "decision",
+    version,
+    state: "completed",
+    title: "Delete schedule?",
+    summary: `"${jobName}" has been deleted.`,
+    sections: [{ id: "settled", text: "✅ Deleted", tone: "success" as const }],
+    actions: [
+      { id: "schedules", label: "🗓 Schedules", command: "/schedules" },
+      { id: "home", label: "Back to Home", command: "/home" },
     ],
     updatedAt,
   };
@@ -484,44 +600,93 @@ export function scheduledJobsSemanticView(
 
 export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
   const state = input.state;
-  const model = `${state?.model?.provider ?? "?"}/${state?.model?.id ?? "?"}`;
-  const session = state?.sessionName?.trim() || state?.sessionId || "Starting";
-  const status = state?.isStreaming ? "Running" : state?.isCompacting ? "Compacting" : "Idle";
-  const statusEmoji = state?.isStreaming ? "🟡" : state?.isCompacting ? "🟣" : "🟢";
-  const context = state?.contextUsage?.percent;
-  const contextText =
-    typeof context === "number" && Number.isFinite(context) ? `${Math.round(context)}% context` : undefined;
-  const queueText = typeof state?.queuedMessageCount === "number" ? `${state.queuedMessageCount} queued` : undefined;
+  const isBusy = input.activeTask !== undefined || state?.isStreaming === true;
+  if (isBusy) {
+    const startedAt = input.activeTask?.startedAt ?? input.updatedAt;
+    const elapsed = elapsedText(startedAt, input.updatedAt);
+    const title = input.activeTask?.title || state?.sessionName?.trim() || "Active task";
+    return {
+      schemaVersion: 1,
+      id: "home",
+      kind: "home",
+      version: input.version,
+      state: "active",
+      title: `🟡 Working · ${elapsed}`,
+      summary: title,
+      sections: input.activeTask?.currentStep ? [{ id: "step", text: input.activeTask.currentStep }] : [],
+      actions: [
+        { id: "tasks", label: "📋 Open task", command: "/tasks" },
+        { id: "stop", label: "🛑 Stop", command: "/stop", style: "danger" as const },
+      ],
+      updatedAt: input.updatedAt,
+    };
+  }
+
+  const session = state?.sessionName?.trim() || state?.sessionId || "New chat";
+  const modelName = friendlyModelName(state?.model);
+  const reasoning = reasoningLabel(state?.thinkingLevel);
   return {
     schemaVersion: 1,
     id: "home",
     kind: "home",
     version: input.version,
-    state: state?.isStreaming || state?.isCompacting ? "active" : "waiting",
-    title: `${statusEmoji} OmpClaw · ${status}`,
+    state: "waiting",
+    title: "🟢 Ready",
     summary: session,
     sections: [
-      { id: "session", label: "Session", text: [contextText, queueText].filter(Boolean).join(" · ") || "Ready" },
-      { id: "model", label: "Model", text: model },
-      { id: "mode", label: "Mode", text: `${input.autonomyLabel} · ${state?.thinkingLevel ?? "inherit"}` },
       {
-        id: "controls",
-        label: "Controls",
-        text: `Fast ${state?.fastModeEnabled ? "on" : "off"} · Auto-compact ${state?.autoCompactionEnabled ? "on" : "off"}`,
-        tone: "muted",
+        id: "settings",
+        text: `${modelName} · ${reasoning}\nPermissions: ${input.autonomyLabel}`,
       },
     ],
     actions: [
-      { id: "status", label: "📊 Status", command: "/status" },
+      { id: "new", label: "✨ New chat", command: "/new", style: "primary" as const },
       { id: "model", label: "🤖 Model", command: "/model" },
-      { id: "autonomy", label: "🛡 Autonomy", command: "/autonomy" },
+      { id: "permissions", label: "🛡 Permissions", command: "/permissions" },
       { id: "thinking", label: "🧠 Reasoning", command: "/thinking" },
-      { id: "fast", label: "⚡ Fast mode", command: "/fast" },
-      { id: "autocompact", label: "🗜 Auto-compact", command: "/autocompact" },
       { id: "tasks", label: "📋 Tasks", command: "/tasks" },
-      { id: "jobs", label: "🗓 Jobs", command: "/jobs" },
-      { id: "new", label: "✨ New session", command: "/new", style: "primary" },
-      ...(state?.isStreaming ? [{ id: "stop", label: "🛑 Stop", command: "/stop", style: "danger" as const }] : []),
+      { id: "schedules", label: "🗓 Schedules", command: "/schedules" },
+      { id: "fast", label: state?.fastModeEnabled ? "⚡ Fast: On" : "⚡ Fast: Off", command: "/fast" },
+      { id: "more", label: "⚙️ More", command: "/more" },
+    ],
+    updatedAt: input.updatedAt,
+  };
+}
+
+export function moreSemanticView(input: HomeSemanticViewInput): SemanticView {
+  const state = input.state;
+  const session = state?.sessionName?.trim() || state?.sessionId || "New chat";
+  const context = state?.contextUsage?.percent;
+  const contextPercent =
+    typeof context === "number" && Number.isFinite(context) ? `${Math.round(context)}% context` : "Context: unknown";
+  const tokens = state?.contextUsage?.tokens;
+  const contextWindow = state?.contextUsage?.contextWindow;
+  const contextDetails =
+    tokens != null && contextWindow != null
+      ? ` (${tokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens)`
+      : "";
+  const queueText = `${state?.queuedMessageCount ?? 0} queued`;
+  return {
+    schemaVersion: 1,
+    id: "home",
+    kind: "decision",
+    version: input.version,
+    state: "waiting",
+    title: "⚙️ More",
+    summary: session,
+    sections: [
+      { id: "context", label: "Context", text: `${contextPercent}${contextDetails}` },
+      { id: "autocompact", label: "Auto-compact", text: state?.autoCompactionEnabled ? "Enabled" : "Disabled" },
+      { id: "queue", label: "Queue", text: queueText },
+      { id: "session", label: "Session ID", text: state?.sessionId ?? "None" },
+    ],
+    actions: [
+      {
+        id: "autocompact",
+        label: state?.autoCompactionEnabled ? "🗜 Auto-compact: On" : "🗜 Auto-compact: Off",
+        command: "/autocompact",
+      },
+      { id: "home", label: "← Home", command: "/home" },
     ],
     updatedAt: input.updatedAt,
   };

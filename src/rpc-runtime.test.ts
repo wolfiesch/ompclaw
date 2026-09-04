@@ -1466,7 +1466,7 @@ describe("RpcGatewayRuntime", () => {
     expect(home).toMatchObject({
       type: "semantic_view",
       view: {
-        title: "🟢 OmpClaw · Idle",
+        title: "🟢 Ready",
         actions: expect.arrayContaining([{ id: "model", label: "🤖 Model", command: "/model" }]),
       },
     });
@@ -1515,7 +1515,7 @@ describe("RpcGatewayRuntime", () => {
     expect(
       deliveries.filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view").at(-1)
         ?.request,
-    ).toMatchObject({ type: "semantic_view", view: { title: "🟢 OmpClaw · Idle" } });
+    ).toMatchObject({ type: "semantic_view", view: { title: "🟢 Ready" } });
     await runtime.stop();
   });
 
@@ -1541,8 +1541,8 @@ describe("RpcGatewayRuntime", () => {
       expect(home).toMatchObject({
         type: "semantic_view",
         view: {
-          sections: expect.arrayContaining([{ id: "mode", label: "Mode", text: `${label} · inherit` }]),
-          actions: expect.arrayContaining([{ id: "autonomy", label: "🛡 Autonomy", command: "/autonomy" }]),
+          sections: expect.arrayContaining([{ id: "settings", text: expect.stringContaining(label) }]),
+          actions: expect.arrayContaining([{ id: "permissions", label: "🛡 Permissions", command: "/permissions" }]),
         },
       });
 

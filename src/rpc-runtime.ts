@@ -42,6 +42,10 @@ import {
   informationSemanticView,
   modelPageSemanticView,
   modelProviderSemanticView,
+  moreSemanticView,
+  scheduledJobDeleteConfirmSemanticView,
+  scheduledJobDeleteSettledSemanticView,
+  scheduledJobDetailSemanticView,
   scheduledJobsSemanticView,
   sessionChoiceSemanticView,
   taskHistorySemanticView,
@@ -770,18 +774,20 @@ export class RpcGatewayRuntime {
       if (name === "start") await reply(assistantWelcome());
       else if (name === "help") await reply(runtimeHelp(this.#options.config.allowRpcBash));
       else if (name === "home") await this.#homeCommand(delivery);
+      else if (name === "more") await this.#moreCommand(delivery);
       else if (name === "status") {
         const now = this.#now();
         await this.#presentSemanticView(
           delivery,
           informationSemanticView("Session status", await this.statusText(), now, now),
         );
-      } else if (name === "stop") {
+      }
+      else if (name === "stop") {
         await this.#sendRpc({ type: "abort" });
         await reply("Stop requested.");
       } else if (name === "new") {
         const created = await this.newSession();
-        await reply(created ? "Started a new OMP session." : "New session cancelled.");
+        await reply(created ? "Started a new chat." : "New chat cancelled.");
       } else if (name === "steer" || name === "followup") {
         if (!args) await reply(`Usage: /${name} <message>`);
         else {
@@ -793,7 +799,7 @@ export class RpcGatewayRuntime {
         await this.#refreshState();
         await reply("Compaction complete.");
       } else if (name === "model") await this.#modelCommand(delivery, args, reply);
-      else if (name === "autonomy") await this.#autonomyCommand(delivery, args, reply);
+      else if (name === "autonomy" || name === "permissions") await this.#autonomyCommand(delivery, args, reply, name);
       else if (name === "thinking") await this.#thinkingCommand(delivery, args, reply);
       else if (name === "fast")
         await this.#booleanCommand(delivery, "set_fast_mode", args, this.#status.state?.fastModeEnabled, reply);
@@ -813,21 +819,61 @@ export class RpcGatewayRuntime {
       else if (name === "todos") await reply(this.#todosText());
       else if (name === "subagents") await this.#subagentsCommand(reply);
       else if (name === "commands") await this.#commandsCommand(reply);
-      else if (name === "jobs") await this.#jobsCommand(delivery, reply);
-      else if (name === "job_pause" || name === "job_resume" || name === "job_run" || name === "job_delete") {
+      else if (name === "jobs" || name === "schedules") await this.#jobsCommand(delivery, reply);
+      else if (name === "job" || name === "schedule") await this.#jobDetailCommand(delivery, args.trim(), reply);
+      else if (name === "job_delete_confirm") await this.#jobDeleteConfirmCommand(delivery, args.trim(), reply);
+      else if (name === "schedule_create") {
+        if (args.trim()) {
+          await this.handleInbound({
+            id: `cmd-${this.#now()}`,
+            sentAt: this.#now(),
+            identity: delivery.identity,
+            principal: delivery.deliveryContext.principal,
+            address: delivery.address,
+            content: { text: args.trim() },
+          });
+        } else {
+          await reply("Usage: /schedule_create <instructions>");
+        }
+      } else if (name === "job_edit") {
+        const parts = args.trim().split(/\s+/);
+        const id = parts[0];
+        const instruction = parts.slice(1).join(" ");
+        if (id && instruction) {
+          await this.handleInbound({
+            id: `cmd-${this.#now()}`,
+            sentAt: this.#now(),
+            identity: delivery.identity,
+            principal: delivery.deliveryContext.principal,
+            address: delivery.address,
+            content: { text: `Update scheduled job ${id}: ${instruction}` },
+          });
+        } else {
+          await reply("Usage: /job_edit <job id> <instructions>");
+        }
+      } else if (name === "job_pause" || name === "job_resume" || name === "job_run" || name === "job_delete") {
         const automation = this.#options.automation;
         if (automation === undefined) await reply("OmpClaw automation is disabled.");
         else if (!args) await reply(`Usage: /${name} <job id>`);
         else {
           const principalId = delivery.deliveryContext.principal.id;
+          const jobId = args.trim();
           if (name === "job_delete") {
-            if (!automation.remove(args, principalId)) {
-              await reply(`Scheduled job ${args} was not found.`);
+            const job = automation.list(principalId).find((j) => j.id === jobId);
+            const jobName = job?.name ?? jobId;
+            if (!automation.remove(jobId, principalId)) {
+              await reply(`Scheduled job ${jobId} was not found.`);
               return true;
             }
-          } else if (name === "job_run") automation.runNow(args, principalId);
-          else automation.setEnabled(args, principalId, name === "job_resume");
-          await this.#jobsCommand(delivery, reply);
+            const now = this.#now();
+            await this.#presentSemanticView(delivery, scheduledJobDeleteSettledSemanticView(jobName, now, now));
+          } else if (name === "job_run") {
+            automation.runNow(jobId, principalId);
+            await this.#jobDetailCommand(delivery, jobId, reply);
+          } else {
+            automation.setEnabled(jobId, principalId, name === "job_resume");
+            await this.#jobDetailCommand(delivery, jobId, reply);
+          }
         }
       } else if (name === "history") await this.#historyCommand(args, reply);
       else if (name === "branch") await this.#branchCommand(args, reply);
@@ -882,9 +928,36 @@ export class RpcGatewayRuntime {
   async #homeCommand(delivery: GatewayTurnTarget): Promise<void> {
     await this.#refreshState();
     const now = this.#now();
+    const active = this.#activeTurn;
+    const isStreaming = this.#status.state?.isStreaming === true;
+    const isBusy = active !== undefined || isStreaming;
+    const activeTask = isBusy
+      ? {
+          title: active?.lifecycle?.prompt ?? this.#status.state?.sessionName?.trim() ?? "Active task",
+          startedAt: active?.lifecycle?.createdAt ?? now,
+          currentStep: active?.activities?.findLast?.((a) => a.state === "active")?.text ?? this.#status.currentTool,
+        }
+      : undefined;
+
     await this.#presentSemanticView(
       delivery,
       homeSemanticView({
+        state: this.#status.state,
+        autonomyMode: this.#options.config.autonomyMode,
+        autonomyLabel: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode],
+        activeTask,
+        version: now,
+        updatedAt: now,
+      }),
+    );
+  }
+
+  async #moreCommand(delivery: GatewayTurnTarget): Promise<void> {
+    await this.#refreshState();
+    const now = this.#now();
+    await this.#presentSemanticView(
+      delivery,
+      moreSemanticView({
         state: this.#status.state,
         autonomyMode: this.#options.config.autonomyMode,
         autonomyLabel: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode],
@@ -905,6 +978,46 @@ export class RpcGatewayRuntime {
       delivery,
       scheduledJobsSemanticView(automation.list(delivery.deliveryContext.principal.id), now, now),
     );
+  }
+
+  async #jobDetailCommand(
+    delivery: GatewayTurnTarget,
+    id: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const automation = this.#options.automation;
+    if (automation === undefined) {
+      await reply("OmpClaw automation is disabled.");
+      return;
+    }
+    const principalId = delivery.deliveryContext.principal.id;
+    const job = automation.list(principalId).find((j) => j.id === id);
+    if (!job) {
+      await reply(`Scheduled job ${id} was not found.`);
+      return;
+    }
+    const now = this.#now();
+    await this.#presentSemanticView(delivery, scheduledJobDetailSemanticView(job, now, now));
+  }
+
+  async #jobDeleteConfirmCommand(
+    delivery: GatewayTurnTarget,
+    id: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const automation = this.#options.automation;
+    if (automation === undefined) {
+      await reply("OmpClaw automation is disabled.");
+      return;
+    }
+    const principalId = delivery.deliveryContext.principal.id;
+    const job = automation.list(principalId).find((j) => j.id === id);
+    if (!job) {
+      await reply(`Scheduled job ${id} was not found.`);
+      return;
+    }
+    const now = this.#now();
+    await this.#presentSemanticView(delivery, scheduledJobDeleteConfirmSemanticView(job, now, now));
   }
 
   async #modelCommand(
@@ -1010,21 +1123,25 @@ export class RpcGatewayRuntime {
     delivery: GatewayTurnTarget,
     args: string,
     reply: (text: string) => Promise<void>,
+    commandName = "permissions",
   ): Promise<void> {
     const selection = args.trim();
+    const isPermissions = commandName === "permissions";
+    const commandPrefix = isPermissions ? "/permissions" : "/autonomy";
+    const label = isPermissions ? "Permissions" : "Autonomy";
     if (!selection) {
       const current = this.#options.config.autonomyMode;
       const now = this.#now();
       await this.#presentSemanticView(
         delivery,
         sessionChoiceSemanticView({
-          title: "Choose autonomy mode",
+          title: isPermissions ? "Choose permissions mode" : "Choose autonomy mode",
           summary: "Governs whether OMP requests tool approval or runs autonomously.",
           choices: AUTONOMY_MODES.map((mode) => ({
             id: mode,
             label: AUTONOMY_MODE_LABELS[mode],
             description: AUTONOMY_MODE_DESCRIPTIONS[mode],
-            command: `/autonomy ${mode}`,
+            command: `${commandPrefix} ${mode}`,
             selected: mode === current,
           })),
           version: now,
@@ -1037,7 +1154,7 @@ export class RpcGatewayRuntime {
       const now = this.#now();
       await this.#presentSemanticView(
         delivery,
-        informationSemanticView("Autonomy", autonomyText(this.#options.config.autonomyMode), now, now),
+        informationSemanticView(label, autonomyText(this.#options.config.autonomyMode, label), now, now),
       );
       return;
     }
@@ -1051,11 +1168,11 @@ export class RpcGatewayRuntime {
       return;
     }
     if (mode === this.#options.config.autonomyMode) {
-      await reply(`Autonomy is already set to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
+      await reply(`${label} is already set to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
       return;
     }
     await this.setAutonomyMode(mode);
-    await reply(`Autonomy switched to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
+    await reply(`${label} switched to ${AUTONOMY_MODE_LABELS[mode]} (${mode}).`);
     await this.#homeCommand(delivery);
   }
 
@@ -1102,26 +1219,15 @@ export class RpcGatewayRuntime {
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
     const selection = args;
-    const label = command === "set_fast_mode" ? "Fast mode" : "Auto-compaction";
-    if (!selection) {
-      const commandName = command === "set_fast_mode" ? "fast" : "autocompact";
-      const now = this.#now();
-      await this.#presentSemanticView(
-        delivery,
-        sessionChoiceSemanticView({
-          title: label,
-          summary:
-            command === "set_fast_mode"
-              ? "Fast mode favors lower-latency responses."
-              : "Auto-compaction keeps long sessions within their context window.",
-          choices: [
-            { id: "on", label: "On", command: `/${commandName} on`, selected: current === true },
-            { id: "off", label: "Off", command: `/${commandName} off`, selected: current !== true },
-          ],
-          version: now,
-          updatedAt: now,
-        }),
-      );
+    if (!selection || selection === "toggle") {
+      const next = !current;
+      await this.#sendRpc({ type: command, enabled: next });
+      await this.#refreshState();
+      if (command === "set_auto_compaction") {
+        await this.#moreCommand(delivery);
+      } else {
+        await this.#homeCommand(delivery);
+      }
       return;
     }
     if (selection !== "on" && selection !== "off") {
@@ -1130,7 +1236,11 @@ export class RpcGatewayRuntime {
     }
     await this.#sendRpc({ type: command, enabled: selection === "on" });
     await this.#refreshState();
-    await this.#homeCommand(delivery);
+    if (command === "set_auto_compaction") {
+      await this.#moreCommand(delivery);
+    } else {
+      await this.#homeCommand(delivery);
+    }
   }
 
   async #retryCommand(args: string, reply: (text: string) => Promise<void>): Promise<void> {

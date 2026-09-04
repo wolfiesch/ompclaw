@@ -6,12 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Redesign Telegram Home control surface with distinct Idle ("🟢 Ready", hero session title, combined model and reasoning settings, and direct state-exposing Fast toggle) and Busy ("🟡 Working · <elapsed>", active task title, current step, Open task, and single-tap Stop) states, moving context details, auto-compaction, queue size, and session identifiers under a More sub-surface.
+- Humanize scheduled job rules and next runs with local natural-language cron formatting ("Every day at 9:00 AM", "Every weekday at 9:00 AM", "Every 30 minutes") with exotic-expression fallback, and relative run times with friendly timezone names ("in 45 min", "Today at 9:00 AM Pacific", "Tomorrow at 9:00 AM Pacific").
+- Add Schedule Detail surface with state-exposing Pause/Resume, Run now, Edit, and a dedicated confirmation card for Schedule Delete that settles in-message.
 - Replace Telegram approval prompts with in-message decision cards that visibly settle approved, denied, or expired requests; long OMP clarifications use numbered choices and a correlated typed “Other answer”.
 - Add paginated Telegram model cards that choose a provider before its models, retain the current selection, and return to the same message on navigation.
 - Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
 - Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
 - Add table-driven native Telegram media dispatch for outbound attachments, sending audio (`sendAudio`), voice notes (`sendVoice`), video (`sendVideo`), animations (`sendAnimation`), photos (`sendPhoto`), and documents (`sendDocument`) by MIME type and file extension, with native `sendMediaGroup` grouping for visual and audio sets and automatic fallback to documents for mixed media batches.
 
+### Changed
+
+- Rename user-facing controls and commands: Jobs → Schedules, Autonomy → Permissions, and New session → New chat.
 ### Fixed
 
 - Always finalize a Telegram task with a visible outcome when OMP omits its terminal assistant text, while retaining the existing safeguard that prevents an empty response from activating an armed update.
