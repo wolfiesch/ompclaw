@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add agent-authored `ompclaw_watch` host tool to create recurring check-and-notify jobs directly from conversation context with `everyMinutes` or `cron` schedule, delivering turn results back to the requesting chat.
 - Replace Telegram approval prompts with in-message decision cards that visibly settle approved, denied, or expired requests; long OMP clarifications use numbered choices and a correlated typed “Other answer”.
 - Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
 - Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.

@@ -121,6 +121,7 @@ describe("gateway host tools", () => {
       "ompclaw_react",
       "ompclaw_ask",
       "ompclaw_schedule_job",
+      "ompclaw_watch",
       "ompclaw_update_job",
       "ompclaw_list_jobs",
       "ompclaw_set_job_enabled",
@@ -297,6 +298,249 @@ describe("gateway host tools", () => {
       jobs: [expect.stringContaining("job-1")],
     });
     await expect(executeGatewayHostTool(hostToolCall("ompclaw_delete_job", { id: "job-1" }), context)).resolves.toEqual({ deleted: true });
+  });
+
+  test("watch creates a job with watch: name prefix and requesting address context, validated schedule, and deletes via existing job tools", async () => {
+    let capturedContext: Parameters<GatewayAutomationControl["create"]>[1] | undefined;
+    let capturedInput: Parameters<GatewayAutomationControl["create"]>[0] | undefined;
+    let deletedId: string | undefined;
+    let deletedPrincipal: string | undefined;
+    const watchJob = {
+      id: "watch-job-42",
+      principalId: deliveryContext.principal.id,
+      identity,
+      address,
+      name: "watch: PR 100 CI",
+      prompt: "Check CI status and alert if failing",
+      schedule: { kind: "cron", expression: "*/5 * * * *" } as const,
+      enabled: true,
+      nextRunAt: Date.parse("2026-08-31T09:05:00Z"),
+      attemptCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      createdAt: Date.parse("2026-08-31T09:00:00Z"),
+      updatedAt: Date.parse("2026-08-31T09:00:00Z"),
+    };
+    const automation: GatewayAutomationControl = {
+      create(input, context) {
+        capturedInput = input;
+        capturedContext = context;
+        return { ...watchJob, name: input.name, prompt: input.prompt };
+      },
+      update() {
+        return watchJob;
+      },
+      remove(id, principalId) {
+        deletedId = id;
+        deletedPrincipal = principalId;
+        return id === watchJob.id && principalId === deliveryContext.principal.id;
+      },
+      setEnabled() {
+        return watchJob;
+      },
+      runNow() {
+        return watchJob;
+      },
+      list(principalId) {
+        return principalId === deliveryContext.principal.id ? [watchJob] : [];
+      },
+    };
+    const { context } = harness(undefined, automation);
+
+    // 1. Create watch job with everyMinutes
+    const result = await executeGatewayHostTool(
+      hostToolCall("ompclaw_watch", {
+        name: "PR 100 CI",
+        prompt: "Check CI status and alert if failing",
+        everyMinutes: 5,
+      }),
+      context,
+    );
+    expect(result).toEqual({
+      id: "watch-job-42",
+      name: "watch: PR 100 CI",
+      job: expect.stringContaining("watch: PR 100 CI"),
+    });
+    expect(capturedInput).toEqual({
+      name: "watch: PR 100 CI",
+      prompt: "Check CI status and alert if failing",
+      cron: "*/5 * * * *",
+    });
+    expect(capturedContext).toEqual({ principal: deliveryContext.principal, identity, address });
+
+    // Also supports "watch" toolName alias
+    const aliasResult = await executeGatewayHostTool(
+      hostToolCall("watch", {
+        name: "PR 100 CI",
+        prompt: "Check CI status and alert if failing",
+        everyMinutes: 5,
+      }),
+      context,
+    );
+    expect(aliasResult).toEqual({
+      id: "watch-job-42",
+      name: "watch: PR 100 CI",
+      job: expect.stringContaining("watch: PR 100 CI"),
+    });
+
+    // Preserves existing "watch: " prefix without doubling
+    await executeGatewayHostTool(
+      hostToolCall("ompclaw_watch", {
+        name: "watch: already prefixed",
+        prompt: "Check thing",
+        everyMinutes: 1,
+      }),
+      context,
+    );
+    expect(capturedInput?.name).toBe("watch: already prefixed");
+
+    // Supports cron and timezone
+    await executeGatewayHostTool(
+      hostToolCall("ompclaw_watch", {
+        name: "custom cron watch",
+        prompt: "Nightly watch",
+        cron: "0 2 * * *",
+        timezone: "UTC",
+      }),
+      context,
+    );
+    expect(capturedInput).toEqual({
+      name: "watch: custom cron watch",
+      prompt: "Nightly watch",
+      cron: "0 2 * * *",
+      timezone: "UTC",
+    });
+
+    // Verify list and deletion via existing job tools
+    await expect(executeGatewayHostTool(hostToolCall("ompclaw_list_jobs", {}), context)).resolves.toEqual({
+      jobs: [expect.stringContaining("watch-job-42")],
+    });
+    await expect(
+      executeGatewayHostTool(hostToolCall("ompclaw_delete_job", { id: "watch-job-42" }), context),
+    ).resolves.toEqual({ deleted: true });
+    expect(deletedId).toBe("watch-job-42");
+    expect(deletedPrincipal).toBe(deliveryContext.principal.id);
+
+    // Exclusivity validation errors: both or neither everyMinutes and cron
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", {
+          name: "both",
+          prompt: "check",
+          everyMinutes: 5,
+          cron: "*/5 * * * *",
+        }),
+        context,
+      ),
+    ).rejects.toThrow("Specify exactly one of everyMinutes or cron");
+
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", {
+          name: "neither",
+          prompt: "check",
+        }),
+        context,
+      ),
+    ).rejects.toThrow("Specify exactly one of everyMinutes or cron");
+
+    // Invalid everyMinutes
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "test", prompt: "check", everyMinutes: 0 }),
+        context,
+      ),
+    ).rejects.toThrow("everyMinutes must be a positive integer");
+
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "test", prompt: "check", everyMinutes: -3 }),
+        context,
+      ),
+    ).rejects.toThrow("everyMinutes must be a positive integer");
+
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "test", prompt: "check", everyMinutes: 2.5 }),
+        context,
+      ),
+    ).rejects.toThrow("everyMinutes must be a positive integer");
+
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "test", prompt: "check", everyMinutes: 90 }),
+        context,
+      ),
+    ).rejects.toThrow("everyMinutes must be between 1 and 60");
+
+    // Invalid cron
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "test", prompt: "check", cron: "not-a-cron-expression" }),
+        context,
+      ),
+    ).rejects.toThrow("Invalid cron schedule");
+
+    // Invalid name
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "", prompt: "check", everyMinutes: 5 }),
+        context,
+      ),
+    ).rejects.toThrow("name must not be empty");
+
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "   ", prompt: "check", everyMinutes: 5 }),
+        context,
+      ),
+    ).rejects.toThrow("name must not be empty");
+
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "a".repeat(120), prompt: "check", everyMinutes: 5 }),
+        context,
+      ),
+    ).rejects.toThrow("name must be at most 113 characters");
+
+    // Invalid prompt
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "valid", prompt: "", everyMinutes: 5 }),
+        context,
+      ),
+    ).rejects.toThrow("prompt must not be empty");
+
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "valid", prompt: "   ", everyMinutes: 5 }),
+        context,
+      ),
+    ).rejects.toThrow("prompt must not be empty");
+
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "valid", prompt: "a".repeat(16_001), everyMinutes: 5 }),
+        context,
+      ),
+    ).rejects.toThrow("16000 characters");
+
+    // Invalid timezone
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "valid", prompt: "check", cron: "0 * * * *", timezone: "Fake/Timezone" }),
+        context,
+      ),
+    ).rejects.toThrow("Invalid IANA timezone");
+
+    // Gating: automation disabled
+    const { context: disabledContext } = harness();
+    await expect(
+      executeGatewayHostTool(
+        hostToolCall("ompclaw_watch", { name: "test", prompt: "check", everyMinutes: 5 }),
+        disabledContext,
+      ),
+    ).rejects.toThrow("OmpClaw automation is disabled");
   });
 
   test("stages and arms updates only for an authenticated operator", async () => {
