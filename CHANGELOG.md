@@ -15,9 +15,14 @@ All notable changes to this project will be documented in this file.
 - Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
 - Add table-driven native Telegram media dispatch for outbound attachments, sending audio (`sendAudio`), voice notes (`sendVoice`), video (`sendVideo`), animations (`sendAnimation`), photos (`sendPhoto`), and documents (`sendDocument`) by MIME type and file extension, with native `sendMediaGroup` grouping for visual and audio sets and automatic fallback to documents for mixed media batches.
 
+- Add a single durable Telegram pairing journey card that updates in place for approval, rejection, expiry, retry, connected Home access, and dismissible command examples.
+- Print the bot's `https://t.me/<botusername>` deep link during successful interactive setup.
+- Refresh the Telegram Bot API description and short description at setup and gateway startup, plus a derivable friendly name without making profile API failures fatal.
+
 ### Changed
 
 - Rename user-facing controls and commands: Jobs → Schedules, Autonomy → Permissions, and New session → New chat.
+
 ### Fixed
 
 - Always finalize a Telegram task with a visible outcome when OMP omits its terminal assistant text, while retaining the existing safeguard that prevents an empty response from activating an armed update.

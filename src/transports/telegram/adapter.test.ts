@@ -64,6 +64,25 @@ describe("Telegram transport lifecycle", () => {
     await adapter.stop();
   });
 
+  test("refreshes the Bot API profile without blocking startup on a rejected update", async () => {
+    const { calls, poller, warnings } = await fixture({
+      botIdentity: { first_name: "OmpClaw" },
+      botProfileError: new Error("profile unavailable"),
+    });
+    expect(calls.map((call) => call.method)).toContain("getMe");
+    expect(calls.map((call) => call.method)).toEqual(
+      expect.arrayContaining(["setMyDescription", "setMyShortDescription", "setMyName"]),
+    );
+    expect(poller.started).toBe(true);
+    expect(warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("bot profile setMyDescription failed: profile unavailable"),
+        expect.stringContaining("bot profile setMyShortDescription failed: profile unavailable"),
+        expect.stringContaining("bot profile setMyName failed: profile unavailable"),
+      ]),
+    );
+  });
+
   test("stops polling when pairing approval monitor startup fails", async () => {
     const poller = new TelegramTestPoller();
     await expect(
@@ -187,7 +206,7 @@ describe("Telegram typing", () => {
 
     await adapter.typing(address, context);
 
-    expect(calls).toEqual([
+    expect(calls.filter((call) => call.method === "sendChatAction")).toEqual([
       {
         method: "sendChatAction",
         payload: { chat_id: "-100", message_thread_id: 19, action: "typing" },
@@ -483,16 +502,10 @@ describe("Telegram inbound conversion", () => {
         requests.splice(0, requests.length, request);
         return { status: "created" as const, result: { code: "ABCD2345", request } };
       },
+      list: () => requests,
       listUnconfirmedApprovals: () => requests.filter((request) => request.state === "approved"),
-      completeConfirmation: (identity: PairingRequestView["identity"]) => {
-        const index = requests.findIndex(
-          (request) =>
-            request.identity.transport === identity.transport &&
-            request.identity.account === identity.account &&
-            request.identity.subject === identity.subject,
-        );
-        if (index < 0) return false;
-        requests.splice(index, 1);
+      completeConfirmation: () => {
+        if (confirmationsCompleted > 0) return false;
         confirmationsCompleted += 1;
         return true;
       },
@@ -508,8 +521,14 @@ describe("Telegram inbound conversion", () => {
     });
 
     expect(harness.received).toEqual([]);
-    expect(sentMessage(harness.calls).payload.text).toContain("Pairing code: ABCD2345");
-    expect(sentMessage(harness.calls).payload.text).toContain("ompclaw pairing-approve ABCD2345");
+    const welcome = sentMessage(harness.calls).payload;
+    expect(welcome.text).toContain("Welcome to OmpClaw");
+    expect(welcome.text).toContain("not authorized yet");
+    expect(welcome.text).toContain("Pairing request: sent");
+    expect(welcome.text).toContain("Pairing code: ABCD2345");
+    expect(welcome.text).toContain(
+      "The gateway operator must approve this request. This message updates automatically.",
+    );
 
     pairedPrincipal = { id: "operator:telegram:primary:99", roles: ["operator"] };
     requests[0] = {
@@ -519,19 +538,104 @@ describe("Telegram inbound conversion", () => {
       principalId: pairedPrincipal.id,
     };
     await harness.flushPairingApprovals();
-    expect(sentMessage(harness.calls).payload.text).toBe("Paired. Send your first task.");
+    const connected = harness.api.last("editMessageText").payload;
+    expect(connected.text).toContain("✅ Connected");
+    expect(connected.text).toContain("messages, voice notes, photos, and files");
+    expect(connected.reply_markup).toEqual({
+      inline_keyboard: [
+        [
+          { text: "Open Home", callback_data: "omppair:home" },
+          { text: "See examples", callback_data: "omppair:examples" },
+        ],
+      ],
+    });
 
+    await harness.adapter.handleUpdate({
+      update_id: 8,
+      callback_query: {
+        id: "examples",
+        from: { id: 99 },
+        data: "omppair:examples",
+        message: message({ message_id: Number(connected.message_id) }),
+      },
+    });
+    expect(harness.api.last("editMessageText").payload.text).toContain("Examples");
+    expect(harness.api.last("editMessageText").payload.text).toContain("/home — open the control center");
+
+    await harness.adapter.handleUpdate({
+      update_id: 9,
+      callback_query: {
+        id: "dismiss",
+        from: { id: 99 },
+        data: "omppair:dismiss",
+        message: message({ message_id: Number(connected.message_id) }),
+      },
+    });
+    expect(harness.api.last("editMessageText").payload.text).not.toContain("Examples");
     expect(confirmationsCompleted).toBe(1);
-    const confirmationCount = harness.calls.filter(
-      (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
-    ).length;
     await harness.flushPairingApprovals();
     expect(confirmationsCompleted).toBe(1);
-    expect(
-      harness.calls.filter(
-        (entry) => entry.method === "sendMessage" && entry.payload.text === "Paired. Send your first task.",
-      ),
-    ).toHaveLength(confirmationCount);
+  });
+
+  test("settles rejected and expired pairing cards in place with retry controls", async () => {
+    const requests: PairingRequestView[] = [];
+    let codeNumber = 0;
+    const pairing = {
+      requestFromTransport: (
+        identity: PairingRequestView["identity"],
+        address: PairingRequestView["address"],
+        createdAt: number,
+      ) => {
+        codeNumber += 1;
+        const request: PairingRequestView = {
+          identity,
+          address,
+          state: "pending",
+          failedAttempts: 0,
+          maxAttempts: 5,
+          createdAt,
+          expiresAt: createdAt + 600_000,
+        };
+        requests.splice(0, requests.length, request);
+        return { status: "created" as const, result: { code: `PAIR${codeNumber}`, request } };
+      },
+      list: () => requests,
+      listUnconfirmedApprovals: () => [],
+      completeConfirmation: () => false,
+    };
+    const harness = await fixture({ pairing, resolve: () => undefined });
+    await harness.adapter.handleUpdate({
+      update_id: 10,
+      message: message({ from: { id: 99 }, text: "hello" }),
+    });
+    const sentCount = harness.calls.filter((call) => call.method === "sendMessage").length;
+
+    requests[0] = { ...requests[0]!, state: "rejected", resolvedAt: 1_800_000_000_001 };
+    await harness.flushPairingApprovals();
+    const rejected = harness.api.last("editMessageText").payload;
+    expect(rejected.text).toContain("Pairing request rejected");
+    expect(rejected.reply_markup).toEqual({
+      inline_keyboard: [[{ text: "Retry pairing", callback_data: "omppair:retry" }]],
+    });
+    expect(harness.calls.filter((call) => call.method === "sendMessage")).toHaveLength(sentCount);
+
+    await harness.adapter.handleUpdate({
+      update_id: 11,
+      callback_query: {
+        id: "retry",
+        from: { id: 99 },
+        data: "omppair:retry",
+        message: message({ message_id: Number(rejected.message_id) }),
+      },
+    });
+    requests[0] = { ...requests[0]!, state: "expired", resolvedAt: 1_800_000_000_002 };
+    await harness.flushPairingApprovals();
+    const expired = harness.api.last("editMessageText").payload;
+    expect(expired.text).toContain("Pairing request expired");
+    expect(expired.reply_markup).toEqual({
+      inline_keyboard: [[{ text: "Retry pairing", callback_data: "omppair:retry" }]],
+    });
+    expect(harness.calls.filter((call) => call.method === "sendMessage")).toHaveLength(sentCount);
   });
 
   test("keeps unresolved group senders silent when runtime pairing is enabled", async () => {

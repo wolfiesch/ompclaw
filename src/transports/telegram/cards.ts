@@ -8,6 +8,69 @@ export interface TelegramCardRender {
   readonly inlineKeyboard: readonly (readonly TelegramCardButton[])[];
 }
 
+export type PairingJourneyCardState = "pending" | "connected" | "examples" | "rejected" | "expired";
+
+export interface PairingJourneyCard {
+  readonly state: PairingJourneyCardState;
+  readonly code?: string;
+  readonly expiresIn?: string;
+}
+
+function pairingJourneyText(card: PairingJourneyCard): string {
+  if (card.state === "connected") {
+    return [
+      "✅ Connected",
+      "You can send messages, voice notes, photos, and files to the OMP agent; it can help with each in this chat.",
+    ].join("\n\n");
+  }
+  if (card.state === "examples") {
+    return [
+      "✅ Connected",
+      "You can send messages, voice notes, photos, and files to the OMP agent; it can help with each in this chat.",
+      "Examples",
+      "/home — open the control center\n/status — show session and runtime details\n/tasks — show recent tasks\nSend a photo, voice note, or file with an instruction.",
+    ].join("\n\n");
+  }
+  if (card.state === "rejected") {
+    return [
+      "Pairing request rejected",
+      "The gateway operator did not authorize this Telegram account. You can request a new pairing code.",
+    ].join("\n\n");
+  }
+  if (card.state === "expired") {
+    return ["Pairing request expired", "This pairing code is no longer valid. You can request a new one."].join("\n\n");
+  }
+  return [
+    "Welcome to OmpClaw",
+    "This bot is connected to an OMP agent, but this Telegram account is not authorized yet.",
+    "Pairing request: sent",
+    ...(card.code === undefined ? [] : [`Pairing code: ${card.code}`]),
+    ...(card.expiresIn === undefined ? [] : [`Expires in ${card.expiresIn}.`]),
+    "The gateway operator must approve this request. This message updates automatically.",
+  ].join("\n\n");
+}
+
+/** Renders the durable first-run pairing journey in one mutable message. */
+export function renderPairingJourneyCard(
+  card: PairingJourneyCard,
+  callback: (action: string) => string,
+): TelegramCardRender {
+  const inlineKeyboard: TelegramCardButton[][] =
+    card.state === "connected"
+      ? [
+          [
+            { text: "Open Home", action: callback("home") },
+            { text: "See examples", action: callback("examples") },
+          ],
+        ]
+      : card.state === "examples"
+        ? [[{ text: "Dismiss", action: callback("dismiss") }]]
+        : card.state === "rejected" || card.state === "expired"
+          ? [[{ text: "Retry pairing", action: callback("retry") }]]
+          : [];
+  return { text: pairingJourneyText(card), inlineKeyboard };
+}
+
 export interface PickerCardOption {
   readonly id: string;
   readonly label: string;

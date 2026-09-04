@@ -33,7 +33,7 @@ either file when one already exists. Setup temporarily owns the same per-account
 polling lock used by the runtime. A running gateway or another setup listener
 therefore blocks discovery instead of competing for Telegram updates.
 
-After setup prints that the listener is ready, send the bot a direct, non-topic
+After setup prints the bot's `https://t.me/<botusername>` link and that the listener is ready, send the bot a direct, non-topic
 message from the account to authorize. Messages already queued when the listener
 starts are ignored. The bot acknowledges that local approval is still required.
 Setup shows the Telegram identity locally, stores only a salted hash of a newly
@@ -57,9 +57,9 @@ ompclaw pairing-listen \
 ```
 
 The command prints a new code and local approval command. A running gateway
-provides the normal path: an unknown private sender receives a pairing code and
-the exact local approval command in Telegram. Approval is still performed only
-on the gateway host:
+provides the normal path: an unknown private sender receives one mutable pairing
+card in Telegram with its short-lived code and approval state. Approval is still
+performed only on the gateway host:
 
 ```text
 ompclaw pairing-list
@@ -68,7 +68,7 @@ ompclaw pairing-reject <code>
 ompclaw pairing-clear
 ```
 
-After approval, the bot confirms the binding in the originating chat. The next
+After approval, that card changes in place to the connected journey and the next
 message enters the normal OMP conversation. `pairing-list` never returns a code
 or code hash. `pairing-clear` removes all pairing request records without
 changing approved principal bindings. Use `telegram-allow` only for deliberate
@@ -271,6 +271,18 @@ A Telegram object is required only when Telegram is configured:
 | `transcribeCommand` | optional argv array for local voice transcription; `{file}` is required, stdout is accepted, and `{outputDir}` reads a Whisper-style `<audio-basename>.txt` result |
 | `topicSessions.enabled` | isolate each Telegram forum topic in its own persisted OMP session |
 | `topicSessions.createFromRoot` | create a new forum topic for each authorized non-command root message; requires topic sessions |
+
+#### BotFather finishing checklist
+
+The Bot API cannot configure these profile fields. In `@BotFather`, complete them for the bot after setup:
+
+1. Enable inline mode with `/setinline`.
+2. Set the inline placeholder to a short invitation such as `Ask OmpClaw…`.
+3. Set the avatar with `/setuserpic`.
+
+The gateway refreshes the factual description and short description at setup and
+startup. You may manually use a short description such as `🟢 Online`, but it is
+not automated because it becomes stale after a crash.
 
 #### Conversation behavior
 
