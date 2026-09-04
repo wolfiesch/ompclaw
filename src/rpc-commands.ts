@@ -1,7 +1,4 @@
-import {
-  type AutonomyMode,
-  ompApprovalModeForAutonomy,
-} from "./rpc-config";
+import { type AutonomyMode, ompApprovalModeForAutonomy } from "./rpc-config";
 import type { RpcRecord } from "./rpc-protocol";
 import { isRecord } from "./type-guards";
 
@@ -22,11 +19,12 @@ export const RUNTIME_COMMANDS: readonly RuntimeCommandDefinition[] = [
   { command: "home", description: "Open the control center", group: "Everyday", native: true },
   { command: "status", description: "Show session and runtime details", group: "Everyday", native: true },
   { command: "stop", description: "Stop the current response", group: "Everyday", native: true },
-  { command: "new", description: "Start a fresh conversation", group: "Everyday", native: true },
+  { command: "new", description: "Start a fresh chat", group: "Everyday", native: true },
   { command: "steer", description: "Correct the current response", group: "Everyday" },
   { command: "followup", description: "Add work after the current response", group: "Everyday" },
   { command: "compact", description: "Compact context with optional focus", group: "Session" },
   { command: "model", description: "List or select provider/model", group: "Session" },
+  { command: "permissions", description: "Show or set permissions mode", group: "Session" },
   { command: "autonomy", description: "Show or set autonomy policy", group: "Session" },
   { command: "thinking", description: "Show or set reasoning level", group: "Session" },
   { command: "fast", description: "Show or toggle fast mode", group: "Session" },
@@ -35,11 +33,15 @@ export const RUNTIME_COMMANDS: readonly RuntimeCommandDefinition[] = [
   { command: "todos", description: "Show the current todo phases", group: "Work" },
   { command: "tasks", description: "Show recent persisted task lifecycle", group: "Work", native: true },
   { command: "subagents", description: "Show active and recent subagents", group: "Work" },
+  { command: "schedules", description: "List durable scheduled jobs", group: "Work" },
+  { command: "schedule", description: "Show schedule details", group: "Work" },
   { command: "jobs", description: "List durable scheduled jobs", group: "Work" },
+  { command: "job", description: "Show schedule details", group: "Work" },
   { command: "job_pause", description: "Pause a scheduled job by ID", group: "Work" },
   { command: "job_resume", description: "Resume a scheduled job by ID", group: "Work" },
   { command: "job_run", description: "Run a scheduled job now by ID", group: "Work" },
   { command: "job_delete", description: "Delete a scheduled job by ID", group: "Work" },
+  { command: "job_delete_confirm", description: "Confirm deletion of a scheduled job", group: "Work" },
   { command: "commands", description: "List OMP slash commands", group: "Advanced" },
   { command: "history", description: "Show recent conversation messages", group: "Session" },
   { command: "branch", description: "List branch points or branch by entry ID", group: "Advanced" },
@@ -49,6 +51,7 @@ export const RUNTIME_COMMANDS: readonly RuntimeCommandDefinition[] = [
   { command: "export", description: "Export and send the session HTML", group: "Advanced" },
   { command: "retry", description: "Show, toggle, or stop automatic retry", group: "Session" },
   { command: "autocompact", description: "Toggle automatic compaction", group: "Session" },
+  { command: "more", description: "Show more session controls and status", group: "Session" },
   { command: "login", description: "Show or start provider login", group: "Advanced" },
   { command: "help", description: "Show all gateway commands", native: true },
 ];
@@ -67,16 +70,35 @@ export function runtimeCommandMenu(allowRpcBash = false): RuntimeCommandMenuItem
   return commands;
 }
 
-export const CROSS_DELIVERY_COMMANDS = new Set(["start", "help", "status", "stop", "tasks", "todos", "jobs"]);
+export const CROSS_DELIVERY_COMMANDS = new Set([
+  "start",
+  "help",
+  "status",
+  "more",
+  "stop",
+  "tasks",
+  "todos",
+  "jobs",
+  "job",
+  "schedules",
+  "schedule",
+  "permissions",
+]);
 
 export const SAME_DELIVERY_IMMEDIATE_COMMANDS = new Set([
   "start",
   "help",
   "status",
+  "more",
   "stop",
   "tasks",
   "todos",
   "jobs",
+  "job",
+  "schedules",
+  "schedule",
+  "permissions",
+  "job_delete_confirm",
   "steer",
   "followup",
   "abortbash",
@@ -121,10 +143,10 @@ export const AUTONOMY_MODE_DESCRIPTIONS: Readonly<Record<AutonomyMode, string>> 
   inherit: "Preserves OMP's approval configuration without gateway override",
 };
 
-export function autonomyText(mode: AutonomyMode): string {
+export function autonomyText(mode: AutonomyMode, header = "Permissions"): string {
   const approvalMode = ompApprovalModeForAutonomy(mode);
   return [
-    `Autonomy: ${AUTONOMY_MODE_LABELS[mode]} (${mode})`,
+    `${header}: ${AUTONOMY_MODE_LABELS[mode]} (${mode})`,
     `OMP approval mode: ${approvalMode ?? "inherited (OmpClaw adds no autonomy override; omp.args still apply)"}`,
     "This affects tool approval prompts, not genuine user decisions.",
     "Use /autonomy <mode> to switch modes at runtime.",
@@ -164,7 +186,7 @@ export function assistantWelcome(): string {
     "Quick controls",
     "/home - Open the control center",
     "/stop - Stop the current response",
-    "/new - Start a fresh conversation",
+    "/new - Start a fresh chat",
     "/status - Show technical session details",
     "/help - Show every command",
   ].join("\n");
@@ -217,10 +239,7 @@ export function activityForTool(toolName: string): string {
 }
 function safePathPreview(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  const segments = value
-    .replace(/\\/g, "/")
-    .split("/")
-    .filter(Boolean);
+  const segments = value.replace(/\\/g, "/").split("/").filter(Boolean);
   const projectRoot = segments.findLastIndex((segment) => ["src", "docs", "test", "tests"].includes(segment));
   const preview = projectRoot >= 0 ? segments.slice(projectRoot).join("/") : segments.at(-1);
   return preview === undefined || preview.length === 0 ? undefined : preview.slice(0, 80);
@@ -256,7 +275,11 @@ export function conciseActivity(value: unknown): string | undefined {
 export function activityForFrame(frame: RpcRecord): string {
   const toolName = typeof frame.toolName === "string" ? frame.toolName : undefined;
   if (toolName === undefined) {
-    return conciseActivity(frame.intent) ?? conciseActivity(isRecord(frame.args) ? frame.args.i : undefined) ?? activityForTool("tool");
+    return (
+      conciseActivity(frame.intent) ??
+      conciseActivity(isRecord(frame.args) ? frame.args.i : undefined) ??
+      activityForTool("tool")
+    );
   }
   const preview = safeToolPreview(toolName, isRecord(frame.args) ? frame.args : undefined);
   return preview === undefined ? activityForTool(toolName) : `${activityForTool(toolName)} · ${preview}`;

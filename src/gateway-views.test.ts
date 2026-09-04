@@ -6,7 +6,14 @@ import {
   type SemanticView,
   type StoredSemanticView,
 } from "./gateway-views";
-import { scheduledJobsSemanticView, sessionChoiceSemanticView, taskHistorySemanticView, taskSemanticView } from "./rpc-semantic-views";
+import {
+  scheduledJobDeleteConfirmSemanticView,
+  scheduledJobDetailSemanticView,
+  scheduledJobsSemanticView,
+  sessionChoiceSemanticView,
+  taskHistorySemanticView,
+  taskSemanticView,
+} from "./rpc-semantic-views";
 
 function semanticView(overrides: Partial<SemanticView> = {}): SemanticView {
   return {
@@ -154,39 +161,50 @@ describe("runtime semantic projections", () => {
   });
 
   test("projects scheduled jobs into actionable cards", () => {
-    const view = scheduledJobsSemanticView(
-      [
-        {
-          id: "job-1",
-          principalId: "operator-42",
-          identity: { transport: "telegram", account: "default", subject: "42" },
-          address: { transport: "telegram", account: "default", channel: "42" },
-          name: "Morning brief",
-          prompt: "Summarize updates",
-          schedule: { kind: "cron", expression: "0 9 * * *", timezone: "America/Los_Angeles" },
-          enabled: true,
-          nextRunAt: 200,
-          attemptCount: 0,
-          successCount: 2,
-          failureCount: 0,
-          createdAt: 10,
-          updatedAt: 100,
-        },
-      ],
-      7,
-      100,
-    );
+    const job = {
+      id: "job-1",
+      principalId: "operator-42",
+      identity: { transport: "telegram", account: "default", subject: "42" },
+      address: { transport: "telegram", account: "default", channel: "42" },
+      name: "Morning brief",
+      prompt: "Summarize updates",
+      schedule: { kind: "cron" as const, expression: "0 9 * * *", timezone: "America/Los_Angeles" },
+      enabled: true,
+      nextRunAt: 200,
+      attemptCount: 0,
+      successCount: 2,
+      failureCount: 0,
+      createdAt: 10,
+      updatedAt: 100,
+    };
+    const view = scheduledJobsSemanticView([job], 7, 100);
 
     validateSemanticView(view);
     expect(view.sections[0]).toMatchObject({
-      label: "Morning brief",
-      text: expect.stringContaining("Cron · 0 9 * * * · America/Los_Angeles"),
+      label: "🟢 Morning brief",
+      text: expect.stringContaining("Next:"),
     });
     expect(view.actions.map(({ command }) => command)).toEqual([
-      "/job_pause job-1",
-      "/job_run job-1",
-      "/job_delete job-1",
+      "/job job-1",
+      undefined,
       "/home",
+    ]);
+
+    const detail = scheduledJobDetailSemanticView(job, 8, 100);
+    validateSemanticView(detail);
+    expect(detail.actions.map(({ command }) => command)).toEqual([
+      "/job_run job-1",
+      "/job_pause job-1",
+      undefined,
+      "/job_delete_confirm job-1",
+      "/schedules",
+    ]);
+
+    const confirm = scheduledJobDeleteConfirmSemanticView(job, 9, 100);
+    validateSemanticView(confirm);
+    expect(confirm.actions.map(({ command }) => command)).toEqual([
+      "/job_delete job-1",
+      "/job job-1",
     ]);
   });
 

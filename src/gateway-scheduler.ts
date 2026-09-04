@@ -77,7 +77,8 @@ export class ScheduledDispatchBusyError extends Error {
 
 /** Durable one-shot and cron scheduling, scoped to server-derived gateway principals. */
 export class GatewayScheduler implements GatewayAutomationControl {
-  readonly #options: Required<Pick<GatewaySchedulerOptions, "pollIntervalMs" | "retryDelayMs" | "maxAttempts">> & GatewaySchedulerOptions;
+  readonly #options: Required<Pick<GatewaySchedulerOptions, "pollIntervalMs" | "retryDelayMs" | "maxAttempts">> &
+    GatewaySchedulerOptions;
   readonly #log: GatewaySchedulerLogger;
   readonly #setTimer: (callback: () => void, delayMs: number) => GatewaySchedulerTimer;
   readonly #clearTimer: (timer: GatewaySchedulerTimer) => void;
@@ -148,7 +149,9 @@ export class GatewayScheduler implements GatewayAutomationControl {
         ? current.schedule
         : current.schedule.kind === "cron"
           ? parseSchedule({ cron: current.schedule.expression, timezone: input.timezone }, now)
-          : (() => { throw new Error("timezone is only valid with cron"); })();
+          : (() => {
+              throw new Error("timezone is only valid with cron");
+            })();
     const nextRunAt = changesSchedule ? nextOccurrence(schedule, now - 1) : current.nextRunAt;
     if (changesSchedule && nextRunAt === undefined) throw new Error("Schedule has no future occurrence");
     const updated: ScheduledJob = {
@@ -156,7 +159,8 @@ export class GatewayScheduler implements GatewayAutomationControl {
       identity: context.identity,
       address: context.address,
       name: input.name === undefined ? current.name : boundedText(input.name, "job name", MAX_JOB_NAME_LENGTH),
-      prompt: input.prompt === undefined ? current.prompt : boundedText(input.prompt, "job prompt", MAX_JOB_PROMPT_LENGTH),
+      prompt:
+        input.prompt === undefined ? current.prompt : boundedText(input.prompt, "job prompt", MAX_JOB_PROMPT_LENGTH),
       schedule,
       enabled: changesSchedule ? true : current.enabled,
       ...(nextRunAt === undefined ? {} : { nextRunAt }),
@@ -182,7 +186,8 @@ export class GatewayScheduler implements GatewayAutomationControl {
     const current = this.#owned(id, principalId);
     const now = this.#now();
     const nextRunAt = enabled ? nextOccurrence(current.schedule, now - 1) : current.nextRunAt;
-    if (enabled && nextRunAt === undefined) throw new Error("One-shot job has already expired; update its schedule before enabling it");
+    if (enabled && nextRunAt === undefined)
+      throw new Error("One-shot job has already expired; update its schedule before enabling it");
     const updated: ScheduledJob = {
       ...current,
       enabled,
@@ -191,7 +196,8 @@ export class GatewayScheduler implements GatewayAutomationControl {
       attemptCount: 0,
       updatedAt: now,
     };
-    if (!this.#options.store.updateScheduledJob(updated)) throw new Error(`Scheduled job ${current.id} no longer exists`);
+    if (!this.#options.store.updateScheduledJob(updated))
+      throw new Error(`Scheduled job ${current.id} no longer exists`);
     this.#wake();
     return updated;
   }
@@ -207,7 +213,8 @@ export class GatewayScheduler implements GatewayAutomationControl {
       attemptCount: 0,
       updatedAt: now,
     };
-    if (!this.#options.store.updateScheduledJob(updated)) throw new Error(`Scheduled job ${current.id} no longer exists`);
+    if (!this.#options.store.updateScheduledJob(updated))
+      throw new Error(`Scheduled job ${current.id} no longer exists`);
     this.#wake();
     return updated;
   }
@@ -340,23 +347,191 @@ export class GatewayScheduler implements GatewayAutomationControl {
     if (!this.#started) return;
     this.#timer = this.#setTimer(() => {
       this.#timer = undefined;
-      void this.runDue().catch((error) => this.#log.error(`Scheduled job poll failed: ${String(error)}`)).finally(() => {
-        this.#schedule(this.#options.pollIntervalMs);
-      });
+      void this.runDue()
+        .catch((error) => this.#log.error(`Scheduled job poll failed: ${String(error)}`))
+        .finally(() => {
+          this.#schedule(this.#options.pollIntervalMs);
+        });
     }, delayMs);
   }
 }
 
-export function formatScheduledJob(job: ScheduledJob): string {
-  const schedule = job.schedule.kind === "at"
-    ? `once at ${new Date(job.schedule.at).toISOString()}`
-    : `cron ${job.schedule.expression}${job.schedule.timezone === undefined ? "" : ` (${job.schedule.timezone})`}`;
-  const next = job.nextRunAt === undefined ? "none" : new Date(job.retryAt ?? job.nextRunAt).toISOString();
+export function friendlyTimezoneName(timezone?: string, date = new Date()): string | undefined {
+  if (!timezone) return undefined;
+  if (timezone === "UTC" || timezone === "Etc/UTC") return "UTC";
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longGeneric" }).formatToParts(
+      date,
+    );
+    const name = parts.find((part) => part.type === "timeZoneName")?.value;
+    if (name) {
+      return name.replace(/ (?:Standard |Daylight )?Time$/, "").trim() || name;
+    }
+  } catch {
+    // fallback on error
+  }
+  return timezone.split("/").pop()?.replace(/_/g, " ") ?? timezone;
+}
+
+export function humanizeCron(expression: string): string {
+  const parts = expression.trim().split(/\s+/);
+  if (parts.length !== 5) return expression;
+  const [min, hour, dom, mon, dow] = parts;
+  if (min === undefined || hour === undefined || dom === undefined || mon === undefined || dow === undefined) {
+    return expression;
+  }
+
+  const isInt = (value: string): boolean => /^\d+$/.test(value);
+
+  if (/^\*\/\d+$/.test(min) && hour === "*" && dom === "*" && mon === "*" && dow === "*") {
+    const step = Number.parseInt(min.slice(2), 10);
+    return step === 1 ? "Every minute" : `Every ${step} minutes`;
+  }
+
+  if (min === "0" && (/^\*\/\d+$/.test(hour) || hour === "*") && dom === "*" && mon === "*" && dow === "*") {
+    if (hour === "*") return "Every hour";
+    const step = Number.parseInt(hour.slice(2), 10);
+    return step === 1 ? "Every hour" : `Every ${step} hours`;
+  }
+
+  const formatTime = (hStr: string, mStr: string): string | null => {
+    const hNum = Number.parseInt(hStr, 10);
+    const mNum = Number.parseInt(mStr, 10);
+    if (hNum < 0 || hNum > 23 || mNum < 0 || mNum > 59) return null;
+    const period = hNum >= 12 ? "PM" : "AM";
+    const h12 = hNum % 12 === 0 ? 12 : hNum % 12;
+    const minuteFormatted = mNum.toString().padStart(2, "0");
+    return `${h12}:${minuteFormatted} ${period}`;
+  };
+
+  const dayNames: Readonly<Record<string, string>> = {
+    "0": "Sunday",
+    "7": "Sunday",
+    sun: "Sunday",
+    "1": "Monday",
+    mon: "Monday",
+    "2": "Tuesday",
+    tue: "Tuesday",
+    "3": "Wednesday",
+    wed: "Wednesday",
+    "4": "Thursday",
+    thu: "Thursday",
+    "5": "Friday",
+    fri: "Friday",
+    "6": "Saturday",
+    sat: "Saturday",
+  };
+
+  if (isInt(min) && isInt(hour) && dom === "*" && mon === "*") {
+    const time = formatTime(hour, min);
+    if (!time) return expression;
+
+    if (dow === "*") return `Every day at ${time}`;
+
+    const dowLower = dow.toLowerCase();
+    if (dowLower === "1-5" || dowLower === "mon-fri") return `Every weekday at ${time}`;
+    if (dowLower === "0,6" || dowLower === "6,0" || dowLower === "sat,sun" || dowLower === "sun,sat") {
+      return `Every weekend at ${time}`;
+    }
+    const day = dayNames[dowLower];
+    if (day !== undefined) return `Every ${day} at ${time}`;
+  }
+
+  return expression;
+}
+
+function safeFormat(options: Intl.DateTimeFormatOptions, timezone?: string): Intl.DateTimeFormat {
+  if (timezone) {
+    try {
+      return new Intl.DateTimeFormat("en-US", { ...options, timeZone: timezone });
+    } catch {
+      // ignore invalid timezone
+    }
+  }
+  return new Intl.DateTimeFormat("en-US", options);
+}
+
+export function formatHumanSchedule(schedule: ScheduledJobSchedule): string {
+  if (schedule.kind === "at") {
+    const date = new Date(schedule.at);
+    const tz = friendlyTimezoneName(undefined, date);
+    const tzSuffix = tz ? ` ${tz}` : "";
+    const dateFormatted = safeFormat({
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    }).format(date);
+    return `Once at ${dateFormatted}${tzSuffix}`;
+  }
+  const cronText = humanizeCron(schedule.expression);
+  const tz = friendlyTimezoneName(schedule.timezone);
+  return tz ? `${cronText} (${tz})` : cronText;
+}
+
+export function formatFriendlyNextRun(
+  nextRunAt: number | undefined,
+  now: number = Date.now(),
+  timezone?: string,
+  enabled = true,
+): string {
+  if (nextRunAt === undefined) return enabled === false ? "Paused" : "None scheduled";
+  const diffMs = nextRunAt - now;
+  const targetDate = new Date(nextRunAt);
+  const tz = friendlyTimezoneName(timezone, targetDate);
+  const tzSuffix = tz ? ` ${tz}` : "";
+
+  if (diffMs < 0) return "Past due";
+  if (diffMs < 60_000) return "in < 1 min";
+  if (diffMs < 60 * 60_000) {
+    const mins = Math.max(1, Math.round(diffMs / 60_000));
+    return `in ${mins} min`;
+  }
+
+  let nowDateStr: string;
+  let targetDateStr: string;
+  let timeStr: string;
+  try {
+    const caFmt = timezone
+      ? new Intl.DateTimeFormat("en-CA", { timeZone: timezone })
+      : new Intl.DateTimeFormat("en-CA");
+    nowDateStr = caFmt.format(new Date(now));
+    targetDateStr = caFmt.format(targetDate);
+    const timeFmt = safeFormat({ hour: "numeric", minute: "2-digit", hour12: true }, timezone);
+    timeStr = timeFmt.format(targetDate);
+  } catch {
+    nowDateStr = new Date(now).toISOString().slice(0, 10);
+    targetDateStr = targetDate.toISOString().slice(0, 10);
+    timeStr = targetDate.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
+  }
+
+  const nowDay = new Date(`${nowDateStr}T00:00:00Z`).getTime();
+  const targetDay = new Date(`${targetDateStr}T00:00:00Z`).getTime();
+  const dayDiff = Math.round((targetDay - nowDay) / 86_400_000);
+
+  if (dayDiff === 0) return `Today at ${timeStr}${tzSuffix}`;
+  if (dayDiff === 1) return `Tomorrow at ${timeStr}${tzSuffix}`;
+  if (dayDiff > 1 && dayDiff < 7) {
+    const weekdayFmt = safeFormat({ weekday: "long" }, timezone);
+    return `${weekdayFmt.format(targetDate)} at ${timeStr}${tzSuffix}`;
+  }
+  const dateFmt = safeFormat({ month: "short", day: "numeric" }, timezone);
+  return `${dateFmt.format(targetDate)} at ${timeStr}${tzSuffix}`;
+}
+
+export function formatScheduledJob(job: ScheduledJob, now: number = Date.now()): string {
+  const schedule = formatHumanSchedule(job.schedule);
+  const timezone = job.schedule.kind === "cron" ? job.schedule.timezone : undefined;
+  const next = formatFriendlyNextRun(job.retryAt ?? job.nextRunAt, now, timezone, job.enabled);
   const result = job.lastError === undefined ? "never failed" : `last error: ${job.lastError}`;
   return `${job.enabled ? "enabled" : "disabled"} | ${job.name} | id ${job.id} | ${schedule} | next ${next} | ${job.successCount} succeeded, ${job.failureCount} failed | ${result}`;
 }
 
-function parseSchedule(input: Pick<CreateScheduledJobInput, "at" | "cron" | "timezone">, now: number): ScheduledJobSchedule {
+function parseSchedule(
+  input: Pick<CreateScheduledJobInput, "at" | "cron" | "timezone">,
+  now: number,
+): ScheduledJobSchedule {
   if ((input.at === undefined) === (input.cron === undefined)) {
     throw new Error("Specify exactly one of at or cron");
   }
@@ -402,7 +577,10 @@ function validateContext(context: ScheduledJobContext): void {
   boundedText(context.address.account, "address account", 128);
   boundedText(context.address.channel, "address channel", 256);
   if (context.address.thread !== undefined) boundedText(context.address.thread, "address thread", 256);
-  if (context.identity.transport !== context.address.transport || context.identity.account !== context.address.account) {
+  if (
+    context.identity.transport !== context.address.transport ||
+    context.identity.account !== context.address.account
+  ) {
     throw new Error("Scheduled job identity and address must use the same transport account");
   }
 }
