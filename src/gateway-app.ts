@@ -57,6 +57,7 @@ export interface GatewayApplicationStore
   migrateTelegramUpdateCheckpoint?(account: string): boolean;
   putPendingInteraction: GatewayStore["putPendingInteraction"];
   deletePendingInteraction: GatewayStore["deletePendingInteraction"];
+  listPendingInteractions: GatewayStore["listPendingInteractions"];
   getSemanticView: GatewayStore["getSemanticView"];
   putSemanticView: GatewayStore["putSemanticView"];
   getSemanticViewByReceipt: GatewayStore["getSemanticViewByReceipt"];

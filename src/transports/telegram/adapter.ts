@@ -55,6 +55,8 @@ import {
 import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } from "./delivery";
 import { MAX_INBOUND_ATTACHMENT_BYTES, saveInboxAttachment } from "./inbox";
 import type { SemanticViewActionInput } from "../../gateway-views";
+import { isRecord } from "../../type-guards";
+import { renderDecisionCard, renderPickerCard, type DecisionCardState, type TelegramCardRender } from "./cards";
 import { decodeTelegramSemanticCallback, TelegramSemanticViewReconciler } from "./semantic-views";
 
 const executeFile = promisify(execFile);
@@ -107,6 +109,7 @@ export interface TelegramTransportAdapterOptions {
     | "deletePendingInteraction"
     | "listPendingIngressCompositions"
     | "listPendingInboundMessages"
+    | "listPendingInteractions"
     | "getSemanticView"
     | "getSemanticViewByReceipt"
     | "putSemanticView"
@@ -146,6 +149,12 @@ interface InteractiveState {
   readonly reject: (error: Error) => void;
   readonly multiple: boolean;
   page: number;
+  decisionState?: DecisionCardState;
+  decisionSettledLabel?: string;
+  awaitingAnswer: boolean;
+  restored: boolean;
+  readonly createdAt: number;
+  readonly expiresAt: number;
   prompt?: OutboundReceipt;
   timeout?: NodeJS.Timeout;
   detachAbort?: () => void;
@@ -604,6 +613,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       }
       this.#poller.start(this.#token, (update) => this.#trackUpdate(update), this.#log);
       pollerStarted = true;
+      await this.#restoreInteractions(context.signal);
       if (this.#pairing !== undefined) {
         this.#stopPairingApprovalMonitor = this.#startPairingApprovalMonitor(() =>
           this.#schedulePairingApprovalDrain(),
@@ -1008,17 +1018,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
       );
       if (action?.input !== undefined) {
         await acknowledge("Reply with your instruction.");
-        void this.#collectSemanticInput(
-          address,
-          identity,
-          action.input,
-          callbackContext,
-          updateId,
-          context,
-        ).catch((error) =>
-          this.#log?.warn(
-            `[telegram] semantic input failed: ${error instanceof Error ? error.message : String(error)}`,
-          ),
+        void this.#collectSemanticInput(address, identity, action.input, callbackContext, updateId, context).catch(
+          (error) =>
+            this.#log?.warn(
+              `[telegram] semantic input failed: ${error instanceof Error ? error.message : String(error)}`,
+            ),
         );
         return;
       }
@@ -1261,34 +1265,33 @@ export class TelegramTransportAdapter implements TransportAdapter {
     signal?: AbortSignal,
   ): Promise<InteractiveResponse> {
     return new Promise<InteractiveResponse>((resolvePromise, rejectPromise) => {
-      const id = this.#newId();
-      const choices = request.type === "select" ? request.options.map((option) => option.value) : [];
-      const labels = request.type === "select" ? request.options.map((option) => option.label) : [];
-      const notes = request.type === "select" ? request.options.map((option) => option.description) : [];
+      const createdAt = this.#clock();
       const state: InteractiveState = {
-        id,
+        id: this.#newId(),
         request,
         address,
         context,
         principalId: context.principal.id,
-        choices,
-        labels,
-        notes,
+        choices: request.type === "select" ? request.options.map((option) => option.value) : [],
+        labels: request.type === "select" ? request.options.map((option) => option.label) : [],
+        notes: request.type === "select" ? request.options.map((option) => option.description) : [],
         selected: new Set<number>(),
         settle: resolvePromise,
         reject: rejectPromise,
         multiple: request.type === "select" && request.multiSelect === true,
         page: 0,
+        awaitingAnswer: false,
+        restored: false,
+        createdAt,
+        expiresAt: createdAt + this.#interactionLifetime,
       };
-      this.#interactions.set(id, state);
-      this.#store.putPendingInteraction(this.#pendingInteraction(state));
-      state.timeout = setTimeout(
-        () => this.#finishInteraction(state, this.#cancelledResponse(request)),
-        this.#interactionLifetime,
-      );
-      state.timeout.unref?.();
+      this.#interactions.set(state.id, state);
+      this.#persistInteraction(state);
+      this.#scheduleInteractionExpiry(state);
       if (signal) {
-        const abort = (): void => this.#finishInteraction(state, this.#cancelledResponse(request));
+        const abort = (): void => {
+          void this.#finishInteraction(state, this.#cancelledResponse(request), "expired");
+        };
         signal.addEventListener("abort", abort, { once: true });
         state.detachAbort = () => signal.removeEventListener("abort", abort);
       }
@@ -1296,58 +1299,245 @@ export class TelegramTransportAdapter implements TransportAdapter {
     });
   }
 
-  #pendingInteraction(state: InteractiveState): PendingInteraction {
-    const payload: JsonValue = {
-      title: state.request.title,
-      principalId: state.principalId,
-      choices: state.choices,
-      multiple: state.multiple,
+  #scheduleInteractionExpiry(state: InteractiveState): void {
+    const timeout = Math.max(0, state.expiresAt - this.#clock());
+    state.timeout = setTimeout(() => {
+      void this.#finishInteraction(state, this.#cancelledResponse(state.request), "expired");
+    }, timeout);
+    state.timeout.unref?.();
+  }
+
+  async #restoreInteractions(signal?: AbortSignal): Promise<void> {
+    for (const pending of this.#store.listPendingInteractions()) {
+      if (pending.address.transport !== "telegram" || pending.address.account !== this.#account) continue;
+      const state = this.#restoreInteractionState(pending);
+      if (state === undefined) continue;
+      if (state.expiresAt <= this.#clock()) {
+        if (
+          (state.request.type === "confirm" ||
+            (state.request.type === "select" && state.request.presentation === "decision")) &&
+          state.prompt !== undefined
+        ) {
+          state.decisionState = "expired";
+          await this.#refreshInteraction(state).catch((error) => {
+            this.#log?.warn(
+              `[telegram] could not settle expired interaction ${state.id}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+        }
+        this.#store.deletePendingInteraction(state.id);
+        continue;
+      }
+      this.#interactions.set(state.id, state);
+      this.#scheduleInteractionExpiry(state);
+      if (state.prompt === undefined) {
+        await this.#sendInteractionPrompt(state, signal);
+      } else if (state.request.type === "confirm" || state.request.type === "select") {
+        await this.#refreshInteraction(state);
+      }
+    }
+  }
+
+  #restoreInteractionState(pending: PendingInteraction): InteractiveState | undefined {
+    if (!isRecord(pending.payload) || pending.payload.schemaVersion !== 1 || !isRecord(pending.payload.request)) {
+      return undefined;
+    }
+    const principalId = pending.payload.principalId;
+    const requestData = pending.payload.request;
+    const title = requestData.title;
+    if (
+      typeof principalId !== "string" ||
+      principalId.length === 0 ||
+      typeof title !== "string" ||
+      title.length === 0
+    ) {
+      return undefined;
+    }
+    let request: InteractiveRequest;
+    let choices: readonly string[] = [];
+    let labels: readonly string[] = [];
+    let notes: readonly (string | undefined)[] = [];
+    let multiple = false;
+    if (pending.kind === "confirm" && typeof requestData.message === "string") {
+      request = {
+        type: "confirm",
+        title,
+        message: requestData.message,
+        ...(typeof requestData.confirmLabel === "string" ? { confirmLabel: requestData.confirmLabel } : {}),
+        ...(typeof requestData.cancelLabel === "string" ? { cancelLabel: requestData.cancelLabel } : {}),
+      };
+    } else if (pending.kind === "select" && Array.isArray(requestData.options)) {
+      const options = requestData.options.map((option) => {
+        if (!isRecord(option) || typeof option.value !== "string" || typeof option.label !== "string") return undefined;
+        return {
+          value: option.value,
+          label: option.label,
+          ...(typeof option.description === "string" ? { description: option.description } : {}),
+        };
+      });
+      if (options.some((option) => option === undefined)) return undefined;
+      const restoredOptions = options as Array<{
+        readonly value: string;
+        readonly label: string;
+        readonly description?: string;
+      }>;
+      multiple = requestData.multiple === true;
+      request = {
+        type: "select",
+        title,
+        options: restoredOptions,
+        ...(multiple ? { multiSelect: true } : {}),
+        ...(requestData.presentation === "decision"
+          ? { presentation: "decision" as const }
+          : requestData.presentation === "picker"
+            ? { presentation: "picker" as const }
+            : {}),
+      };
+      choices = restoredOptions.map((option) => option.value);
+      labels = restoredOptions.map((option) => option.label);
+      notes = restoredOptions.map((option) => option.description);
+    } else if (pending.kind === "input") {
+      request = {
+        type: "input",
+        title,
+        ...(typeof requestData.prompt === "string" ? { prompt: requestData.prompt } : {}),
+        ...(typeof requestData.initialValue === "string" ? { initialValue: requestData.initialValue } : {}),
+        ...(typeof requestData.placeholder === "string" ? { placeholder: requestData.placeholder } : {}),
+      };
+    } else if (pending.kind === "editor" && typeof requestData.initialValue === "string") {
+      request = {
+        type: "editor",
+        title,
+        initialValue: requestData.initialValue,
+        ...(typeof requestData.language === "string" ? { language: requestData.language } : {}),
+      };
+    } else {
+      return undefined;
+    }
+    const selected = new Set<number>();
+    if (Array.isArray(pending.payload.selected)) {
+      for (const index of pending.payload.selected) {
+        if (typeof index === "number" && Number.isSafeInteger(index) && index >= 0 && index < choices.length) {
+          selected.add(index);
+        }
+      }
+    }
+    const pageCount = Math.max(1, Math.ceil(choices.length / SELECT_PAGE_SIZE));
+    const restoredPage =
+      typeof pending.payload.page === "number" && Number.isSafeInteger(pending.payload.page)
+        ? Math.max(0, Math.min(pageCount - 1, pending.payload.page))
+        : 0;
+    const promptMessageId = pending.payload.promptMessageId;
+    const prompt =
+      typeof promptMessageId === "string" && /^[1-9]\d*$/.test(promptMessageId)
+        ? ({ transport: "telegram", messageId: promptMessageId } as const)
+        : undefined;
+    const expiresAt = pending.expiresAt ?? pending.createdAt + this.#interactionLifetime;
+    return {
+      id: pending.id,
+      request,
+      address: pending.address,
+      context: {
+        principal: { id: principalId, roles: [] },
+        origin: pending.address,
+      },
+      principalId,
+      choices,
+      labels,
+      notes,
+      selected,
+      settle: () => {},
+      reject: () => {},
+      multiple,
+      page: restoredPage,
+      ...(pending.payload.decisionState === "active" ||
+      pending.payload.decisionState === "waiting_answer" ||
+      pending.payload.decisionState === "approved" ||
+      pending.payload.decisionState === "denied" ||
+      pending.payload.decisionState === "expired"
+        ? { decisionState: pending.payload.decisionState }
+        : {}),
+      ...(typeof pending.payload.decisionSettledLabel === "string"
+        ? { decisionSettledLabel: pending.payload.decisionSettledLabel }
+        : {}),
+      awaitingAnswer: pending.payload.awaitingAnswer === true,
+      restored: true,
+      createdAt: pending.createdAt,
+      expiresAt,
+      ...(prompt === undefined ? {} : { prompt }),
     };
+  }
+
+  #pendingInteraction(state: InteractiveState): PendingInteraction {
+    const request: JsonValue =
+      state.request.type === "confirm"
+        ? {
+            title: state.request.title,
+            message: state.request.message,
+            ...(state.request.confirmLabel === undefined ? {} : { confirmLabel: state.request.confirmLabel }),
+            ...(state.request.cancelLabel === undefined ? {} : { cancelLabel: state.request.cancelLabel }),
+          }
+        : state.request.type === "select"
+          ? {
+              title: state.request.title,
+              options: state.choices.map((value, index) => ({
+                value,
+                label: state.labels[index]!,
+                ...(state.notes[index] === undefined ? {} : { description: state.notes[index]! }),
+              })),
+              multiple: state.multiple,
+              ...(state.request.presentation === undefined ? {} : { presentation: state.request.presentation }),
+            }
+          : state.request.type === "input"
+            ? {
+                title: state.request.title,
+                ...(state.request.prompt === undefined ? {} : { prompt: state.request.prompt }),
+                ...(state.request.initialValue === undefined ? {} : { initialValue: state.request.initialValue }),
+                ...(state.request.placeholder === undefined ? {} : { placeholder: state.request.placeholder }),
+              }
+            : {
+                title: state.request.title,
+                initialValue: state.request.initialValue,
+                ...(state.request.language === undefined ? {} : { language: state.request.language }),
+              };
     return {
       id: state.id,
       address: state.address,
       kind: state.request.type,
-      payload,
-      createdAt: this.#clock(),
-      expiresAt: this.#clock() + this.#interactionLifetime,
+      payload: {
+        schemaVersion: 1,
+        principalId: state.principalId,
+        request,
+        selected: [...state.selected].sort((left, right) => left - right),
+        page: state.page,
+        awaitingAnswer: state.awaitingAnswer,
+        ...(state.decisionState === undefined ? {} : { decisionState: state.decisionState }),
+        ...(state.decisionSettledLabel === undefined ? {} : { decisionSettledLabel: state.decisionSettledLabel }),
+        ...(state.prompt === undefined ? {} : { promptMessageId: state.prompt.messageId }),
+      },
+      createdAt: state.createdAt,
+      expiresAt: state.expiresAt,
     };
+  }
+
+  #persistInteraction(state: InteractiveState): void {
+    this.#store.putPendingInteraction(this.#pendingInteraction(state));
   }
 
   async #sendInteractionPrompt(state: InteractiveState, signal?: AbortSignal): Promise<void> {
     const request = state.request;
-    if (request.type === "confirm") {
+    if (request.type === "confirm" || request.type === "select") {
+      const rendered = this.#renderInteractiveCard(state);
       state.prompt = await this.#outbound.sendMessage(
         state.address,
-        `${request.title}\n\n${request.message}\n\nChoose how to proceed.`,
+        rendered.text,
         state.context,
-        {
-          replyMarkup: {
-            inline_keyboard: [
-              [
-                { text: request.confirmLabel ?? "Approve", callback_data: callback(state.id, "accept") },
-                { text: request.cancelLabel ?? "Reject", callback_data: callback(state.id, "reject") },
-              ],
-              [
-                { text: "Clarify", callback_data: callback(state.id, "clarify") },
-                { text: "⚠️ Pause task", callback_data: callback(state.id, "stop") },
-              ],
-            ],
-          },
-        },
+        { replyMarkup: this.#cardReplyMarkup(rendered) },
         signal,
       );
-      return;
-    }
-    if (request.type === "select") {
-      state.prompt = await this.#outbound.sendMessage(
-        state.address,
-        this.#selectPrompt(state),
-        state.context,
-        {
-          replyMarkup: this.#selectKeyboard(state),
-        },
-        signal,
-      );
+      this.#persistInteraction(state);
       return;
     }
     const prompt = request.type === "input" ? request.prompt : undefined;
@@ -1359,54 +1549,83 @@ export class TelegramTransportAdapter implements TransportAdapter {
       state.address,
       lines.join("\n\n"),
       state.context,
-      {
-        replyMarkup: { force_reply: true, selective: true },
-      },
+      { replyMarkup: { force_reply: true, selective: true } },
       signal,
+    );
+    this.#persistInteraction(state);
+  }
+
+  #renderInteractiveCard(state: InteractiveState) {
+    const decision =
+      state.request.type === "confirm" ||
+      (state.request.type === "select" && state.request.presentation === "decision");
+    if (decision) {
+      const choices =
+        state.request.type === "confirm"
+          ? [
+              { id: "accept", label: state.request.confirmLabel ?? "Confirm" },
+              { id: "reject", label: state.request.cancelLabel ?? "Cancel" },
+            ]
+          : state.choices.map((value, index) => ({
+              id: `pick-${index}`,
+              label: `${state.labels[index]!}${state.notes[index] === undefined ? "" : `\n${state.notes[index]!}`}`,
+              shortLabel: String(index + 1),
+              ...(value.length === 0 ? { disabled: true } : {}),
+            }));
+      return renderDecisionCard(
+        {
+          title: state.request.title,
+          preview: state.request.type === "confirm" ? state.request.message : "Choose the best answer.",
+          choices,
+          expiresAt: state.expiresAt,
+          state: state.decisionState ?? "active",
+          ...(state.decisionSettledLabel === undefined ? {} : { settledLabel: state.decisionSettledLabel }),
+        },
+        (action) => callback(state.id, action),
+      );
+    }
+    const start = state.page * SELECT_PAGE_SIZE;
+    const pageCount = Math.max(1, Math.ceil(state.choices.length / SELECT_PAGE_SIZE));
+    return renderPickerCard(
+      {
+        title: state.request.title,
+        prompt: "Choose an option.",
+        options: state.choices.slice(start, start + SELECT_PAGE_SIZE).map((value, relative) => {
+          const index = start + relative;
+          return {
+            id: String(index),
+            label: state.labels[index]!,
+            ...(state.notes[index] === undefined ? {} : { description: state.notes[index]! }),
+            ...(state.selected.has(index) ? { selected: true } : {}),
+            ...(value.length === 0 ? { disabled: true } : {}),
+          };
+        }),
+        page: state.page,
+        pageCount,
+        ...(state.multiple && state.selected.size > 0 ? { current: `${state.selected.size} selected` } : {}),
+        ...(state.choices.length === 0 ? { warning: "No options are available." } : {}),
+        ...(state.multiple ? { doneAction: "done" } : {}),
+        cancelAction: "cancel",
+      },
+      (action) => callback(state.id, action),
     );
   }
 
-  #selectPrompt(state: InteractiveState): string {
-    const request = state.request;
-    if (request.type !== "select") return request.title;
-    const start = state.page * SELECT_PAGE_SIZE;
-    const end = Math.min(start + SELECT_PAGE_SIZE, state.labels.length);
-    const options = state.labels.slice(start, end).map((label, relative) => {
-      const index = start + relative;
-      const marker = state.selected.has(index) ? "[selected]" : "[ ]";
-      const note = state.notes[index];
-      return `${marker} ${label}${note ? `\n${note}` : ""}`;
-    });
-    return [request.title, ...options].join("\n\n");
+  #cardReplyMarkup(rendered: TelegramCardRender): Record<string, unknown> {
+    return {
+      inline_keyboard: rendered.inlineKeyboard.map((row) =>
+        row.map((button) => ({ text: button.text, callback_data: button.action })),
+      ),
+    };
   }
 
-  #selectKeyboard(state: InteractiveState): Record<string, unknown> {
-    const start = state.page * SELECT_PAGE_SIZE;
-    const end = Math.min(start + SELECT_PAGE_SIZE, state.labels.length);
-    const rows: Record<string, string>[][] = [];
-    for (let index = start; index < end; index += 1) {
-      rows.push([
-        {
-          text: `${state.selected.has(index) ? "✓ " : ""}${state.labels[index]}`.slice(0, 64),
-          callback_data: callback(state.id, `pick-${index}`),
-        },
-      ]);
-    }
-    const pages = Math.max(1, Math.ceil(state.labels.length / SELECT_PAGE_SIZE));
-    if (pages > 1) {
-      rows.push([
-        { text: "Previous", callback_data: callback(state.id, "previous") },
-        { text: `${state.page + 1}/${pages}`, callback_data: callback(state.id, "noop") },
-        { text: "Next", callback_data: callback(state.id, "next") },
-      ]);
-    }
-    if (state.multiple) {
-      rows.push([
-        { text: "Done", callback_data: callback(state.id, "done") },
-        { text: "Cancel", callback_data: callback(state.id, "cancel") },
-      ]);
-    }
-    return { inline_keyboard: rows };
+  async #refreshInteraction(state: InteractiveState, persist = true): Promise<void> {
+    if (!state.prompt) return;
+    if (state.request.type !== "confirm" && state.request.type !== "select") return;
+    const rendered = this.#renderInteractiveCard(state);
+    await this.#outbound.update(state.address, state.prompt, { text: rendered.text }, state.context);
+    await this.#outbound.setReplyMarkup(state.address, state.prompt, this.#cardReplyMarkup(rendered), state.context);
+    if (persist) this.#persistInteraction(state);
   }
 
   async #applyInteractionAction(
@@ -1416,27 +1635,43 @@ export class TelegramTransportAdapter implements TransportAdapter {
     acknowledge: (text?: string, alert?: boolean) => Promise<unknown>,
   ): Promise<void> {
     if (state.request.type === "confirm") {
-      if (action === "clarify") {
-        this.#finishInteraction(state, { type: "confirm", confirmed: false });
-        await this.#outbound.sendMessage(
-          state.address,
-          "Reply with the clarification. I’ll send it as a correction; this approval will not proceed.",
-          state.context,
-          { replyMarkup: { force_reply: true, selective: true } },
-        );
-        await acknowledge("Reply with clarification.");
+      if (action === "noop") {
+        await acknowledge();
         return;
       }
-      if (action !== "accept" && action !== "reject" && action !== "stop") {
-        await acknowledge("Invalid response.");
+      if (action !== "accept" && action !== "reject") {
+        await acknowledge("This decision is no longer available.");
         return;
       }
-      this.#finishInteraction(state, { type: "confirm", confirmed: action === "accept" });
-      await acknowledge(action === "accept" ? "Approved" : action === "stop" ? "Pausing…" : "Rejected");
+      await this.#finishInteraction(
+        state,
+        { type: "confirm", confirmed: action === "accept" },
+        action === "accept" ? "approved" : "denied",
+      );
+      await acknowledge(action === "accept" ? "Approved" : "Denied");
       return;
     }
     if (state.request.type !== "select") {
       await acknowledge("Reply to the prompt instead.");
+      return;
+    }
+    if (state.request.presentation === "decision") {
+      if (action === "other") {
+        state.awaitingAnswer = true;
+        state.decisionState = "waiting_answer";
+        await this.#refreshInteraction(state);
+        await acknowledge("Reply to this card with your answer.");
+        return;
+      }
+      const picked = /^pick-(\d+)$/.exec(action);
+      const index = picked === null ? -1 : Number(picked[1]);
+      if (!Number.isSafeInteger(index) || index < 0 || index >= state.choices.length) {
+        await acknowledge("This decision is no longer available.");
+        return;
+      }
+      state.decisionSettledLabel = "✅ Answered";
+      await this.#finishInteraction(state, { type: "select", selected: [state.choices[index]!] }, "approved");
+      await acknowledge(`Selected ${index + 1}`);
       return;
     }
     if (action === "noop") {
@@ -1446,54 +1681,54 @@ export class TelegramTransportAdapter implements TransportAdapter {
     if (action === "previous" || action === "next") {
       const pageCount = Math.max(1, Math.ceil(state.choices.length / SELECT_PAGE_SIZE));
       state.page = Math.max(0, Math.min(pageCount - 1, state.page + (action === "next" ? 1 : -1)));
-      await this.#refreshSelection(state);
+      await this.#refreshInteraction(state);
       await acknowledge();
       return;
     }
     if (action === "cancel") {
-      this.#finishInteraction(state, { type: "select", selected: [] });
+      await this.#finishInteraction(state, { type: "select", selected: [] });
       await acknowledge("Cancelled");
       return;
     }
     if (action === "done") {
-      this.#finishInteraction(state, {
+      await this.#finishInteraction(state, {
         type: "select",
-        selected: [...state.selected].sort((a, b) => a - b).map((index) => state.choices[index]!),
+        selected: [...state.selected].sort((left, right) => left - right).map((index) => state.choices[index]!),
       });
       await acknowledge("Selected");
       return;
     }
     const picked = /^pick-(\d+)$/.exec(action);
-    const index = picked ? Number(picked[1]) : -1;
+    const index = picked === null ? -1 : Number(picked[1]);
     if (!Number.isSafeInteger(index) || index < 0 || index >= state.choices.length) {
       await acknowledge("Invalid option.");
       return;
     }
     if (!state.multiple) {
-      this.#finishInteraction(state, { type: "select", selected: [state.choices[index]!] });
+      await this.#finishInteraction(state, { type: "select", selected: [state.choices[index]!] });
       await acknowledge(state.labels[index]);
       return;
     }
     if (state.selected.has(index)) state.selected.delete(index);
     else state.selected.add(index);
-    await this.#refreshSelection(state);
+    await this.#refreshInteraction(state);
     await acknowledge();
     void query;
-  }
-
-  async #refreshSelection(state: InteractiveState): Promise<void> {
-    if (!state.prompt) return;
-    await this.#outbound.update(state.address, state.prompt, { text: this.#selectPrompt(state) }, state.context);
-    await this.#outbound.setReplyMarkup(state.address, state.prompt, this.#selectKeyboard(state), state.context);
   }
 
   async #captureReply(message: TgMessage, principalId: string, address: ConversationAddress): Promise<boolean> {
     if (!message.reply_to_message || typeof message.text !== "string") return false;
     for (const state of this.#interactions.values()) {
-      if (state.request.type !== "input" && state.request.type !== "editor") continue;
       if (state.principalId !== principalId || !sameAddress(state.address, address)) continue;
       if (state.prompt?.messageId !== String(message.reply_to_message.message_id)) continue;
-      this.#finishInteraction(
+      if (state.request.type === "select" && state.awaitingAnswer) {
+        state.awaitingAnswer = false;
+        state.decisionSettledLabel = "✅ Answered";
+        await this.#finishInteraction(state, { type: "select", selected: [message.text] }, "approved");
+        return true;
+      }
+      if (state.request.type !== "input" && state.request.type !== "editor") continue;
+      await this.#finishInteraction(
         state,
         state.request.type === "input"
           ? { type: "input", cancelled: false, value: message.text }
@@ -1511,21 +1746,32 @@ export class TelegramTransportAdapter implements TransportAdapter {
     return { type: "editor", cancelled: true };
   }
 
-  #finishInteraction(state: InteractiveState, response: InteractiveResponse): void {
+  async #finishInteraction(
+    state: InteractiveState,
+    response: InteractiveResponse,
+    decisionState?: Extract<DecisionCardState, "approved" | "denied" | "expired">,
+  ): Promise<void> {
     if (!this.#interactions.delete(state.id)) return;
-    if (state.timeout) clearTimeout(state.timeout);
+    clearTimeout(state.timeout);
     state.detachAbort?.();
     this.#store.deletePendingInteraction(state.id);
-    if (state.prompt)
-      void this.#outbound
+    const decision =
+      state.request.type === "confirm" ||
+      (state.request.type === "select" && state.request.presentation === "decision");
+    if (decisionState !== undefined && decision) {
+      state.decisionState = decisionState;
+      await this.#refreshInteraction(state, false).catch(() => undefined);
+    } else if (state.prompt) {
+      await this.#outbound
         .setReplyMarkup(state.address, state.prompt, { inline_keyboard: [] }, state.context)
         .catch(() => undefined);
+    }
     state.settle(response);
   }
 
   #failInteraction(state: InteractiveState, error: unknown): void {
     if (!this.#interactions.delete(state.id)) return;
-    if (state.timeout) clearTimeout(state.timeout);
+    clearTimeout(state.timeout);
     state.detachAbort?.();
     this.#store.deletePendingInteraction(state.id);
     state.reject(error instanceof Error ? error : new Error(String(error)));

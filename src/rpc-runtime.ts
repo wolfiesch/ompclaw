@@ -2,12 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type {
-  ConversationAddress,
-  InboundMessage,
-  OutboundReceipt,
-  TransportIdentity,
-} from "./gateway-types";
+import type { ConversationAddress, InboundMessage, OutboundReceipt, TransportIdentity } from "./gateway-types";
 import { executeGatewayHostTool, gatewayHostToolDefinitions, type GatewayDelivery } from "./gateway-tools";
 import { ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
 import type { GatewayUpdateControl } from "./gateway-update";
@@ -27,11 +22,7 @@ import {
   type RpcClient,
   type RpcCommandInput,
 } from "./rpc-client";
-import {
-  type RpcRuntimeConfig,
-  buildOmpChildEnv,
-  buildOmpRpcArgv,
-} from "./rpc-config";
+import { type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-config";
 import {
   type RpcExtensionUiRequest,
   type RpcHostToolCall,
@@ -49,6 +40,8 @@ import { RpcGatewayUiBroker, type RpcGatewayUiTarget } from "./rpc-ui";
 import {
   homeSemanticView,
   informationSemanticView,
+  modelPageSemanticView,
+  modelProviderSemanticView,
   scheduledJobsSemanticView,
   sessionChoiceSemanticView,
   taskHistorySemanticView,
@@ -145,7 +138,6 @@ interface ActiveTurn extends GatewayTurnTarget {
   };
 }
 
-
 const require = createRequire(import.meta.url);
 const packageVersion = (() => {
   try {
@@ -155,7 +147,6 @@ const packageVersion = (() => {
     return "unknown";
   }
 })();
-
 
 function taskTodoPhases(value: unknown): readonly TaskSemanticTodoPhase[] {
   if (!Array.isArray(value)) return [];
@@ -180,8 +171,6 @@ function taskTodoPhases(value: unknown): readonly TaskSemanticTodoPhase[] {
     return tasks.length === 0 ? [] : [{ name, tasks }];
   });
 }
-
-
 
 /** One persistent OMP RPC session served through authenticated gateway transports. */
 export class RpcGatewayRuntime {
@@ -407,14 +396,11 @@ export class RpcGatewayRuntime {
       this.#options.config.autonomyMode = mode;
       await this.#startRpc();
       const approval = ompApprovalModeForAutonomy(mode);
-      this.#log.info(
-        `[ompclaw rpc] Autonomy switched to ${mode}${approval ? ` (--approval-mode ${approval})` : ""}`,
-      );
+      this.#log.info(`[ompclaw rpc] Autonomy switched to ${mode}${approval ? ` (--approval-mode ${approval})` : ""}`);
     } finally {
       this.#recycling = false;
     }
   }
-
 
   /** Queue a scheduler-owned prompt and resolve only after its terminal OMP event. */
   async handleScheduled(message: InboundMessage): Promise<void> {
@@ -926,48 +912,96 @@ export class RpcGatewayRuntime {
     args: string,
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
-    const selection = args;
-    if (!selection) {
+    const selection = args.trim();
+    const command = selection.split(/\s+/);
+    const current =
+      this.#status.state?.model?.provider !== undefined && this.#status.state.model.id !== undefined
+        ? { provider: this.#status.state.model.provider, id: this.#status.state.model.id }
+        : undefined;
+    if (selection.length === 0 || command[0] === "provider" || command[0] === "page") {
       const data = await this.#requestData<{ models: Array<{ provider?: string; id?: string }> }>({
         type: "get_available_models",
       });
       const models = data.models.filter(
         (model): model is { provider: string; id: string } =>
-          typeof model.provider === "string" && typeof model.id === "string",
+          typeof model.provider === "string" &&
+          model.provider.length > 0 &&
+          typeof model.id === "string" &&
+          model.id.length > 0,
       );
-      const current = `${this.#status.state?.model?.provider ?? "?"}/${this.#status.state?.model?.id ?? "?"}`;
       const now = this.#now();
+      if (selection.length === 0) {
+        await this.#presentSemanticView(
+          delivery,
+          modelProviderSemanticView({
+            models,
+            ...(current === undefined ? {} : { current }),
+            version: now,
+            updatedAt: now,
+          }),
+        );
+        return;
+      }
+      const encodedProvider = command[1];
+      if (encodedProvider === undefined || command.length !== (command[0] === "page" ? 3 : 2)) {
+        await reply("Usage: /model <provider>/<model-id>");
+        return;
+      }
+      let provider: string;
+      try {
+        provider = decodeURIComponent(encodedProvider);
+      } catch {
+        await reply("That model provider is not available.");
+        return;
+      }
+      const page = command[0] === "page" ? Number(command[2]) : 0;
+      if (!Number.isSafeInteger(page) || page < 0 || !models.some((model) => model.provider === provider)) {
+        await reply("That model provider is not available.");
+        return;
+      }
       await this.#presentSemanticView(
         delivery,
-        sessionChoiceSemanticView({
-          title: "Choose a model",
-          summary: "The selection applies to this OMP session.",
-          choices: models.map((model, index) => {
-            const value = `${model.provider}/${model.id}`;
-            return {
-              id: `model${index}`,
-              label: model.id,
-              description: model.provider,
-              command: `/model ${value}`,
-              selected: value === current,
-            };
-          }),
+        modelPageSemanticView({
+          models,
+          ...(current === undefined ? {} : { current }),
+          provider,
+          page,
+          pageSize: 8,
           version: now,
           updatedAt: now,
         }),
       );
       return;
     }
-    const split = selection.indexOf("/");
-    if (split <= 0 || split === selection.length - 1) {
-      await reply("Usage: /model <provider>/<model-id>");
-      return;
+    if (command[0] === "select") {
+      const encodedProvider = command[1];
+      const encodedModel = command[2];
+      if (encodedProvider === undefined || encodedModel === undefined || command.length !== 3) {
+        await reply("Usage: /model <provider>/<model-id>");
+        return;
+      }
+      try {
+        await this.#sendRpc({
+          type: "set_model",
+          provider: decodeURIComponent(encodedProvider),
+          modelId: decodeURIComponent(encodedModel),
+        });
+      } catch {
+        await reply("That model is not available.");
+        return;
+      }
+    } else {
+      const split = selection.indexOf("/");
+      if (split <= 0 || split === selection.length - 1) {
+        await reply("Usage: /model <provider>/<model-id>");
+        return;
+      }
+      await this.#sendRpc({
+        type: "set_model",
+        provider: selection.slice(0, split),
+        modelId: selection.slice(split + 1),
+      });
     }
-    await this.#sendRpc({
-      type: "set_model",
-      provider: selection.slice(0, split),
-      modelId: selection.slice(split + 1),
-    });
     await this.#refreshState();
     await this.#homeCommand(delivery);
   }
@@ -1344,7 +1378,9 @@ export class RpcGatewayRuntime {
         text: text.slice(0, 1_000),
       });
     } catch (error) {
-      this.#log.warn(`[ompclaw rpc] Unable to persist task timeline: ${error instanceof Error ? error.message : String(error)}`);
+      this.#log.warn(
+        `[ompclaw rpc] Unable to persist task timeline: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -1466,7 +1502,12 @@ export class RpcGatewayRuntime {
       active.statusHeartbeat = false;
       if (lifecycle !== undefined) await this.#renderTurnCard(active, lifecycle, heartbeat);
       if (active.statusPending !== undefined) {
-        this.#queueTurnCard(active, active.statusPending, Boolean(active.statusUrgent), Boolean(active.statusHeartbeat));
+        this.#queueTurnCard(
+          active,
+          active.statusPending,
+          Boolean(active.statusUrgent),
+          Boolean(active.statusHeartbeat),
+        );
       }
     });
   }
@@ -1666,12 +1707,7 @@ export class RpcGatewayRuntime {
     const pulse = (): void => {
       if (this.#activeTurn !== active || active.lifecycle === undefined) return;
       if (active.lifecycle.state === "queued" || active.lifecycle.state === "running") {
-        this.#queueTurnCard(
-          active,
-          { ...active.lifecycle, updatedAt: this.#now() },
-          false,
-          true,
-        );
+        this.#queueTurnCard(active, { ...active.lifecycle, updatedAt: this.#now() }, false, true);
       }
       active.heartbeatTimer = setTimeout(pulse, RpcGatewayRuntime.#TURN_CARD_HEARTBEAT_MS);
       active.heartbeatTimer.unref?.();

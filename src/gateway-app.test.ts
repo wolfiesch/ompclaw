@@ -281,6 +281,10 @@ class MemoryStore implements GatewayApplicationStore {
   deletePendingInteraction() {
     return false;
   }
+
+  listPendingInteractions() {
+    return [];
+  }
 }
 
 function coreHarness(events: string[]) {

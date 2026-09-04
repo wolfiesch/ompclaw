@@ -1,9 +1,12 @@
 import {
   homeSemanticView,
+  modelPageSemanticView,
+  modelProviderSemanticView,
   scheduledJobsSemanticView,
   sessionChoiceSemanticView,
   taskSemanticView,
 } from "../rpc-semantic-views";
+import { renderDecisionCard, type TelegramCardRender } from "../transports/telegram/cards";
 import { renderTelegramSemanticView } from "../transports/telegram/semantic-views";
 import type { SemanticView } from "../gateway-views";
 
@@ -19,6 +22,14 @@ function scenario(name: string, view: SemanticView): TelegramUiScenario {
     name,
     text: rendered.text,
     buttons: rendered.replyMarkup.inline_keyboard.map((row) => row.map((button) => button.text)),
+  };
+}
+
+function cardScenario(name: string, rendered: TelegramCardRender): TelegramUiScenario {
+  return {
+    name,
+    text: rendered.text,
+    buttons: rendered.inlineKeyboard.map((row) => row.map((button) => button.text)),
   };
 }
 
@@ -60,6 +71,49 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
         ],
         version,
         updatedAt: version,
+      }),
+    ),
+    scenario(
+      "model-providers",
+      modelProviderSemanticView({
+        models: [
+          { provider: "OpenAI", id: "gpt-5" },
+          { provider: "OpenAI", id: "gpt-5-mini" },
+          { provider: "Anthropic", id: "claude-sonnet-4" },
+        ],
+        current: { provider: "OpenAI", id: "gpt-5" },
+        version,
+        updatedAt: version,
+      }),
+    ),
+    scenario(
+      "model-page-1",
+      modelPageSemanticView({
+        models: Array.from({ length: 10 }, (_, index) => ({
+          provider: "OpenAI",
+          id: `gpt-5-${index + 1}`,
+        })),
+        current: { provider: "OpenAI", id: "gpt-5-1" },
+        provider: "OpenAI",
+        page: 0,
+        pageSize: 8,
+        version,
+        updatedAt: version,
+      }),
+    ),
+    scenario(
+      "model-page-2-selected",
+      modelPageSemanticView({
+        models: Array.from({ length: 10 }, (_, index) => ({
+          provider: "OpenAI",
+          id: `gpt-5-${index + 1}`,
+        })),
+        current: { provider: "OpenAI", id: "gpt-5-9" },
+        provider: "OpenAI",
+        page: 1,
+        pageSize: 8,
+        version: version + 1,
+        updatedAt: version + 1,
       }),
     ),
     scenario(
@@ -115,6 +169,43 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
             ],
           },
         ],
+      ),
+    ),
+    cardScenario(
+      "decision-approved",
+      renderDecisionCard(
+        {
+          title: "Approve deployment",
+          preview: "Deploy the selected build?",
+          choices: [],
+          state: "approved",
+          settledLabel: "✅ Approved once",
+        },
+        (action) => action,
+      ),
+    ),
+    cardScenario(
+      "decision-denied",
+      renderDecisionCard(
+        {
+          title: "Approve deployment",
+          preview: "Deploy the selected build?",
+          choices: [],
+          state: "denied",
+        },
+        (action) => action,
+      ),
+    ),
+    cardScenario(
+      "decision-expired",
+      renderDecisionCard(
+        {
+          title: "Approve deployment",
+          preview: "Deploy the selected build?",
+          choices: [],
+          state: "expired",
+        },
+        (action) => action,
       ),
     ),
   ];
