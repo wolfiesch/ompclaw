@@ -227,6 +227,31 @@ describe("runtime semantic projections", () => {
         expect.objectContaining({ id: "followup", input: expect.objectContaining({ command: "/followup" }) }),
       ]),
     );
+    const failed = taskSemanticView({ ...lifecycle, state: "failed" }, [], 8);
+    expect(failed.sections).toEqual(
+      expect.arrayContaining([
+        {
+          id: "error",
+          label: "What happened",
+          text: "The OMP session was interrupted.",
+          tone: "danger",
+        },
+      ]),
+    );
+    expect(failed.sections.map((section) => section.text).join("\n")).not.toContain("Use /status");
+    expect(failed.actions.map((action) => action.command)).toEqual([
+      "/task_retry task-1",
+      "/task_details task-1",
+      "/tasks",
+      "/new",
+    ]);
+    const detailed = taskSemanticView({ ...lifecycle, state: "failed" }, [], 9, [], false, true);
+    expect(detailed.sections).toEqual(
+      expect.arrayContaining([{ id: "details", label: "Details", text: "OMP restarted", tone: "muted" }]),
+    );
+    expect(detailed.actions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "details", command: "/task_details task-1 hide" })]),
+    );
     const timeline = taskHistorySemanticView(
       [{ lifecycle, events: [{ turnId: "task-1", at: 10, kind: "queued", text: "Task received" }] }],
       8,

@@ -7,6 +7,7 @@ import type { SemanticView, SemanticViewState } from "./gateway-views";
 
 const MAX_SUMMARY_CHARS = 512;
 const MAX_ACTIVITY_ITEMS = 4;
+const MAX_FAILURE_DETAIL_CHARS = 480;
 
 export interface TaskSemanticActivity {
   readonly text: string;
@@ -45,6 +46,30 @@ function boundedSummary(value: string): string {
   return `${normalized.slice(0, MAX_SUMMARY_CHARS - 1).trimEnd()}…`;
 }
 
+function failureDetail(error: string | undefined): string | undefined {
+  if (error === undefined) return undefined;
+  const normalized = error
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*at\s/.test(line))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (normalized.length === 0) return undefined;
+  return normalized.length <= MAX_FAILURE_DETAIL_CHARS
+    ? normalized
+    : `${normalized.slice(0, MAX_FAILURE_DETAIL_CHARS - 1).trimEnd()}…`;
+}
+
+function failureSummary(error: string | undefined): string {
+  const detail = failureDetail(error)?.toLowerCase() ?? "";
+  if (/abort|interrupt|restart/.test(detail)) return "The OMP session was interrupted.";
+  if (/timed? out|timeout/.test(detail)) return "The task took longer than expected.";
+  if (/network|connection|socket|econn|enotfound/.test(detail)) return "The connection to OMP was interrupted.";
+  if (/permission|forbidden|not.authorized|unauthor/.test(detail)) return "OmpClaw did not have permission to finish this task.";
+  if (/unavailable|provider/.test(detail)) return "The OMP service was unavailable.";
+  return "This task could not finish.";
+}
+
 function taskState(state: TurnLifecycle["state"]): SemanticViewState {
   if (state === "queued" || state === "running") return "active";
   if (state === "completed") return "completed";
@@ -76,6 +101,7 @@ export function taskSemanticView(
   version: number,
   todoPhases: readonly TaskSemanticTodoPhase[] = [],
   heartbeat = false,
+  detailsExpanded = false,
 ): SemanticView {
   const terminal =
     lifecycle.state === "completed" ||
@@ -108,6 +134,20 @@ export function taskSemanticView(
     tone: "default" as const,
   }));
   const collapsedSuccess = lifecycle.state === "completed";
+  const failure = lifecycle.state === "failed" || lifecycle.error !== undefined;
+  const detail = failureDetail(lifecycle.error);
+  const recoveryActions = failure
+    ? [
+        { id: "retry", label: "↻ Retry", command: `/task_retry ${lifecycle.id}`, style: "primary" as const },
+        {
+          id: "details",
+          label: detailsExpanded ? "Hide details" : "🔍 View details",
+          command: `/task_details ${lifecycle.id}${detailsExpanded ? " hide" : ""}`,
+        },
+        { id: "tasks", label: "📋 Open task", command: "/tasks" },
+        { id: "fresh", label: "✨ Start fresh", command: "/new" },
+      ]
+    : [];
   return {
     schemaVersion: 1,
     id: `task_${createHash("sha256").update(lifecycle.id).digest("hex").slice(0, 19)}`,
@@ -141,17 +181,19 @@ export function taskSemanticView(
                   },
                 ]),
           ]),
-      ...(lifecycle.error === undefined
-        ? []
-        : [{ id: "error", label: "Error", text: "Use /status for details.", tone: "danger" as const }]),
+      ...(failure
+        ? [{ id: "error", label: "What happened", text: failureSummary(lifecycle.error), tone: "danger" as const }]
+        : []),
+      ...(detailsExpanded && detail !== undefined
+        ? [{ id: "details", label: "Details", text: detail, tone: "muted" as const }]
+        : []),
     ],
     actions: terminal
-      ? []
+      ? recoveryActions
       : [
           {
             id: "steer",
             label: "✏️ Add instruction",
-
             input: {
               title: "Steer this task",
               prompt: "Reply with the correction or instruction to apply now.",

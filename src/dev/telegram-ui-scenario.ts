@@ -307,6 +307,45 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
         ],
       ),
     ),
+    scenario(
+      "failed-task",
+      taskSemanticView(
+        {
+          id: "turn-failed",
+          principalId: "operator",
+          address,
+          prompt: "Deploy the release",
+          state: "failed",
+          createdAt: version - 30_000,
+          updatedAt: version,
+          finishedAt: version,
+          error: "Provider socket timed out\n    at transport.send (rpc.ts:44)",
+        },
+        [{ text: "Deploying the selected build", state: "active" }],
+        version,
+      ),
+    ),
+    scenario(
+      "failed-task-details",
+      taskSemanticView(
+        {
+          id: "turn-failed",
+          principalId: "operator",
+          address,
+          prompt: "Deploy the release",
+          state: "failed",
+          createdAt: version - 30_000,
+          updatedAt: version,
+          finishedAt: version,
+          error: "Provider socket timed out\n    at transport.send (rpc.ts:44)",
+        },
+        [{ text: "Deploying the selected build", state: "active" }],
+        version + 1,
+        [],
+        false,
+        true,
+      ),
+    ),
     cardScenario(
       "decision-approved",
       renderDecisionCard(

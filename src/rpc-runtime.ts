@@ -350,7 +350,7 @@ export class RpcGatewayRuntime {
       this.#status.lastError = `Queued request failed: ${detail}`;
       await this.#send(
         delivery,
-        "I couldn't start that queued request. Send it again, or use /status for details.",
+        "I couldn't start that queued request. Your original message is still here—send it again when you're ready.",
       ).catch(() => undefined);
     });
     return settled;
@@ -537,7 +537,10 @@ export class RpcGatewayRuntime {
     if (active) {
       active.scheduledCompletion?.reject(error);
       const outcome = this.#options.config.autoRestart ? "OmpClaw is restarting it." : "OmpClaw will remain offline.";
-      await this.#send(active, `OMP stopped unexpectedly. ${outcome}\n\nUse /status for details.`).catch(() => {});
+      await this.#send(
+        active,
+        `OMP stopped unexpectedly. ${outcome}\n\nThe task card now has recovery controls.`,
+      ).catch(() => {});
     }
     if (!this.#options.config.autoRestart) return;
     const delays = [1_000, 2_000, 5_000, 10_000, 30_000];
@@ -569,7 +572,7 @@ export class RpcGatewayRuntime {
       const detail = frame.error ?? "unknown error";
       this.#status.lastError = `${frame.command}: ${detail}`;
       this.#log.warn(`[ompclaw rpc] ${frame.command} failed: ${detail}`);
-      await this.#sendRuntimeMessage("OMP couldn't complete that operation. Try again, or use /status for details.");
+      await this.#sendRuntimeMessage("OMP couldn't complete that operation. The current task card has recovery controls when an action is available.");
       return;
     }
     if (frame.type === "available_commands_update" && Array.isArray(frame.commands)) {
@@ -735,9 +738,7 @@ export class RpcGatewayRuntime {
       this.#status.lastError = `Prompt failed: ${detail}`;
       await this.#setTurnLifecycle("failed", { error: detail });
       this.#clearActiveDelivery(delivery);
-      await this.#send(delivery, "I couldn't start that request. Try again, or use /status for details.").catch(
-        () => {},
-      );
+      await this.#send(delivery, "That task's recovery card is ready below.").catch(() => {});
       throw error;
     }
   }
@@ -759,7 +760,7 @@ export class RpcGatewayRuntime {
       this.#queueSourceReaction(delivery, "👎");
       await this.#send(
         delivery,
-        `I couldn't queue that ${mode === "followup" ? "follow-up" : "correction"}. Send it again, or use /status for details.`,
+        `I couldn't queue that ${mode === "followup" ? "follow-up" : "correction"}. Your original message is still here—send it again when you're ready.`,
       ).catch(() => {});
       throw error;
     }
@@ -818,6 +819,7 @@ export class RpcGatewayRuntime {
       else if (name === "queue") await this.#queueCommand(args, reply);
       else if (name === "tasks") await this.#tasksCommand(delivery);
       else if (name === "task_retry") await this.#taskRetryCommand(delivery, args, reply);
+      else if (name === "task_details") await this.#taskDetailsCommand(delivery, args, reply);
       else if (name === "stats") await reply(valueText(await this.#requestData({ type: "get_session_stats" })));
       else if (name === "todos") await reply(this.#todosText());
       else if (name === "subagents") await this.#subagentsCommand(reply);
@@ -923,7 +925,7 @@ export class RpcGatewayRuntime {
         error instanceof RpcCommandError ? error.message : error instanceof Error ? error.message : String(error);
       this.#status.lastError = `${name}: ${message}`;
       this.#log.warn(`[ompclaw rpc] ${name} command failed: ${message}`);
-      await reply("That command failed. Try again, or use /status for details.");
+      await reply("That command failed. It was not applied, so you can try it again.");
     }
     return true;
   }
@@ -1589,7 +1591,7 @@ export class RpcGatewayRuntime {
       this.#recordTurnTimeline(state, text);
     }
     if (state === "queued") return;
-    if (terminal && !active.statusVisible) {
+    if (terminal && !active.statusVisible && state !== "failed" && state !== "interrupted") {
       clearTimeout(active.statusTimer);
       active.statusTimer = undefined;
       active.statusPending = undefined;
@@ -1703,14 +1705,41 @@ export class RpcGatewayRuntime {
     );
   }
 
+  #ownedTask(delivery: GatewayTurnTarget, id: string): TurnLifecycle | undefined {
+    return this.#options.turnStore
+      ?.listTurnLifecycles(delivery.address, 100)
+      .find((candidate) => candidate.id === id && candidate.principalId === delivery.deliveryContext.principal.id);
+  }
+
+  async #taskDetailsCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const [id, mode, ...extra] = args.trim().split(/\s+/);
+    if (id === undefined || (mode !== undefined && mode !== "hide") || extra.length > 0) {
+      await reply("That task is no longer available.");
+      return;
+    }
+    const task = this.#ownedTask(delivery, id);
+    if (task === undefined) {
+      await reply("That task is no longer available.");
+      return;
+    }
+    if (task.error === undefined) {
+      await reply("No additional error details are available for this task.");
+      return;
+    }
+    const now = this.#now();
+    await this.#presentSemanticView(delivery, taskSemanticView(task, [], now, [], false, mode !== "hide"));
+  }
+
   async #taskRetryCommand(
     delivery: GatewayTurnTarget,
     id: string,
     reply: (text: string) => Promise<void>,
   ): Promise<void> {
-    const previous = this.#options.turnStore
-      ?.listTurnLifecycles(delivery.address, 100)
-      .find((candidate) => candidate.id === id && candidate.principalId === delivery.deliveryContext.principal.id);
+    const previous = this.#ownedTask(delivery, id);
     if (previous === undefined) {
       await reply("That task is no longer available in this conversation.");
       return;
@@ -1736,7 +1765,7 @@ export class RpcGatewayRuntime {
 
   #missingTerminalSummaryText(state: "completed" | "stopped" | "failed"): string {
     if (state === "stopped") return "The task stopped before OMP produced a final summary. Use /tasks to resume it.";
-    if (state === "failed") return "The task failed before OMP produced a final summary. Use /status for details.";
+    if (state === "failed") return "The task failed before OMP produced a final summary. Its task card has recovery controls.";
     return "The task completed, but OMP produced no final summary. Ask for a summary of the completed work.";
   }
 

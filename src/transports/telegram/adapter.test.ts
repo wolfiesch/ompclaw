@@ -3,6 +3,7 @@ import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PairingRequestView } from "../../gateway-pairing";
+import { taskSemanticView } from "../../rpc-semantic-views";
 import type { PendingInteraction } from "../../gateway-store";
 import type { Principal } from "../../gateway-types";
 import type { SemanticView } from "../../gateway-views";
@@ -1141,6 +1142,68 @@ describe("Telegram interactive UI", () => {
     });
 
     expect(received[0]).toMatchObject({ content: { text: "/status" }, address: baseAddress });
+  });
+
+  test("routes recovery controls from a failed task card and refreshes stale task taps", async () => {
+    const { adapter, calls, received } = await fixture();
+    const lifecycle = {
+      id: "task-failed",
+      principalId: owner.id,
+      address: baseAddress,
+      prompt: "Deploy the release",
+      state: "failed" as const,
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+      error: "Provider socket timed out\n    at transport.send (rpc.ts:44)",
+    };
+    const initial = taskSemanticView(lifecycle, [], 1);
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view: initial }, delivery);
+    const card = sentMessage(calls);
+    expect(card.payload.text).toContain("The task took longer than expected.");
+    expect(card.payload.text).not.toContain("transport.send");
+    expect(card.payload.reply_markup).toMatchObject({
+      inline_keyboard: [
+        [{ text: "↻ Retry" }, { text: "🔍 View details" }],
+        [{ text: "📋 Open task" }, { text: "✨ Start fresh" }],
+      ],
+    });
+
+    for (const [updateId, label, command] of [
+      [20, "↻ Retry", "/task_retry task-failed"],
+      [21, "🔍 View details", "/task_details task-failed"],
+      [22, "📋 Open task", "/tasks"],
+      [23, "✨ Start fresh", "/new"],
+    ] as const) {
+      await adapter.handleUpdate({
+        update_id: updateId,
+        callback_query: {
+          id: `failure-${updateId}`,
+          from: { id: 42 },
+          data: callbackData(card, label),
+          message: message({ message_id: 201 }),
+        },
+      });
+      expect(received.at(-1)).toMatchObject({ content: { text: command } });
+    }
+
+    const detailed = taskSemanticView(lifecycle, [], 2, [], false, true);
+    await adapter.presentUi(baseAddress, { type: "semantic_view", view: detailed }, delivery);
+    calls.splice(0);
+    await adapter.handleUpdate({
+      update_id: 24,
+      callback_query: {
+        id: "stale-failure",
+        from: { id: 42 },
+        data: callbackData(card, "↻ Retry"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    expect(received).toHaveLength(4);
+    expect(calls.find((entry) => entry.method === "editMessageText")?.payload.text).toContain("Provider socket timed out");
+    expect(calls.findLast((entry) => entry.method === "answerCallbackQuery")?.payload.text).toBe(
+      "Updated to the latest controls.",
+    );
   });
 
   test("routes a semantic prompt action through a correlated instruction reply", async () => {

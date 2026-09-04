@@ -442,7 +442,7 @@ describe("RpcGatewayRuntime", () => {
     await runtime.stop();
   });
 
-  test("retries an interrupted task through its timeline action", async () => {
+  test("routes failure-card details and retry controls through the persisted task", async () => {
     const retryable: TurnLifecycle = {
       id: "retryable",
       principalId: "principal-retry",
@@ -452,6 +452,7 @@ describe("RpcGatewayRuntime", () => {
       createdAt: 1,
       updatedAt: 2,
       finishedAt: 2,
+      error: "Provider socket timed out",
     };
     const turns = new Map<string, TurnLifecycle>([[retryable.id, retryable]]);
     const turnStore: GatewayTurnLifecycleStore = {
@@ -463,6 +464,27 @@ describe("RpcGatewayRuntime", () => {
     const runtime = createRuntime({ config, delivery: delivery(), turnStore });
     await runtime.start();
     const rpc = FakeOmpRpcClient.instances[0]!;
+    await runtime.handleInbound(message("retry", "/task_details retryable"));
+    const details = deliveries.findLast((call) => call.method === "presentUi")?.request;
+    if (details?.type !== "semantic_view") throw new Error("expected task details card");
+    expect(details.view.state).toBe("cancelled");
+    expect(details.view.sections).toEqual(
+      expect.arrayContaining([{ id: "details", label: "Details", text: "Provider socket timed out", tone: "muted" }]),
+    );
+    expect(details.view.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ command: "/task_retry retryable" }),
+        expect.objectContaining({ command: "/task_details retryable hide" }),
+      ]),
+    );
+    await runtime.handleInbound(message("retry", "/task_details retryable hide"));
+    const collapsed = deliveries.findLast((call) => call.method === "presentUi")?.request;
+    if (collapsed?.type !== "semantic_view") throw new Error("expected collapsed task card");
+    expect(collapsed.view.sections.some((section) => section.id === "details")).toBe(false);
+    await runtime.handleInbound(message("retry", "/task_details unavailable"));
+    expect(textFromContent(deliveries.findLast((call) => call.method === "send")?.content)).toBe(
+      "That task is no longer available.",
+    );
     await runtime.handleInbound(message("retry", "/task_retry retryable"));
     expect(rpc.sent).toContainEqual({
       type: "prompt",
@@ -926,9 +948,37 @@ describe("RpcGatewayRuntime", () => {
       "prompt transport leaked detail",
     );
     const promptFailure = deliveries.find(
-      (call) => call.method === "send" && textFromContent(call.content)?.startsWith("I couldn't start that request."),
+      (call) => call.method === "send" && textFromContent(call.content) === "That task's recovery card is ready below.",
     );
-    expect(textFromContent(promptFailure?.content)).not.toContain("prompt transport leaked detail");
+    expect(promptFailure).toBeDefined();
+    await waitFor(() =>
+      deliveries.some(
+        (call) =>
+          call.method === "presentUi" &&
+          call.request?.type === "semantic_view" &&
+          call.request.view.state === "failed",
+      ),
+    );
+    const failureCard = deliveries.findLast(
+      (call) =>
+        call.method === "presentUi" &&
+        call.request?.type === "semantic_view" &&
+        call.request.view.state === "failed",
+    )?.request;
+    expect(failureCard).toMatchObject({
+      type: "semantic_view",
+      view: {
+        sections: expect.arrayContaining([
+          expect.objectContaining({ id: "error", text: "This task could not finish." }),
+        ]),
+        actions: expect.arrayContaining([
+          expect.objectContaining({ label: "↻ Retry" }),
+          expect.objectContaining({ label: "🔍 View details" }),
+          expect.objectContaining({ label: "📋 Open task" }),
+          expect.objectContaining({ label: "✨ Start fresh" }),
+        ]),
+      },
+    });
     expect(await runtime.statusText()).toContain("Prompt failed: prompt transport leaked detail");
 
     await runtime.handleInbound(message("errors", "Start again"));
