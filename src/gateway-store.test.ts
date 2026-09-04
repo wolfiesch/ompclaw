@@ -249,6 +249,32 @@ describe("GatewayStore", () => {
     store.close();
   });
 
+  test("persists OMP command discovery and caps per-principal command recency", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    first.upsertPrincipal({ id: "operator-42", roles: ["operator"] });
+    first.replaceOmpAvailableCommands([
+      { name: "deploy", description: "Ship the current branch", source: "skill" },
+      { name: "/inspect", description: "Inspect a task", source: "builtin" },
+      { name: "not a command", description: "Ignored" },
+    ]);
+    for (let index = 0; index < 21; index += 1) {
+      first.recordCommandUsage("operator-42", `skill-${index}`, index);
+    }
+    first.close();
+
+    const restarted = new GatewayStore(path);
+    expect(restarted.listOmpAvailableCommands()).toEqual([
+      { name: "deploy", description: "Ship the current branch", source: "skill" },
+      { name: "inspect", description: "Inspect a task", source: "builtin" },
+    ]);
+    const recent = restarted.listRecentCommandUsage("operator-42");
+    expect(recent).toHaveLength(20);
+    expect(recent[0]).toBe("skill-20");
+    expect(recent).not.toContain("skill-0");
+    restarted.close();
+  });
+
   test("supports the pending interaction lifecycle", () => {
     const store = new GatewayStore(temporaryDatabase());
     const pending = {

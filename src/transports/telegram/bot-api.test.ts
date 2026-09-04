@@ -273,6 +273,6 @@ describe("long poller", () => {
 
     expect(handled).toEqual([4, 7]);
     expect(offsets).toEqual([0]);
-    expect(allowed).toEqual([["message", "edited_message", "callback_query", "stopped_message_generation"]]);
+    expect(allowed).toEqual([["message", "edited_message", "callback_query", "inline_query", "stopped_message_generation"]]);
   });
 });

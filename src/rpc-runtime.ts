@@ -7,6 +7,7 @@ import { executeGatewayHostTool, gatewayHostToolDefinitions, type GatewayDeliver
 import { ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
 import type { GatewayUpdateControl } from "./gateway-update";
 import type {
+  GatewayCommandCatalogStore,
   GatewaySemanticViewStore,
   GatewayTurnLifecycleStore,
   GatewayTurnTimelineStore,
@@ -51,6 +52,8 @@ import {
 } from "./rpc-semantic-views";
 import { isRecord } from "./type-guards";
 
+import { CommandCatalog, type OmpAvailableCommand } from "./command-catalog";
+
 import { formatPromptInput, type FormattedPromptInput } from "./rpc-prompt";
 import {
   AUTONOMY_MODE_DESCRIPTIONS,
@@ -80,7 +83,7 @@ export interface RpcRuntimeLogger {
 }
 
 type RpcRuntimeStore = GatewayTurnLifecycleStore &
-  Partial<Pick<GatewaySemanticViewStore, "getSemanticView"> & GatewayTurnTimelineStore>;
+  Partial<Pick<GatewayCommandCatalogStore, "replaceOmpAvailableCommands"> & Pick<GatewaySemanticViewStore, "getSemanticView"> & GatewayTurnTimelineStore>;
 
 export interface RpcGatewayRuntimeOptions {
   readonly config: RpcRuntimeConfig;
@@ -98,7 +101,7 @@ export interface RpcGatewayRuntimeOptions {
 interface RuntimeStatus {
   state?: RpcSessionState;
   currentTool?: string;
-  availableCommands: Array<{ name: string; description?: string; source?: string }>;
+  availableCommands: OmpAvailableCommand[];
   subagents: RpcRecord[];
   lastError?: string;
 }
@@ -500,6 +503,13 @@ export class RpcGatewayRuntime {
     this.#status.state = state;
     this.#persistSession(state);
     this.#restartAttempt = 0;
+    try {
+      await this.#refreshAvailableCommands();
+    } catch (error) {
+      this.#log.warn(
+        `[ompclaw rpc] Unable to refresh available commands: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async #handleRpcExit(error: Error): Promise<void> {
@@ -559,14 +569,7 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "available_commands_update" && Array.isArray(frame.commands)) {
-      this.#status.availableCommands = frame.commands
-        .filter(isRecord)
-        .map((command) => ({
-          name: typeof command.name === "string" ? command.name : "",
-          description: typeof command.description === "string" ? command.description : undefined,
-          source: typeof command.source === "string" ? command.source : undefined,
-        }))
-        .filter((command) => command.name.length > 0);
+      this.#setAvailableCommands(frame.commands);
       return;
     }
     if (frame.type === "subagent_lifecycle" || frame.type === "subagent_progress") {
@@ -1182,15 +1185,17 @@ export class RpcGatewayRuntime {
   }
 
   async #commandsCommand(reply: (text: string) => Promise<void>): Promise<void> {
-    const data = await this.#requestData<{ commands: Array<{ name: string; description?: string; source?: string }> }>({
-      type: "get_available_commands",
+    await this.#refreshAvailableCommands();
+    const catalog = new CommandCatalog({
+      ompCommands: this.#status.availableCommands,
+      allowRpcBash: this.#options.config.allowRpcBash,
     });
-    this.#status.availableCommands = data.commands;
-    await reply(
-      data.commands
-        .map((command) => `/${command.name}${command.description ? ` — ${command.description}` : ""}`)
-        .join("\n"),
-    );
+    const lines = catalog.groups().flatMap((group) => [
+      group.name,
+      ...group.entries.map((command) => `/${command.name}${command.description ? ` — ${command.description}` : ""}`),
+      "",
+    ]);
+    await reply(lines.join("\n").trimEnd());
   }
 
   async #historyCommand(args: string, reply: (text: string) => Promise<void>): Promise<void> {
@@ -1269,6 +1274,26 @@ export class RpcGatewayRuntime {
     const phases = this.#status.state?.todoPhases;
     if (!Array.isArray(phases) || phases.length === 0) return "No active todos.";
     return phases.map(valueText).join("\n\n");
+  }
+
+  async #refreshAvailableCommands(): Promise<void> {
+    const data = await this.#requestData<{ commands?: unknown }>({ type: "get_available_commands" });
+    if (!Array.isArray(data.commands)) throw new Error("OMP returned an invalid command catalog");
+    this.#setAvailableCommands(data.commands);
+  }
+
+  #setAvailableCommands(commands: readonly unknown[]): void {
+    const available: OmpAvailableCommand[] = [];
+    for (const candidate of commands) {
+      if (!isRecord(candidate) || typeof candidate.name !== "string") continue;
+      available.push({
+        name: candidate.name,
+        ...(typeof candidate.description === "string" ? { description: candidate.description } : {}),
+        ...(typeof candidate.source === "string" ? { source: candidate.source } : {}),
+      });
+    }
+    this.#status.availableCommands = available;
+    this.#options.turnStore?.replaceOmpAvailableCommands?.(available);
   }
 
   async #refreshStateRequired(): Promise<RpcSessionState> {

@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import type { OmpAvailableCommand } from "./command-catalog";
 import type { ConversationAddress, InboundMessage, Principal, TransportIdentity } from "./gateway-types";
 import {
   isSemanticViewIdentifier,
@@ -98,6 +99,13 @@ export interface GatewayTurnLifecycleStore {
   putTurnLifecycle(turn: TurnLifecycle): void;
   interruptActiveTurns(interruptedAt: number): number;
   listTurnLifecycles(address: ConversationAddress, limit?: number): TurnLifecycle[];
+}
+
+export interface GatewayCommandCatalogStore {
+  replaceOmpAvailableCommands(commands: readonly OmpAvailableCommand[]): void;
+  listOmpAvailableCommands(): readonly OmpAvailableCommand[];
+  recordCommandUsage(principalId: string, commandName: string, usedAt: number): void;
+  listRecentCommandUsage(principalId: string, limit?: number): readonly string[];
 }
 
 export type ScheduledJobSchedule =
@@ -1193,6 +1201,23 @@ export class GatewayStore implements GatewaySemanticViewStore {
       CREATE INDEX IF NOT EXISTS semantic_views_address_updated
         ON semantic_views (transport, account, channel, thread, updated_at, view_id);
 
+
+      CREATE TABLE IF NOT EXISTS omp_available_commands (
+        name TEXT PRIMARY KEY NOT NULL,
+        description TEXT NOT NULL,
+        source TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS command_usage (
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+        command_name TEXT NOT NULL,
+        used_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, command_name)
+      );
+
+      CREATE INDEX IF NOT EXISTS command_usage_recent
+        ON command_usage (principal_id, used_at DESC, command_name ASC);
       CREATE TABLE IF NOT EXISTS migration_markers (
         marker TEXT PRIMARY KEY NOT NULL,
         completed_at INTEGER NOT NULL
@@ -1625,6 +1650,97 @@ export class GatewayStore implements GatewaySemanticViewStore {
       .get(adapter, key) as SqlRow | null;
 
     return row === null ? undefined : decodeJson(row.value_json, "adapter checkpoint");
+  }
+
+  replaceOmpAvailableCommands(commands: readonly OmpAvailableCommand[]): void {
+    const normalized = new Map<string, OmpAvailableCommand>();
+    for (const command of commands) {
+      const name = command.name.trim().replace(/^\/+/, "").toLowerCase();
+      if (!/^[a-z][a-z0-9_-]*$/.test(name)) continue;
+      const description = command.description?.trim();
+      if (description !== undefined && typeof command.description !== "string") continue;
+      if (command.source !== undefined && typeof command.source !== "string") continue;
+      normalized.set(name, {
+        name,
+        ...(description === undefined || description.length === 0 ? {} : { description }),
+        ...(command.source === undefined || command.source.length === 0 ? {} : { source: command.source }),
+      });
+    }
+    this.#transaction(() => {
+      this.#database.query("DELETE FROM omp_available_commands").run();
+      const insert = this.#database.query(
+        `INSERT INTO omp_available_commands (name, description, source, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      );
+      const updatedAt = Date.now();
+      for (const command of normalized.values()) {
+        insert.run(command.name, command.description ?? "", command.source ?? "", updatedAt);
+      }
+    });
+  }
+
+  listOmpAvailableCommands(): readonly OmpAvailableCommand[] {
+    const rows = this.#database
+      .query(
+        `SELECT name, description, source
+         FROM omp_available_commands
+         ORDER BY name ASC`,
+      )
+      .all() as SqlRow[];
+    return rows.map((row) => ({
+      name: storedString(row, "name", "OMP available command"),
+      ...(storedString(row, "description", "OMP available command").length === 0
+        ? {}
+        : { description: storedString(row, "description", "OMP available command") }),
+      ...(storedString(row, "source", "OMP available command").length === 0
+        ? {}
+        : { source: storedString(row, "source", "OMP available command") }),
+    }));
+  }
+
+  recordCommandUsage(principalId: string, commandName: string, usedAt: number): void {
+    requiredText(principalId, "command usage principal id");
+    const name = commandName.trim().replace(/^\/+/, "").toLowerCase();
+    if (!/^[a-z][a-z0-9_-]*$/.test(name)) throw new Error("command usage name is invalid");
+    if (!Number.isSafeInteger(usedAt) || usedAt < 0) throw new Error("command usage timestamp is invalid");
+    this.#transaction(() => {
+      this.#database
+        .query(
+          `INSERT INTO command_usage (principal_id, command_name, used_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(principal_id, command_name) DO UPDATE SET used_at = excluded.used_at`,
+        )
+        .run(principalId, name, usedAt);
+      this.#database
+        .query(
+          `DELETE FROM command_usage
+           WHERE principal_id = ?
+             AND command_name IN (
+               SELECT command_name
+               FROM command_usage
+               WHERE principal_id = ?
+               ORDER BY used_at DESC, command_name ASC
+               LIMIT -1 OFFSET 20
+             )`,
+        )
+        .run(principalId, principalId);
+    });
+  }
+
+  listRecentCommandUsage(principalId: string, limit = 20): readonly string[] {
+    requiredText(principalId, "command usage principal id");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw new Error("command usage limit must be between 1 and 20");
+    return (
+      this.#database
+        .query(
+          `SELECT command_name
+           FROM command_usage
+           WHERE principal_id = ?
+           ORDER BY used_at DESC, command_name ASC
+           LIMIT ?`,
+        )
+        .all(principalId, limit) as SqlRow[]
+    ).map((row) => storedString(row, "command_name", "command usage"));
   }
 
   migrateTelegramUpdateCheckpoint(account: string): boolean {
