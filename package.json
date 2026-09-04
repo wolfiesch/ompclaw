@@ -1,6 +1,6 @@
 {
   "name": "ompclaw",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "OmpClaw: authenticated remote access to one persistent OMP session",
   "type": "module",
   "packageManager": "bun@1.3.14",

@@ -1,14 +1,14 @@
 # OmpClaw
 
 [![CI](https://github.com/wolfiesch/ompclaw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/wolfiesch/ompclaw/actions/workflows/ci.yml?query=branch%3Amain)
-[![npm package](https://img.shields.io/badge/npm-ompclaw-CB3837?logo=npm)](https://www.npmjs.com/package/ompclaw)
+[![npm](https://img.shields.io/npm/v/ompclaw?logo=npm&label=npm)](https://www.npmjs.com/package/ompclaw)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Status: Alpha.** OmpClaw is a Bun package for operators who need persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) 17+ sessions reachable through Telegram and authenticated WebSocket clients. One RPC process remains the sole session owner and state writer. Optional Telegram topic sessions isolate context without launching another agent process per chat.
+**Status: Alpha.** OmpClaw is an authenticated Telegram and WebSocket gateway for operators who need remote access to one persistent [Oh My Pi](https://github.com/can1357/oh-my-pi) session. It keeps the main session, gateway state, and transport boundary under one process while giving trusted operators a durable mobile control surface.
 
-Use it when a trusted operator needs remote access to an OMP workspace without placing transport credentials in OMP configuration or handing clients an OMP process directly. Telegram and WebSocket are authenticated adapters around the same serialized runtime. HTTP is health-only.
+Use it when you want to work with an OMP workspace from Telegram or a local authenticated WebSocket client without giving either transport direct access to OMP. Telegram and WebSocket are authenticated adapters around the same serialized runtime. HTTP is health-only.
 
-- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.11.0`
+- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.12.0`
 - **Repository:** [`wolfiesch/ompclaw`](https://github.com/wolfiesch/ompclaw)
 - **License:** [MIT](LICENSE)
 
@@ -33,25 +33,19 @@ From the OMP workspace you want to control, run the guided Telegram setup:
 ompclaw setup
 ```
 
-The command reads the BotFather token without echoing it, validates the bot and
-webhook state, and writes new private default config and environment files. It
-refuses to replace existing setup files. Wait for the listener-ready message,
-then send a direct message to the bot from the Telegram account you want to
-authorize. Setup ignores messages already queued when the listener starts,
-prints a short-lived pairing code
-and the exact local approval command, then runs `doctor`. The code expires after
-ten minutes and is never sent through Telegram or stored in plaintext.
+The command reads the BotFather token without echoing it, validates the bot and webhook state, and creates private default configuration and environment files without replacing existing ones. When its listener is ready, it prints the bot's `https://t.me/<botusername>` deep link. Open that link, send the bot a direct message, and complete the local pairing command that setup prints.
 
-Use `ompclaw setup --install-service` on the first run to install the verified
-configuration as a launchd or user-systemd service. Approval remains a separate
-local command.
+The pairing journey stays in one Telegram card as it moves through approval, rejection, expiry, retry, and connected Home access. Pairing codes expire after ten minutes, are shown only on the gateway host, and are never stored in plaintext. Successful setup runs `doctor` and ends with:
+
+```text
+Doctor: ready
+```
+
+Use `ompclaw setup --install-service` on the first run to install the verified configuration as a launchd or user-systemd service. Local approval remains separate from Telegram.
 
 ### Manual configuration
 
-Use this path when enabling WebSocket, automation, learning, or non-default OMP
-settings. Create a token-free JSON configuration. Run the command from the OMP
-workspace you want the gateway to use, or replace the example workspace path
-with an absolute path.
+Use this path when enabling WebSocket, automation, or non-default OMP settings. Create a token-free JSON configuration. Run the command from the OMP workspace you want the gateway to use, or replace the example workspace path with an absolute path.
 
 ```bash
 mkdir -p ~/.config/ompclaw
@@ -79,11 +73,11 @@ cat > ~/.config/ompclaw/config.json <<'JSON'
     "websocket": {
       "enabled": true,
       "hostname": "127.0.0.1",
-      "port": 8787,
+      "port": 7788,
       "account": "local",
       "credentials": [
         {
-          "tokenEnv": "OMPCLAW_WS_TOKEN",
+          "tokenEnv": "OMPCLAW_WEBSOCKET_TOKEN",
           "subject": "local-operator",
           "channel": "local"
         }
@@ -93,10 +87,8 @@ cat > ~/.config/ompclaw/config.json <<'JSON'
   "automation": {
     "enabled": true
   },
-  "learning": {
-    "enabled": true,
-    "autoCapture": true,
-    "memoryModel": "online"
+  "quickLane": {
+    "enabled": true
   }
 }
 JSON
@@ -104,57 +96,36 @@ JSON
 
 ### OMP approval policy
 
-`omp.autonomyMode` defaults to `inherit`, which preserves OMP's existing
-approval-mode resolution. OmpClaw generates no approval flag in this mode, so
-existing raw `omp.args` remain supported.
+`omp.autonomyMode` defaults to `inherit`, which preserves OMP's existing approval-mode resolution. OmpClaw generates no approval flag in this mode, so existing raw `omp.args` remain supported.
 
-Set an explicit mode when the gateway should generate the OMP tool approval
-policy:
+Set an explicit mode when the gateway should generate the OMP tool approval policy:
 
 - `autopilot` generates `--approval-mode yolo`.
 - `balanced` generates `--approval-mode write`.
 - `review` generates `--approval-mode always-ask`.
 
-To prevent conflicting policies, an explicit mode rejects raw
-`--approval-mode VALUE` and `--approval-mode=VALUE` entries in `omp.args`.
-Autonomy mode governs prompts before OMP uses tools. It does not make genuine
-user decisions, including authorization, publication, or other consequential
-actions.
+To prevent conflicting policies, an explicit mode rejects raw `--approval-mode VALUE` and `--approval-mode=VALUE` entries in `omp.args`. Autonomy mode governs prompts before OMP uses tools. It does not make genuine user decisions, including authorization, publication, or other consequential actions.
 
-Telegram Home displays the active mode and provides an interactive selector.
-Autonomy can also be changed at runtime with `/autonomy <mode>`.
+Telegram Home displays the active mode and provides an interactive selector. Autonomy can also be changed at runtime with `/autonomy <mode>`.
 
 Put token values only in a private environment file. The values below are placeholders, not usable credentials.
 
 ```bash
 cat > ~/.config/ompclaw/ompclaw.env <<'ENV'
 TELEGRAM_BOT_TOKEN=replace-with-telegram-bot-token
-OMPCLAW_WS_TOKEN=replace-with-a-long-random-websocket-token
+OMPCLAW_WEBSOCKET_TOKEN=replace-with-a-long-random-websocket-token
 ENV
 chmod 600 ~/.config/ompclaw/ompclaw.env
 ```
 
-When the gateway is running, an unknown user can pair without stopping the
-service: send the bot a direct message, copy the short-lived pairing code from
-its reply, and run the local approval command shown in that reply:
+When the gateway is running, an unknown user can pair without stopping the service: send the bot a direct message, copy the short-lived pairing code from its card, and run the local approval command shown in that reply:
 
 ```bash
 ompclaw pairing-approve ABCD2345 \
   --config ~/.config/ompclaw/config.json
 ```
 
-The bot confirms approval in the same chat; the user's next message enters the
-normal OMP conversation. If the gateway is stopped, `ompclaw pairing-listen`
-provides the bootstrap listener and prints the code and approval command only
-on the gateway host.
-
-The request expires after ten minutes. Each unresolved identity retains one
-pending request; a new private message rotates its code instead of accumulating
-another record. Only three pending requests are retained per Telegram account.
-Five invalid local approval attempts exhaust a request.
-`pairing-list` shows token-free request metadata; `pairing-reject` denies a
-request; and `pairing-clear` removes all pairing request records without
-changing approved principal bindings.
+The bot confirms approval in the same chat, updates the pairing journey, and opens Home for the user's next message. If the gateway is stopped, `ompclaw pairing-listen` provides the bootstrap listener and prints the code and approval command only on the gateway host.
 
 Authorize the example local WebSocket identity separately:
 
@@ -173,12 +144,6 @@ ompclaw doctor \
   --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
-When Telegram is enabled, successful output includes the bot identity, `Webhook: none (...)`, the OMP RPC protocol and session, and ends with:
-
-```text
-Doctor: ready
-```
-
 Start the foreground gateway:
 
 ```bash
@@ -187,7 +152,7 @@ ompclaw run \
   --env-file ~/.config/ompclaw/ompclaw.env
 ```
 
-The process owns the OMP session until it receives `SIGINT` or `SIGTERM`. Telegram starts long polling. The WebSocket endpoint accepts authenticated connections at `ws://127.0.0.1:8787/`; `GET /healthz` returns `{"status":"ok"}`.
+The process owns the main OMP session until it receives `SIGINT` or `SIGTERM`. Telegram starts long polling. The WebSocket endpoint accepts authenticated connections at `ws://127.0.0.1:7788/`; `GET /healthz` returns `{"status":"ok"}`.
 
 To install it as a user service instead, use the same validated files:
 
@@ -199,20 +164,17 @@ ompclaw service-install \
 
 The command reports `Installed and started <manager> service: <path>`. It installs launchd label `com.ompclaw` on macOS or user systemd unit `ompclaw.service` on Linux.
 
-Transactional self-update is available as an opt-in service mode. It stages one exact commit from a fixed trusted checkout, runs the repository checks, compiles an isolated release, finishes the active Telegram response, then lets an external supervisor switch releases. Failed startup rolls back automatically. See [Transactional self-update](docs/guide.md#transactional-self-update) before enabling it.
-
 ## What the gateway provides
 
-- One authenticated OMP RPC process with serialized session switching, streamed assistant commentary, and a final response routed only to the active authenticated conversation.
-- OMP commands for steering, follow-up, abort, models, thinking, session controls, queue policy, compaction, retries, subagents, history, branching, exports, and login. While a turn is active, an ordinary message in that same conversation naturally corrects it by default.
-- Telegram long polling with durable update checkpoints and an SQLite-backed inbound work queue, receipt reactions, renewed typing, durable task and result cards, voice and video-note transcription acknowledgement, parsed MarkdownV2 output, media albums, compact inline controls, file intake, topics, and interactive OMP UI.
-- A single-message Telegram Home control center for session status, model and reasoning selection, fast mode, auto-compaction, autonomy guidance, task history, and scheduled-job actions. Advanced commands remain available through grouped `/help` output.
-- Optional per-topic OMP sessions with persistent conversation bindings and authorized root-message topic creation.
-- An authenticated versioned WebSocket protocol with client identity and conversation address derived from configured credential metadata, not client-supplied fields.
-- SQLite-backed principals, transport identities, conversation bindings, OMP session checkpointing, inbound deduplication, UI state, durable scheduled jobs, and legacy Telegram migration markers.
-- Optional unattended automation with one-shot and cron schedules, explicit timezone support, bounded retries, restart recovery, per-principal ownership, and natural-language job control through OMP host tools.
-- Optional experimental Mnemopi memory and auto-learn capture in OmpClaw-owned state. Inherited desktop skills are refreshed into a read-only snapshot, while gateway-created managed skills and memory remain isolated in the named OMP profile.
-- Optional transactional self-update with isolated release builds, post-response activation, an external restart supervisor, readiness verification, automatic rollback, and post-restart result delivery.
+- **One durable main session, plus an explicit quick-answer lane.** The primary OMP child remains the only persistent session owner. `/quick <question>` lazily starts an isolated second child for concise, unrelated questions. Quick requests are FIFO and never steer or modify the main task. While a task is working, its Telegram card can arm one plain-text quick question with **Quick ask**.
+- **A durable Telegram Home control surface.** Home presents `Ready` with the current session, model, reasoning, and Fast controls. During work it changes to `Working`, shows the active task and current step, and offers Open task, Quick ask, and Stop. Context details, auto-compaction, queue size, and session identifiers live under More.
+- **Decision and picker cards that settle in place.** OMP prompts appear as correlated Telegram controls for confirmations, choices, text input, and editors. Model selection is provider-first and paginated. Old cards visibly show their approved, denied, expired, or replaced state instead of lingering as active controls.
+- **Searchable commands and skills.** `/commands` offers ranked command and skill results with durable recent choices, paginated picker cards, and private or group-scoped native menus. Telegram inline mode provides the same discovery flow after enabling inline queries for the bot in BotFather.
+- **Actionable task outcomes.** Telegram task cards show active work and final outcomes. The task timeline records task, tool, terminal, and restart-interruption events, while failure cards explain the problem in plain language and offer retry, bounded details, history, and fresh-start controls.
+- **Reply-aware, native Telegram delivery.** Deep replies retain quoted text, external-origin metadata, and useful descriptions for captionless media. Outgoing attachments use Telegram's native audio, voice note, video, animation, photo, document, and supported media-album methods when their media type is identifiable.
+- **Humanized schedules and agent-authored watches.** The Schedules surface renders common cron rules and next runs in local language, supports pause, resume, run now, edit, and confirmed deletion, and retains durable retry state. With automation enabled, OMP can author conversation-bound `ompclaw_watch` jobs for recurring check-and-notify work. See [Ask your agent to watch things](docs/guide.md#ask-your-agent-to-watch-things).
+- **Authenticated transport boundaries and durable state.** Telegram identities and WebSocket credentials resolve to server-side principals before work enters the session. SQLite persists bindings, inbound deduplication, controls, task outcomes, scheduled jobs, and session checkpoints. Telegram topic sessions can keep separate transcripts while the gateway still serializes access.
+- **Transactional self-update.** An opt-in update flow stages one exact commit from a fixed trusted checkout, verifies an isolated build, completes the active Telegram response, and switches through an external supervisor. Failed startup automatically rolls back and records the outcome for later delivery. Read [Transactional self-update](docs/guide.md#transactional-self-update) before enabling it.
 
 Read the [operator guide](docs/guide.md) for configuration, migration, operations, and security boundaries. Read the [RPC and transport reference](docs/rpc-service.md) for the command and protocol matrix.
 
