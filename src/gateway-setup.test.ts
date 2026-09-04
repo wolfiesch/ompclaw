@@ -340,11 +340,12 @@ describe("interactive setup wizard", () => {
     expect(receipt).toMatchObject({
       configPath: join(directory, "config.json"),
       envFile: join(directory, "gateway.env"),
-      bot: { id: 100, username: "ompclaw_bot", displayName: "@ompclaw_bot" },
+      bot: { id: 100, username: "ompclaw_bot", friendlyName: "OmpClaw", displayName: "@ompclaw_bot" },
     });
     expect(JSON.stringify(receipt)).not.toContain(TOKEN);
     expect(output.join("\n")).not.toContain(TOKEN);
+    expect(output).toContain("Open your bot: https://t.me/ompclaw_bot");
     expect(await readFile(receipt.configPath, "utf8")).not.toContain(TOKEN);
-    expect(methods).toEqual(["getMe", "getWebhookInfo"]);
+    expect(methods).toEqual(["getMe", "getWebhookInfo", "setMyDescription", "setMyShortDescription", "setMyName"]);
   });
 });

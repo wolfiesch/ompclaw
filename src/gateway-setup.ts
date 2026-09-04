@@ -2,7 +2,15 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { acquireLock, releaseLock, startLockHeartbeat, tg } from "./transports/telegram/bot-api";
+import {
+  TELEGRAM_BOT_DESCRIPTION,
+  TELEGRAM_BOT_SHORT_DESCRIPTION,
+  acquireLock,
+  refreshTelegramBotProfile,
+  releaseLock,
+  startLockHeartbeat,
+  tg,
+} from "./transports/telegram/bot-api";
 import type { ConversationAddress, TransportIdentity } from "./gateway-types";
 
 const DEFAULT_ACCOUNT = "default";
@@ -27,6 +35,7 @@ export type TelegramApiCall = <Result>(
 export interface TelegramBotIdentity {
   readonly id: number;
   readonly username?: string;
+  readonly friendlyName?: string;
   readonly displayName: string;
 }
 
@@ -288,8 +297,26 @@ export async function runGatewaySetupWizard(options: GatewaySetupWizardOptions =
     tokenEnv,
     ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
   });
+  const profileFailures = await refreshTelegramBotProfile(
+    (method, payload, request) => (options.callTelegram ?? tg)(token, method, payload, request),
+    {
+      description: TELEGRAM_BOT_DESCRIPTION,
+      shortDescription: TELEGRAM_BOT_SHORT_DESCRIPTION,
+      ...(validation.bot.friendlyName === undefined ? {} : { name: validation.bot.friendlyName }),
+    },
+    options.signal,
+  );
+
+  for (const failure of profileFailures) {
+    options.write?.(
+      `[telegram] bot profile ${failure.method} failed: ${
+        failure.error instanceof Error ? failure.error.message : String(failure.error)
+      }`,
+    );
+  }
 
   options.write?.(`Telegram bot verified: ${validation.bot.displayName}`);
+  if (validation.bot.username !== undefined) options.write?.(`Open your bot: https://t.me/${validation.bot.username}`);
   options.write?.(`Setup files written: ${files.configPath} and ${files.envFile}`);
   options.write?.("Waiting briefly for one Telegram pairing request.");
 
@@ -391,11 +418,12 @@ function telegramBot(value: unknown): TelegramBotIdentity {
     throw new Error("Telegram getMe did not return a bot account");
   }
   const username = optionalLabel(bot.username);
-  const firstName = optionalLabel(bot.first_name);
+  const friendlyName = optionalLabel(bot.first_name);
   return {
     id,
     ...(username === undefined ? {} : { username }),
-    displayName: username === undefined ? (firstName ?? `Telegram bot ${id}`) : `@${username}`,
+    ...(friendlyName === undefined ? {} : { friendlyName }),
+    displayName: username === undefined ? (friendlyName ?? `Telegram bot ${id}`) : `@${username}`,
   };
 }
 

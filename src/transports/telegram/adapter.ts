@@ -6,7 +6,7 @@ import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { GatewayStore, JsonValue, PendingInteraction } from "../../gateway-store";
-import type { GatewayPairingService } from "../../gateway-pairing";
+import type { GatewayPairingService, PairingRequestView } from "../../gateway-pairing";
 import type {
   ConversationAddress,
   DeliveryContext,
@@ -26,9 +26,12 @@ import type {
   UiResponseFor,
 } from "../../gateway-types";
 import {
+  TELEGRAM_BOT_DESCRIPTION,
+  TELEGRAM_BOT_SHORT_DESCRIPTION,
   acquireLock,
   downloadFileBytes,
   Poller,
+  refreshTelegramBotProfile,
   releaseLock,
   startLockHeartbeat,
   telegramPollLockPath,
@@ -56,12 +59,20 @@ import { Outbound, telegramDraftId, type TelegramCall, type TelegramUpload } fro
 import { MAX_INBOUND_ATTACHMENT_BYTES, saveInboxAttachment } from "./inbox";
 import type { SemanticViewActionInput } from "../../gateway-views";
 import { isRecord } from "../../type-guards";
-import { renderDecisionCard, renderPickerCard, type DecisionCardState, type TelegramCardRender } from "./cards";
+import {
+  renderDecisionCard,
+  renderPairingJourneyCard,
+  renderPickerCard,
+  type DecisionCardState,
+  type PairingJourneyCardState,
+  type TelegramCardRender,
+} from "./cards";
 import { decodeTelegramSemanticCallback, TelegramSemanticViewReconciler } from "./semantic-views";
 
 const executeFile = promisify(execFile);
 const INTERACTION_LIFETIME_MS = 5 * 60 * 1_000;
 const INTERACTION_CALLBACK = "ompui";
+const PAIRING_CALLBACK = "omppair";
 const STOP_CALLBACK = "ompctl:stop";
 const SELECT_PAGE_SIZE = 8;
 const TOPIC_NAME_LIMIT = 128;
@@ -117,7 +128,8 @@ export interface TelegramTransportAdapterOptions {
   readonly pairing?: Pick<
     GatewayPairingService,
     "requestFromTransport" | "listUnconfirmedApprovals" | "completeConfirmation"
-  >;
+  > &
+    Partial<Pick<GatewayPairingService, "list">>;
   readonly transcribeCommand?: readonly string[];
   readonly logger?: Logger;
   readonly api?: TelegramApiSeams;
@@ -170,6 +182,17 @@ interface ControlCard {
   stopVisible: boolean;
 }
 
+interface DurablePairingCard {
+  readonly id: string;
+  readonly identity: TransportIdentity;
+  readonly address: ConversationAddress;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  readonly state: PairingJourneyCardState;
+  readonly principalId?: string;
+  prompt?: OutboundReceipt;
+}
+
 interface DraftRoute {
   readonly address: ConversationAddress;
   readonly context: DeliveryContext;
@@ -182,6 +205,56 @@ function sameAddress(left: ConversationAddress, right: ConversationAddress): boo
     left.channel === right.channel &&
     left.thread === right.thread
   );
+}
+
+function sameIdentity(left: TransportIdentity, right: TransportIdentity): boolean {
+  return left.transport === right.transport && left.account === right.account && left.subject === right.subject;
+}
+
+function pairingJourneyState(request: PairingRequestView): PairingJourneyCardState {
+  if (request.state === "approved") return "connected";
+  if (request.state === "expired") return "expired";
+  if (request.state === "rejected" || request.state === "exhausted") return "rejected";
+  return "pending";
+}
+
+function pairingCardFromPending(pending: PendingInteraction): DurablePairingCard | undefined {
+  if (pending.kind !== "pairing" || !isRecord(pending.payload) || pending.payload.schemaVersion !== 1) return undefined;
+  if (!isRecord(pending.payload.identity)) return undefined;
+  const identity = pending.payload.identity;
+  const state = pending.payload.state;
+  const expiresAt = pending.payload.expiresAt;
+  const promptMessageId = pending.payload.promptMessageId;
+  if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt)) return undefined;
+  if (
+    typeof identity.transport !== "string" ||
+    identity.transport.length === 0 ||
+    typeof identity.account !== "string" ||
+    identity.account.length === 0 ||
+    typeof identity.subject !== "string" ||
+    identity.subject.length === 0 ||
+    (state !== "pending" &&
+      state !== "connected" &&
+      state !== "examples" &&
+      state !== "rejected" &&
+      state !== "expired") ||
+    expiresAt < pending.createdAt ||
+    (promptMessageId !== undefined && (typeof promptMessageId !== "string" || !/^[1-9]\d*$/.test(promptMessageId))) ||
+    (pending.payload.principalId !== undefined &&
+      (typeof pending.payload.principalId !== "string" || pending.payload.principalId.length === 0))
+  ) {
+    return undefined;
+  }
+  return {
+    id: pending.id,
+    identity: { transport: identity.transport, account: identity.account, subject: identity.subject },
+    address: pending.address,
+    createdAt: pending.createdAt,
+    expiresAt,
+    state,
+    ...(typeof pending.payload.principalId === "string" ? { principalId: pending.payload.principalId } : {}),
+    ...(typeof promptMessageId === "string" ? { prompt: { transport: "telegram", messageId: promptMessageId } } : {}),
+  };
 }
 
 function telegramAddress(
@@ -611,6 +684,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
           );
         }
       }
+      await this.#refreshBotProfile(context.signal);
       this.#poller.start(this.#token, (update) => this.#trackUpdate(update), this.#log);
       pollerStarted = true;
       await this.#restoreInteractions(context.signal);
@@ -983,12 +1057,16 @@ export class TelegramTransportAdapter implements TransportAdapter {
       return;
     }
     const identity = telegramIdentity(query.from.id, this.#account);
+    const address = telegramAddress(query.message, this.#account);
+    if (query.data.startsWith(`${PAIRING_CALLBACK}:`)) {
+      await this.#handlePairingCardCallback(query, identity, address, updateId, context, acknowledge);
+      return;
+    }
     const principal = await context.resolveIdentity(identity, context.signal);
     if (!principal) {
       await acknowledge("Not authorized.", true);
       return;
     }
-    const address = telegramAddress(query.message, this.#account);
     const callbackContext: DeliveryContext = { principal, origin: address };
     if (query.data.startsWith("s1.")) {
       let callbackData: ReturnType<typeof decodeTelegramSemanticCallback>;
@@ -1830,11 +1908,99 @@ export class TelegramTransportAdapter implements TransportAdapter {
     return sections.join("\n\n");
   }
 
+  #pairingCardFor(
+    identity: TransportIdentity,
+    address: ConversationAddress,
+    messageId?: string,
+  ): DurablePairingCard | undefined {
+    for (const pending of this.#store.listPendingInteractions(address)) {
+      const card = pairingCardFromPending(pending);
+      if (
+        card !== undefined &&
+        sameIdentity(card.identity, identity) &&
+        (messageId === undefined || card.prompt?.messageId === messageId)
+      ) {
+        return card;
+      }
+    }
+    return undefined;
+  }
+
+  #persistPairingCard(card: DurablePairingCard): void {
+    this.#store.putPendingInteraction({
+      id: card.id,
+      address: card.address,
+      kind: "pairing",
+      payload: {
+        schemaVersion: 1,
+        identity: {
+          transport: card.identity.transport,
+          account: card.identity.account,
+          subject: card.identity.subject,
+        },
+        state: card.state,
+        expiresAt: card.expiresAt,
+        ...(card.principalId === undefined ? {} : { principalId: card.principalId }),
+        ...(card.prompt === undefined ? {} : { promptMessageId: card.prompt.messageId }),
+      },
+      createdAt: card.createdAt,
+    });
+  }
+
+  #pairingCardContext(card: DurablePairingCard): DeliveryContext {
+    return {
+      principal: { id: card.principalId ?? `telegram-unresolved:${card.identity.subject}`, roles: [] },
+      origin: card.address,
+    };
+  }
+
+  #renderPairingCard(card: DurablePairingCard, code?: string): TelegramCardRender {
+    const remainingMs = Math.max(0, card.expiresAt - this.#clock());
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+    const expiresIn = `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+    return renderPairingJourneyCard(
+      {
+        state: card.state,
+        ...(card.state === "pending" && code !== undefined ? { code } : {}),
+        ...(card.state === "pending" ? { expiresIn } : {}),
+      },
+      (action) => `${PAIRING_CALLBACK}:${action}`,
+    );
+  }
+
+  async #settlePairingCard(
+    card: DurablePairingCard,
+    state: PairingJourneyCardState,
+    principalId?: string,
+    signal?: AbortSignal,
+  ): Promise<DurablePairingCard> {
+    const next: DurablePairingCard = {
+      ...card,
+      state,
+      ...(principalId === undefined ? {} : { principalId }),
+    };
+    if (next.prompt !== undefined) {
+      const rendered = this.#renderPairingCard(next);
+      const receipts = await this.#outbound.replaceMessages(
+        next.address,
+        [next.prompt],
+        rendered.text,
+        this.#pairingCardContext(next),
+        { replyMarkup: this.#cardReplyMarkup(rendered) },
+        signal,
+      );
+      const prompt = receipts.at(-1);
+      if (prompt === undefined) throw new Error("Telegram pairing card update did not return a receipt");
+      next.prompt = prompt;
+    }
+    this.#persistPairingCard(next);
+    return next;
+  }
+
   async #sendPairingChallenge(message: TgMessage, identity: TransportIdentity): Promise<void> {
     const pairing = this.#pairing;
     if (pairing === undefined) return;
     const address = telegramAddress(message, this.#account);
-    const principal = { id: `telegram-unresolved:${identity.subject}`, roles: [] };
     const challenge = pairing.requestFromTransport(identity, address, this.#clock());
     if (challenge.status === "capacity") {
       await this.#outbound.sendMessage(
@@ -1843,28 +2009,98 @@ export class TelegramTransportAdapter implements TransportAdapter {
           "Pairing is temporarily unavailable because this Telegram account has too many pending requests.",
           "Ask the gateway operator to approve or clear an existing request, then try again.",
         ].join("\n"),
-        { principal, origin: address },
+        { principal: { id: `telegram-unresolved:${identity.subject}`, roles: [] }, origin: address },
       );
       return;
     }
 
     const { code, request } = challenge.result;
-    const minutes = Math.max(1, Math.ceil((request.expiresAt - request.createdAt) / 60_000));
-    await this.#outbound.sendMessage(
+    const previous = this.#pairingCardFor(identity, address);
+    const card: DurablePairingCard = {
+      id: previous?.id ?? `pairing:${encodeURIComponent(identity.account)}:${encodeURIComponent(identity.subject)}`,
+      identity,
       address,
-      [
-        "OmpClaw needs local approval before this Telegram account can send tasks.",
-        "",
-        `Pairing code: ${code}`,
-        `Expires in ${minutes} ${minutes === 1 ? "minute" : "minutes"}. A newer code replaces this one.`,
-        "",
-        "On the gateway host, run:",
-        `ompclaw pairing-approve ${code}`,
-        "",
-        `Telegram user ID: ${identity.subject}`,
-        `Chat ID: ${message.chat.id}`,
-      ].join("\n"),
-      { principal, origin: address },
+      createdAt: request.createdAt,
+      expiresAt: request.expiresAt,
+      state: "pending",
+      ...(previous?.prompt === undefined ? {} : { prompt: previous.prompt }),
+    };
+    const rendered = this.#renderPairingCard(card, code);
+    const context = this.#pairingCardContext(card);
+    if (card.prompt === undefined) {
+      card.prompt = await this.#outbound.sendMessage(address, rendered.text, context, {
+        replyMarkup: this.#cardReplyMarkup(rendered),
+      });
+    } else {
+      const receipts = await this.#outbound.replaceMessages(address, [card.prompt], rendered.text, context, {
+        replyMarkup: this.#cardReplyMarkup(rendered),
+      });
+      const prompt = receipts.at(-1);
+      if (prompt === undefined) throw new Error("Telegram pairing card creation did not return a receipt");
+      card.prompt = prompt;
+    }
+    this.#persistPairingCard(card);
+  }
+
+  async #handlePairingCardCallback(
+    query: TgCallbackQuery,
+    identity: TransportIdentity,
+    address: ConversationAddress,
+    updateId: number,
+    context: TransportStartContext,
+    acknowledge: (text?: string, alert?: boolean) => Promise<unknown>,
+  ): Promise<void> {
+    const message = query.message;
+    const action = query.data?.slice(`${PAIRING_CALLBACK}:`.length);
+    if (message === undefined || action === undefined) {
+      await acknowledge("This control is no longer available.");
+      return;
+    }
+    const card = this.#pairingCardFor(identity, address, String(message.message_id));
+    if (card === undefined) {
+      await acknowledge("This control has expired.");
+      return;
+    }
+    if (action === "retry") {
+      if (card.state !== "rejected" && card.state !== "expired") {
+        await acknowledge("This pairing request is still active.");
+        return;
+      }
+      await acknowledge("Requesting a new pairing code.");
+      await this.#sendPairingChallenge(message, identity);
+      return;
+    }
+    const principal = await context.resolveIdentity(identity, context.signal);
+    if (principal === undefined || card.principalId !== principal.id) {
+      await acknowledge("Not authorized.", true);
+      return;
+    }
+    if (action === "examples" && card.state === "connected") {
+      await this.#settlePairingCard(card, "examples", principal.id, context.signal);
+      await acknowledge("Examples shown.");
+      return;
+    }
+    if (action === "dismiss" && card.state === "examples") {
+      await this.#settlePairingCard(card, "connected", principal.id, context.signal);
+      await acknowledge("Examples dismissed.");
+      return;
+    }
+    if (action !== "home" || card.state !== "connected") {
+      await acknowledge("This control has expired.");
+      return;
+    }
+    await acknowledge("Opening Home.");
+    await context.receive(
+      {
+        id: `telegram:${this.#account}:pairing:${updateId}`,
+        sentAt: this.#clock(),
+        identity,
+        address,
+        content: { text: "/home" },
+        sourceReceipt: { transport: "telegram", messageId: String(message.message_id) },
+        edited: false,
+      },
+      context.signal,
     );
   }
 
@@ -1888,19 +2124,29 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const pairing = this.#pairing;
     const context = this.#context;
     if (pairing === undefined || context === undefined) return;
-    const approved = pairing.listUnconfirmedApprovals("telegram", this.#account);
-    for (const request of approved) {
+    const requests =
+      pairing.list === undefined
+        ? pairing.listUnconfirmedApprovals("telegram", this.#account)
+        : pairing.list(this.#clock());
+    const cards = this.#store
+      .listPendingInteractions()
+      .map(pairingCardFromPending)
+      .filter((card): card is DurablePairingCard => card !== undefined);
+    for (const card of cards) {
+      const request = requests.find((candidate) => sameIdentity(candidate.identity, card.identity));
+      if (request === undefined) continue;
+      const state = pairingJourneyState(request);
       try {
-        const principal = await context.resolveIdentity(request.identity, context.signal);
-        if (principal === undefined || principal.id !== request.principalId) continue;
-        await this.#outbound.sendMessage(
-          request.address,
-          "Paired. Send your first task.",
-          { principal, origin: request.address },
-          {},
-          context.signal,
-        );
-        pairing.completeConfirmation(request.identity, this.#clock());
+        if (state === "connected") {
+          const principal = await context.resolveIdentity(request.identity, context.signal);
+          if (principal === undefined || principal.id !== request.principalId) continue;
+          if (card.state !== "connected" && card.state !== "examples") {
+            await this.#settlePairingCard(card, "connected", principal.id, context.signal);
+          }
+          pairing.completeConfirmation(request.identity, this.#clock());
+          continue;
+        }
+        if (state !== card.state) await this.#settlePairingCard(card, state, undefined, context.signal);
       } catch (error) {
         if (context.signal?.aborted) return;
         this.#log?.warn(
@@ -1942,6 +2188,36 @@ export class TelegramTransportAdapter implements TransportAdapter {
       context.origin.account === this.#account &&
       sameAddress(address, context.origin)
     );
+  }
+  async #refreshBotProfile(signal?: AbortSignal): Promise<void> {
+    let name: string | undefined;
+    try {
+      const bot = await this.#telegram("getMe", {}, signal);
+      if (isRecord(bot) && typeof bot.first_name === "string" && bot.first_name.trim().length > 0) {
+        name = bot.first_name.trim();
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      this.#log?.warn(
+        `[telegram] bot profile identity lookup failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const failures = await refreshTelegramBotProfile(
+      (method, payload, options) => this.#telegram(method, payload ?? {}, options?.signal),
+      {
+        description: TELEGRAM_BOT_DESCRIPTION,
+        shortDescription: TELEGRAM_BOT_SHORT_DESCRIPTION,
+        ...(name === undefined ? {} : { name }),
+      },
+      signal,
+    );
+    for (const failure of failures) {
+      this.#log?.warn(
+        `[telegram] bot profile ${failure.method} failed: ${
+          failure.error instanceof Error ? failure.error.message : String(failure.error)
+        }`,
+      );
+    }
   }
 
   #trackUpdate(update: TgUpdate): Promise<void> {

@@ -160,7 +160,7 @@ describe("Gateway Telegram scenario harness", () => {
       expect.objectContaining({ state: "approved", identity: telegramIdentity }),
     );
     await harness.api.flushPairingApprovals();
-    expect(harness.api.last("sendMessage").payload.text).toBe("Paired. Send your first task.");
+    expect(harness.api.last("editMessageText").payload.text).toContain("✅ Connected");
 
     await harness.adapter.handleUpdate({ update_id: 52, message: telegramTestMessage({ text: "second task" }) });
     await harness.handledTurn;

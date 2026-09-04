@@ -23,6 +23,82 @@ export interface Logger {
   error(message: string): void;
 }
 
+export const TELEGRAM_BOT_DESCRIPTION =
+  "OmpClaw connects this chat to an OMP agent for messages, voice notes, photos, and files.";
+export const TELEGRAM_BOT_SHORT_DESCRIPTION = "Your OMP agent on Telegram.";
+
+export type TelegramMethodCall = (
+  method: string,
+  payload?: Record<string, unknown>,
+  options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number },
+) => Promise<unknown>;
+
+function botProfileText(value: string, label: string): string {
+  const text = value.trim();
+  if (text.length === 0) throw new Error(`Telegram bot ${label} must not be empty`);
+  return text;
+}
+
+export async function setMyDescription(
+  call: TelegramMethodCall,
+  description: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await call("setMyDescription", { description: botProfileText(description, "description") }, { signal });
+}
+
+export async function setMyShortDescription(
+  call: TelegramMethodCall,
+  shortDescription: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await call(
+    "setMyShortDescription",
+    { short_description: botProfileText(shortDescription, "short description") },
+    {
+      signal,
+    },
+  );
+}
+
+export async function setMyName(call: TelegramMethodCall, name: string, signal?: AbortSignal): Promise<void> {
+  await call("setMyName", { name: botProfileText(name, "name") }, { signal });
+}
+
+export interface TelegramBotProfile {
+  readonly description: string;
+  readonly shortDescription: string;
+  readonly name?: string;
+}
+
+export interface TelegramBotProfileFailure {
+  readonly method: "setMyDescription" | "setMyShortDescription" | "setMyName";
+  readonly error: unknown;
+}
+
+/** Applies the idempotent Bot API profile fields without making a rejected field fatal. */
+export async function refreshTelegramBotProfile(
+  call: TelegramMethodCall,
+  profile: TelegramBotProfile,
+  signal?: AbortSignal,
+): Promise<readonly TelegramBotProfileFailure[]> {
+  const operations: Array<readonly [TelegramBotProfileFailure["method"], () => Promise<void>]> = [
+    ["setMyDescription", () => setMyDescription(call, profile.description, signal)],
+    ["setMyShortDescription", () => setMyShortDescription(call, profile.shortDescription, signal)],
+    ...(profile.name === undefined ? [] : [["setMyName", () => setMyName(call, profile.name!, signal)] as const]),
+  ];
+  const failures: TelegramBotProfileFailure[] = [];
+  for (const [method, update] of operations) {
+    try {
+      await update();
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      failures.push({ method, error });
+    }
+  }
+  return failures;
+}
+
 export class TgError extends Error {
   readonly name = "TelegramApiError";
 

@@ -63,6 +63,8 @@ export interface FakeTelegramApiOptions {
   readonly transcribe?: boolean;
   readonly poller?: TelegramTestPoller;
   readonly pairingApprovalMonitorError?: Error;
+  readonly botIdentity?: Record<string, unknown>;
+  readonly botProfileError?: Error;
 }
 
 export class FakeTelegramApi {
@@ -93,6 +95,13 @@ export class FakeTelegramApi {
         this.calls.push({ method, payload });
         if (method === "setMyCommands" && options.setCommandsError) throw options.setCommandsError;
         if (method === "setMessageReaction" && options.reactionError) throw options.reactionError;
+        if (method === "getMe") return options.botIdentity ?? true;
+        if (
+          (method === "setMyDescription" || method === "setMyShortDescription" || method === "setMyName") &&
+          options.botProfileError
+        ) {
+          throw options.botProfileError;
+        }
         if (method === "sendMessageDraft") return true;
         if (method === "getFile") return { file_path: "uploads/file.bin" };
         if (method === "createForumTopic") return { message_thread_id: 77 };
