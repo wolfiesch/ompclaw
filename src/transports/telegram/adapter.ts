@@ -82,6 +82,10 @@ const INTERACTION_LIFETIME_MS = 5 * 60 * 1_000;
 const INTERACTION_CALLBACK = "ompui";
 const PAIRING_CALLBACK = "omppair";
 const STOP_CALLBACK = "ompctl:stop";
+const QUICK_ASK_CALLBACK = "ompctl:quick-arm";
+const QUICK_ASK_STATUS_KEY = "quick-ask";
+const QUICK_ASK_LABEL = "⚡ Quick ask";
+const QUICK_ASK_ARMED_LABEL = "⚡ Quick ask armed — send your question";
 const SELECT_PAGE_SIZE = 8;
 const TOPIC_NAME_LIMIT = 128;
 const PAIRING_APPROVAL_CHECK_MS = 1_000;
@@ -1345,6 +1349,32 @@ export class TelegramTransportAdapter implements TransportAdapter {
       );
       return;
     }
+    if (query.data === QUICK_ASK_CALLBACK) {
+      const card = this.#cards.get(cardKey(address));
+      const receipt = card?.receipts.at(-1);
+      if (!card || !receipt || receipt.messageId !== String(query.message.message_id)) {
+        await acknowledge("This control has expired.");
+        return;
+      }
+      if (card.context?.principal.id !== principal.id) {
+        await acknowledge("This control belongs to another user.", true);
+        return;
+      }
+      await context.receive(
+        {
+          id: `telegram:${this.#account}:quick-arm:${updateId}`,
+          sentAt: this.#clock(),
+          identity,
+          address,
+          content: { text: "/quick-arm" },
+          sourceReceipt: { transport: "telegram", messageId: String(query.message.message_id) },
+          edited: false,
+        },
+        context.signal,
+      );
+      await acknowledge("Quick ask toggled.");
+      return;
+    }
     if (query.data === STOP_CALLBACK) {
       const card = this.#cards.get(cardKey(address));
       const receipt = card?.receipts.at(-1);
@@ -2179,8 +2209,14 @@ export class TelegramTransportAdapter implements TransportAdapter {
     card.stopVisible = [...card.statuses.values()].some(activeTask);
     this.#cards.set(key, card);
     const body = this.#renderCard(card);
+    const quickAskArmed = card.statuses.has(QUICK_ASK_STATUS_KEY);
     const markup = card.stopVisible
-      ? { inline_keyboard: [[{ text: "Stop", callback_data: STOP_CALLBACK }]] }
+      ? {
+          inline_keyboard: [
+            [{ text: quickAskArmed ? QUICK_ASK_ARMED_LABEL : QUICK_ASK_LABEL, callback_data: QUICK_ASK_CALLBACK }],
+            [{ text: "Stop", callback_data: STOP_CALLBACK }],
+          ],
+        }
       : { inline_keyboard: [] };
     const options = {
       replyMarkup: markup,
@@ -2197,12 +2233,13 @@ export class TelegramTransportAdapter implements TransportAdapter {
 
   #renderCard(card: ControlCard): string {
     const sections: string[] = [card.title];
-    for (const [name, value] of card.statuses) sections.push(`${name}\n${value}`);
+    for (const [name, value] of card.statuses) {
+      sections.push(name === QUICK_ASK_STATUS_KEY ? value : `${name}\n${value}`);
+    }
     for (const [name, lines] of card.widgets) sections.push(`${name}\n${lines.join("\n")}`);
     if (card.editorText) sections.push(`Suggested reply\n${card.editorText}`);
     return sections.join("\n\n");
   }
-
   #pairingCardFor(
     identity: TransportIdentity,
     address: ConversationAddress,

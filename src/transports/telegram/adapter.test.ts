@@ -1521,6 +1521,37 @@ describe("Telegram interactive UI", () => {
     expect(received[0]).toMatchObject({ content: { text: "/stop" }, address: baseAddress });
   });
 
+  test("adds the quick-ask toggle to busy task cards and maps it to /quick-arm", async () => {
+    const { adapter, calls, received } = await fixture();
+    await adapter.presentUi(baseAddress, { type: "status", key: "Task", text: "Working\nDeploying" }, delivery);
+    const card = sentMessage(calls);
+    expect(callbackData(card, "⚡ Quick ask")).toBe("ompctl:quick-arm");
+
+    await adapter.handleUpdate({
+      update_id: 16,
+      callback_query: {
+        id: "quick-arm",
+        from: { id: 42 },
+        data: callbackData(card, "⚡ Quick ask"),
+        message: message({ message_id: 201 }),
+      },
+    });
+    expect(received[0]).toMatchObject({ content: { text: "/quick-arm" }, address: baseAddress });
+
+    await adapter.presentUi(
+      baseAddress,
+      { type: "status", key: "quick-ask", text: "⚡ Quick ask armed — send your question" },
+      delivery,
+    );
+    expect(calls.findLast((entry) => entry.method === "editMessageText")?.payload).toMatchObject({
+      reply_markup: {
+        inline_keyboard: expect.arrayContaining([
+          [{ text: "⚡ Quick ask armed — send your question", callback_data: "ompctl:quick-arm" }],
+        ]),
+      },
+    });
+  });
+
   test("rejects a stop button click from a different authorized principal", async () => {
     const attacker: Principal = { id: "principal-attacker", roles: ["operator"] };
     const { adapter, calls, received } = await fixture({

@@ -77,6 +77,7 @@ export function telegramUiScenarios(): readonly TelegramUiScenario[] {
           currentStep: "Running focused tests",
         },
         autonomyMode: "balanced",
+        quickAskArmed: true,
         autonomyLabel: "Balanced",
         version,
         updatedAt: version,

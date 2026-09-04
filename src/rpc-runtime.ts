@@ -107,6 +107,7 @@ export interface RpcGatewayRuntimeOptions {
   readonly config: RpcRuntimeConfig;
   readonly delivery: GatewayDelivery;
   readonly sessionFile?: string;
+  readonly isQuickAskArmed?: (address: ConversationAddress) => boolean;
   readonly onSessionState?: (state: RpcSessionState) => void;
   readonly automation?: GatewayAutomationControl;
   readonly turnStore?: RpcRuntimeStore;
@@ -968,10 +969,15 @@ export class RpcGatewayRuntime {
         autonomyMode: this.#options.config.autonomyMode,
         autonomyLabel: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode],
         activeTask,
+        quickAskArmed: isBusy && this.#options.isQuickAskArmed?.(delivery.address) === true,
         version: now,
         updatedAt: now,
       }),
     );
+  }
+
+  async showHome(message: InboundMessage): Promise<void> {
+    await this.#homeCommand(this.#deliveryFor(message));
   }
 
   async #moreCommand(delivery: GatewayTurnTarget): Promise<void> {
