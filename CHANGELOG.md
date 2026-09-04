@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 - Refresh the Telegram Bot API description and short description at setup and gateway startup, plus a derivable friendly name without making profile API failures fatal.
 - Add table-driven native Telegram media dispatch for outbound attachments, sending audio (`sendAudio`), voice notes (`sendVoice`), video (`sendVideo`), animations (`sendAnimation`), photos (`sendPhoto`), and documents (`sendDocument`) by MIME type and file extension, with native `sendMediaGroup` grouping for visual and audio sets and automatic fallback to documents for mixed media batches.
 - Add actionable Telegram failure cards with a plain-language cause, one-tap retry, expandable bounded details, task history, and fresh-start controls.
+- Add an explicit, lazy quick-answer lane: `/quick <question>` always uses its own FIFO OMP child, while busy task cards and Home can arm one unrelated follow-up without interrupting the main turn.
 
 ### Changed
 

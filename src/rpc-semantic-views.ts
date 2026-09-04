@@ -36,6 +36,7 @@ export interface HomeSemanticViewInput {
   readonly autonomyMode: AutonomyMode;
   readonly autonomyLabel: string;
   readonly activeTask?: HomeActiveTask;
+  readonly quickAskArmed?: boolean;
   readonly version: number;
   readonly updatedAt: number;
 }
@@ -658,6 +659,11 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
       sections: input.activeTask?.currentStep ? [{ id: "step", text: input.activeTask.currentStep }] : [],
       actions: [
         { id: "tasks", label: "📋 Open task", command: "/tasks" },
+        {
+          id: "quick-arm",
+          label: input.quickAskArmed ? "⚡ Quick ask armed — send your question" : "⚡ Quick ask",
+          command: "/quick-arm",
+        },
         { id: "stop", label: "🛑 Stop", command: "/stop", style: "danger" as const },
       ],
       updatedAt: input.updatedAt,

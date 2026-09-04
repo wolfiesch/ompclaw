@@ -1,5 +1,5 @@
 import { gatewayRpcRuntimeConfig, stripGatewaySecretsFromChildEnv, type GatewayConfig } from "./gateway-config";
-import type { InboundMessage } from "./gateway-types";
+import type { ConversationAddress, InboundMessage } from "./gateway-types";
 import type { GatewayDelivery } from "./gateway-tools";
 import { OmpRpcClient, type OmpRpcClientOptions, type RpcClient } from "./rpc-client";
 import { buildOmpChildEnv, buildOmpRpcArgv, type RpcRuntimeConfig } from "./rpc-config";
@@ -60,6 +60,10 @@ export class QuickLaneStoppedError extends Error {
 export class GatewayQuickLane {
   readonly #options: GatewayQuickLaneOptions;
   readonly #log: GatewayQuickLaneLogger;
+
+  isArmed(address: ConversationAddress): boolean {
+    return this.#armedAddresses.has(addressKey(address));
+  }
   readonly #armedAddresses = new Set<string>();
   #rpc: RpcClient | undefined;
   #sessionFile: string | undefined;
@@ -240,7 +244,7 @@ export class GatewayQuickLane {
   }
 
   async #setArmed(message: InboundMessage, armed: boolean): Promise<void> {
-    const key = addressKey(message);
+    const key = addressKey(message.address);
     if (armed) this.#armedAddresses.add(key);
     else this.#armedAddresses.delete(key);
     await this.#options.delivery.presentUi(
@@ -251,7 +255,7 @@ export class GatewayQuickLane {
   }
 
   #isArmed(message: InboundMessage): boolean {
-    return this.#armedAddresses.has(addressKey(message));
+    return this.isArmed(message.address);
   }
 
   async #send(message: InboundMessage, text: string): Promise<void> {
@@ -269,8 +273,8 @@ function quickRuntimeConfig(config: GatewayConfig): RpcRuntimeConfig {
   return { ...runtime, profile: `${runtime.profile.slice(0, Math.max(1, 128 - suffix.length))}${suffix}` };
 }
 
-function addressKey(message: Pick<InboundMessage, "address">): string {
-  const { transport, account, channel, thread } = message.address;
+function addressKey(address: ConversationAddress): string {
+  const { transport, account, channel, thread } = address;
   return `${transport}\u0000${account}\u0000${channel}\u0000${thread ?? ""}`;
 }
 

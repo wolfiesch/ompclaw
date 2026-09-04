@@ -52,6 +52,9 @@
     "retryDelayMs": 15000,
     "maxAttempts": 3
   },
+  "quickLane": {
+    "enabled": true
+  },
   "learning": {
     "enabled": false,
     "autoCapture": false,

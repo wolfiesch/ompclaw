@@ -31,7 +31,7 @@ describe("Telegram UI scenario golden", () => {
           "Running focused tests",
         ].join("\n"),
         buttons: [
-          ["📋 Open task"],
+          ["📋 Open task", "⚡ Quick ask armed — send your question"],
           ["🛑 Stop"],
         ],
       },
