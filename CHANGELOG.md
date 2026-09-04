@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Expand the dedicated live Telegram handset canary to exercise Home, decisions, quick lane, watches, schedules, photo delivery, and document delivery through the real Bot API.
+
+### Changed
+
+- Raise the transactional update readiness default from 30 seconds to 180 seconds so full OMP extension initialization does not trigger a false rollback.
+
 ## 0.12.0 (2026-09-04)
 
 ### Added

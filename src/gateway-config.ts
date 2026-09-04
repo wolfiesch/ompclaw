@@ -82,7 +82,6 @@ export interface GatewayQuickLaneConfig {
   readonly enabled: boolean;
 }
 
-
 export interface GatewayConfig {
   readonly workspace: string;
   readonly stateDir: string;
@@ -436,7 +435,7 @@ function parseLearning(value: unknown): GatewayLearningConfig {
 }
 
 function parseUpdates(value: unknown, cwd: string): GatewayUpdatesConfig {
-  if (value === undefined) return { enabled: false, healthTimeoutMs: 30_000 };
+  if (value === undefined) return { enabled: false, healthTimeoutMs: 180_000 };
   const updates = object(value, "updates");
   rejectUnknown(updates, ["enabled", "repository", "healthTimeoutMs"], "updates");
   const enabled = boolean(updates.enabled, "updates.enabled", false);
@@ -448,7 +447,7 @@ function parseUpdates(value: unknown, cwd: string): GatewayUpdatesConfig {
   return {
     enabled,
     ...(repository === undefined ? {} : { repository }),
-    healthTimeoutMs: integer(updates.healthTimeoutMs, "updates.healthTimeoutMs", 5_000, 300_000, 30_000),
+    healthTimeoutMs: integer(updates.healthTimeoutMs, "updates.healthTimeoutMs", 5_000, 300_000, 180_000),
   };
 }
 

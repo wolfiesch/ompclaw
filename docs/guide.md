@@ -234,7 +234,7 @@ Self-update is off by default. Enable it only for a trusted local checkout:
   "updates": {
     "enabled": true,
     "repository": "~/Projects/ompclaw",
-    "healthTimeoutMs": 30000
+    "healthTimeoutMs": 180000
   }
 }
 ```
@@ -243,7 +243,7 @@ Self-update is off by default. Enable it only for a trusted local checkout:
 | --- | --- | --- |
 | `enabled` | boolean, `false` | register update host tools and install the service through the release supervisor |
 | `repository` | required path when enabled | fixed Git checkout whose commits may be staged |
-| `healthTimeoutMs` | integer, `30000` | readiness deadline from 5000 to 300000 milliseconds before rollback |
+| `healthTimeoutMs` | integer, `180000` | readiness deadline from 5000 to 300000 milliseconds before rollback |
 
 Run `service-install` again after enabling updates. The installer resolves `HEAD` in the configured repository, runs the repository checks, compiles the gateway and external supervisor into a versioned release directory under `stateDir/updates/releases`, and points `stateDir/updates/current` at that release. The service manager launches the external supervisor rather than the gateway directly.
 
