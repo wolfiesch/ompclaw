@@ -27,6 +27,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Always finalize a Telegram task with a visible outcome when OMP omits its terminal assistant text, while retaining the existing safeguard that prevents an empty response from activating an armed update.
+- Expire and replace Telegram catalog search cards so old searches no longer linger.
 
 ## 0.11.0 (2026-09-03)
 

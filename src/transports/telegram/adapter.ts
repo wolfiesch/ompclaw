@@ -226,8 +226,10 @@ interface CommandCatalogCard {
   readonly context: DeliveryContext;
   readonly principalId: string;
   readonly entries: readonly CommandCatalogEntry[];
+  readonly expiresAt: number;
   page: number;
   receipt?: OutboundReceipt;
+  timeout?: NodeJS.Timeout;
 }
 
 function sameAddress(left: ConversationAddress, right: ConversationAddress): boolean {
@@ -809,7 +811,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       this.#cards.clear();
       this.#draftRoutes.clear();
       this.#releaseRuntimeOwnership();
-      this.#catalogCards.clear();
+      for (const card of [...this.#catalogCards.values()]) this.#removeCommandCatalogCard(card);
       this.#context = undefined;
       this.#stopTask = undefined;
     })();
@@ -1029,6 +1031,30 @@ export class TelegramTransportAdapter implements TransportAdapter {
     });
   }
 
+  #removeCommandCatalogCard(card: CommandCatalogCard): boolean {
+    if (!this.#catalogCards.delete(card.id)) return false;
+    clearTimeout(card.timeout);
+    return true;
+  }
+
+  #scheduleCommandCatalogCardExpiry(card: CommandCatalogCard): void {
+    const timeout = Math.max(0, card.expiresAt - this.#clock());
+    card.timeout = setTimeout(() => {
+      this.#removeCommandCatalogCard(card);
+    }, timeout);
+    card.timeout.unref?.();
+  }
+
+  #replaceCommandCatalogCard(card: CommandCatalogCard): void {
+    for (const existing of this.#catalogCards.values()) {
+      if (existing.principalId === card.principalId && sameAddress(existing.address, card.address)) {
+        this.#removeCommandCatalogCard(existing);
+      }
+    }
+    this.#catalogCards.set(card.id, card);
+    this.#scheduleCommandCatalogCardExpiry(card);
+  }
+
   async #showCommandCatalog(
     address: ConversationAddress,
     principal: Principal,
@@ -1056,12 +1082,14 @@ export class TelegramTransportAdapter implements TransportAdapter {
       await this.#outbound.sendMessage(address, "No commands match that search.", delivery, {}, signal);
       return;
     }
+    const createdAt = this.#clock();
     const card: CommandCatalogCard = {
       id: this.#newId(),
       address,
       context: delivery,
       principalId: principal.id,
       entries,
+      expiresAt: createdAt + this.#interactionLifetime,
       page: 0,
     };
     const rendered = this.#renderCommandCatalogCard(card);
@@ -1072,7 +1100,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       { replyMarkup: this.#cardReplyMarkup(rendered) },
       signal,
     );
-    this.#catalogCards.set(card.id, card);
+    this.#replaceCommandCatalogCard(card);
   }
 
   #renderCommandCatalogCard(card: CommandCatalogCard): TelegramCardRender {
@@ -1400,11 +1428,13 @@ export class TelegramTransportAdapter implements TransportAdapter {
     const card = this.#catalogCards.get(remainder.slice(0, separator));
     if (
       card === undefined ||
+      card.expiresAt <= this.#clock() ||
       card.principalId !== principal.id ||
       !sameAddress(card.address, address) ||
       card.receipt?.messageId !== String(query.message.message_id)
     ) {
-      await acknowledge("This command search has expired.", true);
+      if (card !== undefined && card.expiresAt <= this.#clock()) this.#removeCommandCatalogCard(card);
+      await acknowledge("This command search has expired.");
       return;
     }
     const action = remainder.slice(separator + 1);
@@ -1436,6 +1466,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
       await acknowledge("This command is no longer available.");
       return;
     }
+    this.#removeCommandCatalogCard(card);
     await context.receive(
       {
         id: `telegram:${this.#account}:command-catalog:${updateId}`,
@@ -1449,7 +1480,6 @@ export class TelegramTransportAdapter implements TransportAdapter {
       context.signal,
     );
     this.#store.recordCommandUsage?.(principal.id, entry.name, this.#clock());
-    this.#catalogCards.delete(card.id);
     await acknowledge(`Sent /${entry.name}`);
   }
 

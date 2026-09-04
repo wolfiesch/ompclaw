@@ -66,6 +66,8 @@ export interface FakeTelegramApiOptions {
   readonly pairingApprovalMonitorError?: Error;
   readonly botIdentity?: Record<string, unknown>;
   readonly botProfileError?: Error;
+  readonly now?: () => number;
+  readonly randomId?: () => string;
 }
 
 export class FakeTelegramApi {
@@ -99,8 +101,8 @@ export class FakeTelegramApi {
       acquireLock: () => ({ ok: true }),
       releaseLock: () => {},
       startLockHeartbeat: () => () => {},
-      now: () => 1_800_000_000_000,
-      randomId: () => "interaction-id",
+      now: options.now ?? (() => 1_800_000_000_000),
+      randomId: options.randomId ?? (() => "interaction-id"),
       startPairingApprovalMonitor: (run) => {
         if (options.pairingApprovalMonitorError) throw options.pairingApprovalMonitorError;
         this.#pairingApprovalRun = run;
@@ -148,6 +150,7 @@ export interface TelegramAdapterHarnessOptions extends FakeTelegramApiOptions {
   readonly pendingInteractions?: readonly PendingInteraction[];
   readonly ompCommands?: readonly OmpAvailableCommand[];
   readonly recentCommands?: readonly string[];
+  readonly uiTimeoutMs?: number;
 }
 
 export interface TelegramAdapterHarness {
@@ -298,7 +301,7 @@ export async function createTelegramAdapterHarness(
     },
     api: api.seams,
     ...(options.transcribe ? { transcribeCommand: ["speech-to-text"] } : {}),
-    uiTimeoutMs: 10_000,
+    uiTimeoutMs: options.uiTimeoutMs ?? 10_000,
   });
   let receiveAttempt = 0;
   const context: TransportStartContext = {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -323,6 +323,87 @@ describe("Telegram command catalog", () => {
       }),
     ]);
     expect(commandUsage).toEqual(["deploy"]);
+  });
+
+  test("replaces a prior catalog search card for the same sender", async () => {
+    let nextId = 0;
+    const { adapter, calls, received } = await fixture({
+      ompCommands: [{ name: "deploy", description: "Ship the current branch", source: "skill" }],
+      randomId: () => `catalog-${++nextId}`,
+    });
+
+    await adapter.handleUpdate({ update_id: 95, message: message({ text: "/commands deploy" }) });
+    const first = sentMessage(calls);
+    await adapter.handleUpdate({ update_id: 96, message: message({ message_id: 11, text: "/commands deploy" }) });
+    const second = sentMessage(calls);
+
+    await adapter.handleUpdate({
+      update_id: 97,
+      callback_query: {
+        id: "catalog-prior",
+        from: { id: 42 },
+        data: callbackData(first, "/deploy"),
+        message: message({ message_id: 201, text: "Command search" }),
+      },
+    });
+    expect(received).toEqual([]);
+    expect(sentMessage(calls, "answerCallbackQuery").payload).toMatchObject({
+      callback_query_id: "catalog-prior",
+      text: "This command search has expired.",
+    });
+
+    await adapter.handleUpdate({
+      update_id: 98,
+      callback_query: {
+        id: "catalog-current",
+        from: { id: 42 },
+        data: callbackData(second, "/deploy"),
+        message: message({ message_id: 202, text: "Command search" }),
+      },
+    });
+    expect(received).toEqual([expect.objectContaining({ content: { text: "/deploy" } })]);
+  });
+
+  test("rejects an expired catalog card without dispatching a command", async () => {
+    let now = 1_800_000_000_000;
+    const { adapter, calls, received } = await fixture({
+      ompCommands: [{ name: "deploy", description: "Ship the current branch", source: "skill" }],
+      now: () => now,
+      randomId: () => "catalog-expired",
+    });
+
+    await adapter.handleUpdate({ update_id: 99, message: message({ text: "/commands deploy" }) });
+    const card = sentMessage(calls);
+    now += 10_001;
+    await adapter.handleUpdate({
+      update_id: 100,
+      callback_query: {
+        id: "catalog-expired",
+        from: { id: 42 },
+        data: callbackData(card, "/deploy"),
+        message: message({ message_id: 201, text: "Command search" }),
+      },
+    });
+
+    expect(received).toEqual([]);
+    expect(sentMessage(calls, "answerCallbackQuery").payload).toEqual({
+      callback_query_id: "catalog-expired",
+      text: "This command search has expired.",
+    });
+  });
+
+  test("clears catalog card expiry timers when stopping", async () => {
+    const clear = spyOn(globalThis, "clearTimeout");
+    try {
+      const { adapter } = await fixture({
+        ompCommands: [{ name: "deploy", description: "Ship the current branch", source: "skill" }],
+      });
+      await adapter.handleUpdate({ update_id: 101, message: message({ text: "/commands deploy" }) });
+      await adapter.stop();
+      expect(clear).toHaveBeenCalledTimes(1);
+    } finally {
+      clear.mockRestore();
+    }
   });
 });
 describe("Telegram typing", () => {
