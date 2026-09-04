@@ -6,20 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Replace Telegram approval prompts with in-message decision cards that visibly settle approved, denied, or expired requests; long OMP clarifications use numbered choices and a correlated typed “Other answer”.
+- Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
+- Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
+- Add paginated Telegram model cards that choose a provider before its models, retain the current selection, and return to the same message on navigation.
+- Add an authorized searchable Telegram command and skill catalog through `/commands` and inline mode, with ranked results, durable per-principal recency, paginated picker cards, and private/group-scoped native menus.
 - Redesign Telegram Home control surface with distinct Idle ("🟢 Ready", hero session title, combined model and reasoning settings, and direct state-exposing Fast toggle) and Busy ("🟡 Working · <elapsed>", active task title, current step, Open task, and single-tap Stop) states, moving context details, auto-compaction, queue size, and session identifiers under a More sub-surface.
 - Humanize scheduled job rules and next runs with local natural-language cron formatting ("Every day at 9:00 AM", "Every weekday at 9:00 AM", "Every 30 minutes") with exotic-expression fallback, and relative run times with friendly timezone names ("in 45 min", "Today at 9:00 AM Pacific", "Tomorrow at 9:00 AM Pacific").
 - Add Schedule Detail surface with state-exposing Pause/Resume, Run now, Edit, and a dedicated confirmation card for Schedule Delete that settles in-message.
-- Replace Telegram approval prompts with in-message decision cards that visibly settle approved, denied, or expired requests; long OMP clarifications use numbered choices and a correlated typed “Other answer”.
-- Add paginated Telegram model cards that choose a provider before its models, retain the current selection, and return to the same message on navigation.
-- Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
-- Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
-- Add actionable Telegram failure cards with a plain-language cause, one-tap retry, expandable bounded details, task history, and fresh-start controls.
-- Add table-driven native Telegram media dispatch for outbound attachments, sending audio (`sendAudio`), voice notes (`sendVoice`), video (`sendVideo`), animations (`sendAnimation`), photos (`sendPhoto`), and documents (`sendDocument`) by MIME type and file extension, with native `sendMediaGroup` grouping for visual and audio sets and automatic fallback to documents for mixed media batches.
-- Add an authorized searchable Telegram command and skill catalog through `/commands` and inline mode, with ranked results, durable per-principal recency, paginated picker cards, and private/group-scoped native menus.
-
 - Add a single durable Telegram pairing journey card that updates in place for approval, rejection, expiry, retry, connected Home access, and dismissible command examples.
 - Print the bot's `https://t.me/<botusername>` deep link during successful interactive setup.
 - Refresh the Telegram Bot API description and short description at setup and gateway startup, plus a derivable friendly name without making profile API failures fatal.
+- Add table-driven native Telegram media dispatch for outbound attachments, sending audio (`sendAudio`), voice notes (`sendVoice`), video (`sendVideo`), animations (`sendAnimation`), photos (`sendPhoto`), and documents (`sendDocument`) by MIME type and file extension, with native `sendMediaGroup` grouping for visual and audio sets and automatic fallback to documents for mixed media batches.
+- Add actionable Telegram failure cards with a plain-language cause, one-tap retry, expandable bounded details, task history, and fresh-start controls.
 
 ### Changed
 
