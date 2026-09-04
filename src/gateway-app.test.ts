@@ -401,7 +401,7 @@ describe("GatewayApplication", () => {
         if (armed && text === "unrelated question") return { kind: "query", prompt: text, consumesArm: true };
         return undefined;
       },
-      async handle(message, route) {
+      async handle(_message, route) {
         if (route.kind === "arm") {
           armed = !armed;
           return { armChanged: true, armed };
