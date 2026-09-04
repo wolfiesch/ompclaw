@@ -2,14 +2,22 @@ import { mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { ConversationAddress, InboundMessage, OutboundReceipt, TransportIdentity } from "./gateway-types";
+import type {
+  ConversationAddress,
+  InboundMessage,
+  OutboundReceipt,
+  Principal,
+  TransportIdentity,
+} from "./gateway-types";
 import { executeGatewayHostTool, gatewayHostToolDefinitions, type GatewayDelivery } from "./gateway-tools";
 import { ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
 import type { GatewayUpdateControl } from "./gateway-update";
 import type {
   GatewayCommandCatalogStore,
+  GatewayPrincipalStore,
   GatewaySemanticViewStore,
   GatewayTurnLifecycleStore,
+  GatewayTurnOutcomeStore,
   GatewayTurnTimelineStore,
   TurnLifecycle,
   TurnLifecycleState,
@@ -87,7 +95,13 @@ export interface RpcRuntimeLogger {
 }
 
 type RpcRuntimeStore = GatewayTurnLifecycleStore &
-  Partial<Pick<GatewayCommandCatalogStore, "replaceOmpAvailableCommands"> & Pick<GatewaySemanticViewStore, "getSemanticView"> & GatewayTurnTimelineStore>;
+  Partial<
+    GatewayPrincipalStore &
+      GatewayTurnOutcomeStore &
+      Pick<GatewayCommandCatalogStore, "replaceOmpAvailableCommands"> &
+      Pick<GatewaySemanticViewStore, "getSemanticView"> &
+      GatewayTurnTimelineStore
+  >;
 
 export interface RpcGatewayRuntimeOptions {
   readonly config: RpcRuntimeConfig;
@@ -218,6 +232,7 @@ export class RpcGatewayRuntime {
     this.#options.turnStore?.interruptActiveTurns(this.#now());
     try {
       await this.#startRpc();
+      await this.#recoverPendingTurnOutcomes();
       this.#log.info(`[ompclaw rpc] OMP ${this.#status.state?.sessionId ?? "session"} started`);
     } catch (error) {
       await this.stop();
@@ -661,7 +676,6 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "agent_end" && frame.isTerminal !== false) {
-      if (this.#status.state) this.#status.state.isStreaming = false;
       const active = this.#activeTurn;
       const terminalState = this.#terminalState(frame.messages);
       const terminalText = finalAssistantText(frame.messages);
@@ -669,7 +683,7 @@ export class RpcGatewayRuntime {
         terminalText || active?.previewText || this.#missingTerminalSummaryText(terminalState);
       let finalDelivered = false;
       try {
-        await this.#finalizeAssistantText(visibleTerminalText);
+        await this.#finalizeAssistantText(visibleTerminalText, terminalState);
         finalDelivered = terminalText.trim().length > 0;
         await this.#setTurnLifecycle(terminalState);
         active?.scheduledCompletion?.resolve();
@@ -819,6 +833,7 @@ export class RpcGatewayRuntime {
       else if (name === "queue") await this.#queueCommand(args, reply);
       else if (name === "tasks") await this.#tasksCommand(delivery);
       else if (name === "task_retry") await this.#taskRetryCommand(delivery, args, reply);
+      else if (name === "result") await this.#resultCommand(delivery, args, reply);
       else if (name === "task_details") await this.#taskDetailsCommand(delivery, args, reply);
       else if (name === "stats") await reply(valueText(await this.#requestData({ type: "get_session_stats" })));
       else if (name === "todos") await reply(this.#todosText());
@@ -1711,6 +1726,33 @@ export class RpcGatewayRuntime {
       .find((candidate) => candidate.id === id && candidate.principalId === delivery.deliveryContext.principal.id);
   }
 
+  async #resultCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const id = args.trim();
+    if (!id) {
+      await reply("Usage: /result <task-id>");
+      return;
+    }
+    const task = this.#ownedTask(delivery, id);
+    const outcome = this.#options.turnStore?.getTurnOutcome?.(id);
+    if (task === undefined || outcome === undefined || outcome.principalId !== delivery.deliveryContext.principal.id) {
+      await reply("That task result is no longer available.");
+      return;
+    }
+    await this.#options.delivery.send(
+      delivery.address,
+      {
+        text: outcome.text,
+        format: "markdown",
+        ...(outcome.replyTo === undefined ? {} : { replyTo: outcome.replyTo }),
+      },
+      delivery.deliveryContext,
+    );
+  }
+
   async #taskDetailsCommand(
     delivery: GatewayTurnTarget,
     args: string,
@@ -1797,8 +1839,46 @@ export class RpcGatewayRuntime {
         : previous.then(() => this.#reactToSource(delivery, emoji));
     this.#reactionQueues.set(key, queued);
     void queued.finally(() => {
+
       if (this.#reactionQueues.get(key) === queued) this.#reactionQueues.delete(key);
     });
+  }
+
+  async #recoverPendingTurnOutcomes(): Promise<void> {
+    const store = this.#options.turnStore;
+    if (
+      store === undefined ||
+      typeof store.listPendingTurnOutcomes !== "function" ||
+      typeof store.getPrincipal !== "function" ||
+      typeof store.recordTurnOutcomeAttempt !== "function" ||
+      typeof store.markTurnOutcomeDelivered !== "function"
+    ) {
+      return;
+    }
+    for (const outcome of store.listPendingTurnOutcomes()) {
+      const principal: Principal | undefined = store.getPrincipal(outcome.principalId);
+      if (principal === undefined) {
+        this.#log.warn(`[ompclaw rpc] Unable to recover outcome ${outcome.turnId}: principal no longer exists`);
+        continue;
+      }
+      try {
+        store.recordTurnOutcomeAttempt(outcome.turnId, this.#now());
+        await this.#options.delivery.send(
+          outcome.address,
+          {
+            text: outcome.text,
+            format: "markdown",
+            ...(outcome.replyTo === undefined ? {} : { replyTo: outcome.replyTo }),
+          },
+          { principal, origin: outcome.address },
+        );
+        store.markTurnOutcomeDelivered(outcome.turnId, this.#now());
+      } catch (error) {
+        this.#log.warn(
+          `[ompclaw rpc] Unable to recover outcome ${outcome.turnId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
   }
 
   async #reactToSource(delivery: GatewayTurnTarget | undefined, emoji: string): Promise<void> {
@@ -1837,9 +1917,25 @@ export class RpcGatewayRuntime {
     active.previewText = text;
   }
 
-  async #finalizeAssistantText(text: string): Promise<boolean> {
+  async #finalizeAssistantText(
+    text: string,
+    state: Extract<TurnLifecycleState, "completed" | "stopped" | "failed">,
+  ): Promise<boolean> {
     const active = this.#activeTurn;
-    if (!active || text.trim().length === 0 || active.finalText === text) return false;
+    const lifecycle = active?.lifecycle;
+    if (!active || !lifecycle || text.trim().length === 0 || active.finalText === text) return false;
+    const now = this.#now();
+    this.#options.turnStore?.putTurnOutcome?.({
+      turnId: lifecycle.id,
+      principalId: lifecycle.principalId,
+      address: lifecycle.address,
+      state,
+      text,
+      createdAt: now,
+      attemptCount: 0,
+      ...(active.sourceReceipt === undefined ? {} : { replyTo: active.sourceReceipt }),
+    });
+    this.#options.turnStore?.recordTurnOutcomeAttempt?.(lifecycle.id, now);
     const receipts = await this.#options.delivery.finalize(
       active.address,
       active.receipt,
@@ -1847,6 +1943,7 @@ export class RpcGatewayRuntime {
       active.deliveryContext,
     );
     active.receipt = receipts[0] ?? active.receipt;
+    this.#options.turnStore?.markTurnOutcomeDelivered?.(lifecycle.id, this.#now());
     active.previewText = text;
     active.finalText = text;
     return true;

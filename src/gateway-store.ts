@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { OmpAvailableCommand } from "./command-catalog";
-import type { ConversationAddress, InboundMessage, Principal, TransportIdentity } from "./gateway-types";
+import type { ConversationAddress, InboundMessage, OutboundReceipt, Principal, TransportIdentity } from "./gateway-types";
 import {
   isSemanticViewIdentifier,
   normalizeStoredSemanticView,
@@ -95,6 +95,31 @@ export interface GatewayTurnTimelineStore {
   listTurnTimelineEvents(turnId: string, limit?: number): TurnTimelineEvent[];
 }
 
+export interface TurnOutcome {
+  readonly turnId: string;
+  readonly principalId: string;
+  readonly address: ConversationAddress;
+  readonly state: Extract<TurnLifecycleState, "completed" | "stopped" | "failed">;
+  readonly text: string;
+  readonly createdAt: number;
+  readonly attemptCount: number;
+  readonly lastAttemptAt?: number;
+  readonly deliveredAt?: number;
+  readonly replyTo?: OutboundReceipt;
+}
+
+export interface GatewayTurnOutcomeStore {
+  putTurnOutcome(outcome: TurnOutcome): void;
+  getTurnOutcome(turnId: string): TurnOutcome | undefined;
+  listPendingTurnOutcomes(limit?: number): TurnOutcome[];
+  recordTurnOutcomeAttempt(turnId: string, attemptedAt: number): void;
+  markTurnOutcomeDelivered(turnId: string, deliveredAt: number): boolean;
+}
+
+export interface GatewayPrincipalStore {
+  getPrincipal(id: string): Principal | undefined;
+}
+
 export interface GatewayTurnLifecycleStore {
   putTurnLifecycle(turn: TurnLifecycle): void;
   interruptActiveTurns(interruptedAt: number): number;
@@ -104,6 +129,7 @@ export interface GatewayTurnLifecycleStore {
 export interface GatewayCommandCatalogStore {
   replaceOmpAvailableCommands(commands: readonly OmpAvailableCommand[]): void;
   listOmpAvailableCommands(): readonly OmpAvailableCommand[];
+
   recordCommandUsage(principalId: string, commandName: string, usedAt: number): void;
   listRecentCommandUsage(principalId: string, limit?: number): readonly string[];
 }
@@ -734,6 +760,49 @@ function decodeTurnTimelineEvent(row: SqlRow): TurnTimelineEvent {
   };
 }
 
+function decodeTurnOutcome(row: SqlRow): TurnOutcome {
+  const context = "turn outcome";
+  const state = storedString(row, "state", context);
+  if (state !== "completed" && state !== "stopped" && state !== "failed") {
+    throw new Error("corrupt turn outcome: invalid state");
+  }
+  const thread = storedString(row, "thread", context);
+  const replyTransport = row.reply_transport;
+  const replyMessageId = row.reply_message_id;
+  if (
+    (replyTransport === null) !== (replyMessageId === null) ||
+    (replyTransport !== null && typeof replyTransport !== "string") ||
+    (replyMessageId !== null && typeof replyMessageId !== "string")
+  ) {
+    throw new Error("corrupt turn outcome: invalid reply receipt");
+  }
+  const replyTo =
+    replyTransport === null || replyMessageId === null
+      ? undefined
+      : { transport: replyTransport, messageId: replyMessageId };
+  return {
+    turnId: storedString(row, "turn_id", context),
+    principalId: storedString(row, "principal_id", context),
+    address: {
+      transport: storedString(row, "transport", context),
+      account: storedString(row, "account", context),
+      channel: storedString(row, "channel", context),
+      ...(thread === "" ? {} : { thread }),
+    },
+    state: state as TurnOutcome["state"],
+    text: storedString(row, "text", context),
+    createdAt: storedTimestamp(row, "created_at", context),
+    attemptCount: storedCount(row, "attempt_count", context),
+    ...(optionalStoredTimestamp(row, "last_attempt_at", context) === undefined
+      ? {}
+      : { lastAttemptAt: optionalStoredTimestamp(row, "last_attempt_at", context) }),
+    ...(optionalStoredTimestamp(row, "delivered_at", context) === undefined
+      ? {}
+      : { deliveredAt: optionalStoredTimestamp(row, "delivered_at", context) }),
+    ...(replyTo === undefined ? {} : { replyTo }),
+  };
+}
+
 function encodeSemanticViewJson(value: unknown, context: string): string {
   const encoded = JSON.stringify(value);
   if (typeof encoded !== "string") throw new Error(`${context} must be JSON-serializable`);
@@ -837,6 +906,33 @@ function validateTurnTimelineEvent(event: TurnTimelineEvent): void {
   }
 }
 
+function validateTurnOutcome(outcome: TurnOutcome): void {
+  requiredText(outcome.turnId, "turn outcome turn id");
+  requiredText(outcome.principalId, "turn outcome principal");
+  validateAddress(outcome.address);
+  if (outcome.state !== "completed" && outcome.state !== "stopped" && outcome.state !== "failed") {
+    throw new Error("turn outcome state is invalid");
+  }
+  requiredText(outcome.text, "turn outcome text");
+  if (outcome.text.length > 100_000) throw new Error("turn outcome text exceeds 100000 characters");
+  for (const [label, value] of [
+    ["created", outcome.createdAt],
+    ["last attempt", outcome.lastAttemptAt],
+    ["delivered", outcome.deliveredAt],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new Error(`turn outcome ${label} timestamp must be a safe nonnegative integer`);
+    }
+  }
+  if (!Number.isSafeInteger(outcome.attemptCount) || outcome.attemptCount < 0) {
+    throw new Error("turn outcome attempt count must be a safe nonnegative integer");
+  }
+  if (outcome.replyTo !== undefined) {
+    requiredText(outcome.replyTo.transport, "turn outcome reply transport");
+    requiredText(outcome.replyTo.messageId, "turn outcome reply message id");
+  }
+}
+
 const TURN_LIFECYCLE_FIELDS = [
   "id",
   "principal_id",
@@ -851,6 +947,23 @@ const TURN_LIFECYCLE_FIELDS = [
   "updated_at",
   "finished_at",
   "error",
+].join(", ");
+
+const TURN_OUTCOME_FIELDS = [
+  "turn_id",
+  "principal_id",
+  "transport",
+  "account",
+  "channel",
+  "thread",
+  "state",
+  "text",
+  "created_at",
+  "attempt_count",
+  "last_attempt_at",
+  "delivered_at",
+  "reply_transport",
+  "reply_message_id",
 ].join(", ");
 
 const SCHEDULED_JOB_FIELDS = [
@@ -1183,6 +1296,27 @@ export class GatewayStore implements GatewaySemanticViewStore {
       CREATE INDEX IF NOT EXISTS turn_timeline_events_turn_recent
         ON turn_timeline_events (turn_id, id DESC);
 
+      CREATE TABLE IF NOT EXISTS turn_outcomes (
+        turn_id TEXT PRIMARY KEY NOT NULL REFERENCES turn_lifecycles(id) ON DELETE CASCADE,
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+        transport TEXT NOT NULL,
+        account TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('completed', 'stopped', 'failed')),
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at INTEGER,
+        delivered_at INTEGER,
+        reply_transport TEXT,
+        reply_message_id TEXT,
+        CHECK ((reply_transport IS NULL) = (reply_message_id IS NULL))
+      );
+
+      CREATE INDEX IF NOT EXISTS turn_outcomes_pending
+        ON turn_outcomes (delivered_at, created_at);
+
       CREATE TABLE IF NOT EXISTS semantic_views (
         transport TEXT NOT NULL,
         account TEXT NOT NULL,
@@ -1477,6 +1611,7 @@ export class GatewayStore implements GatewaySemanticViewStore {
       }
 
       const binding = this.#database
+
         .query(
           `SELECT principal_id FROM transport_identities
            WHERE transport = ? AND account = ? AND subject = ?`,
@@ -1567,6 +1702,14 @@ export class GatewayStore implements GatewaySemanticViewStore {
       )
       .get(identity.transport, identity.account, identity.subject) as SqlRow | null;
 
+    return row === null ? undefined : decodePrincipal(row);
+  }
+
+  getPrincipal(id: string): Principal | undefined {
+    requiredText(id, "principal id");
+    const row = this.#database
+      .query("SELECT id, roles_json FROM principals WHERE id = ?")
+      .get(id) as SqlRow | null;
     return row === null ? undefined : decodePrincipal(row);
   }
 
@@ -2038,10 +2181,96 @@ export class GatewayStore implements GatewaySemanticViewStore {
         .query(`
         DELETE FROM inbound_messages AS inbound
         WHERE inbound.received_at < ? AND ${pendingGuard}
+
       `)
         .run(before);
       return count;
     });
+  }
+
+  putTurnOutcome(outcome: TurnOutcome): void {
+    validateTurnOutcome(outcome);
+    const principal = this.#database.query("SELECT 1 FROM principals WHERE id = ?").get(outcome.principalId);
+    if (principal === null) throw new Error("turn outcome principal does not exist");
+    this.#database
+      .query(
+        `INSERT INTO turn_outcomes (
+          turn_id, principal_id, transport, account, channel, thread, state, text,
+          created_at, attempt_count, last_attempt_at, delivered_at, reply_transport, reply_message_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(turn_id) DO UPDATE SET
+          state = excluded.state,
+          text = excluded.text,
+          reply_transport = excluded.reply_transport,
+          reply_message_id = excluded.reply_message_id
+        WHERE turn_outcomes.delivered_at IS NULL`,
+      )
+      .run(
+        outcome.turnId,
+        outcome.principalId,
+        outcome.address.transport,
+        outcome.address.account,
+        outcome.address.channel,
+        outcome.address.thread ?? "",
+        outcome.state,
+        outcome.text,
+        outcome.createdAt,
+        outcome.attemptCount,
+        outcome.lastAttemptAt ?? null,
+        outcome.deliveredAt ?? null,
+        outcome.replyTo?.transport ?? null,
+        outcome.replyTo?.messageId ?? null,
+      );
+  }
+
+  getTurnOutcome(turnId: string): TurnOutcome | undefined {
+    requiredText(turnId, "turn outcome turn id");
+    const row = this.#database
+      .query(`SELECT ${TURN_OUTCOME_FIELDS} FROM turn_outcomes WHERE turn_id = ?`)
+      .get(turnId) as SqlRow | null;
+    return row === null ? undefined : decodeTurnOutcome(row);
+  }
+
+  listPendingTurnOutcomes(limit = 100): TurnOutcome[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("turn outcome limit must be an integer from 1 to 100");
+    }
+    const rows = this.#database
+      .query(
+        `SELECT ${TURN_OUTCOME_FIELDS}
+         FROM turn_outcomes
+         WHERE delivered_at IS NULL
+         ORDER BY created_at ASC, turn_id ASC
+         LIMIT ?`,
+      )
+      .all(limit) as SqlRow[];
+    return rows.map(decodeTurnOutcome);
+  }
+
+  recordTurnOutcomeAttempt(turnId: string, attemptedAt: number): void {
+    requiredText(turnId, "turn outcome turn id");
+    if (!Number.isSafeInteger(attemptedAt) || attemptedAt < 0) {
+      throw new Error("turn outcome attempt timestamp must be a safe nonnegative integer");
+    }
+    this.#database
+      .query(
+        `UPDATE turn_outcomes
+         SET attempt_count = attempt_count + 1, last_attempt_at = ?
+         WHERE turn_id = ? AND delivered_at IS NULL`,
+      )
+      .run(attemptedAt, turnId);
+  }
+
+  markTurnOutcomeDelivered(turnId: string, deliveredAt: number): boolean {
+    requiredText(turnId, "turn outcome turn id");
+    if (!Number.isSafeInteger(deliveredAt) || deliveredAt < 0) {
+      throw new Error("turn outcome delivered timestamp must be a safe nonnegative integer");
+    }
+    return (
+      this.#database
+        .query("UPDATE turn_outcomes SET delivered_at = ? WHERE turn_id = ? AND delivered_at IS NULL")
+        .run(deliveredAt, turnId).changes > 0
+    );
   }
 
   putTurnLifecycle(turn: TurnLifecycle): void {

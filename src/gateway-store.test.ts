@@ -599,6 +599,16 @@ describe("GatewayStore", () => {
       updatedAt: 400,
       finishedAt: 400,
     });
+    first.putTurnOutcome({
+      turnId: "turn-complete",
+      principalId: "operator-42",
+      address: { ...ownerAddress, thread: "topic-1" },
+      state: "completed",
+      text: "Release summary",
+      createdAt: 400,
+      attemptCount: 0,
+      replyTo: { transport: "telegram", messageId: "request-42" },
+    });
     first.close();
 
     const restarted = new GatewayStore(path);
@@ -622,6 +632,26 @@ describe("GatewayStore", () => {
     expect(restarted.listTurnLifecycles({ ...ownerAddress, thread: "topic-1" })).toEqual([
       expect.objectContaining({ id: "turn-complete", state: "completed" }),
     ]);
+    expect(restarted.listPendingTurnOutcomes()).toEqual([
+      {
+        turnId: "turn-complete",
+        principalId: "operator-42",
+        address: { ...ownerAddress, thread: "topic-1" },
+        state: "completed",
+        text: "Release summary",
+        createdAt: 400,
+        attemptCount: 0,
+        replyTo: { transport: "telegram", messageId: "request-42" },
+      },
+    ]);
+    restarted.recordTurnOutcomeAttempt("turn-complete", 550);
+    expect(restarted.markTurnOutcomeDelivered("turn-complete", 600)).toBe(true);
+    expect(restarted.getTurnOutcome("turn-complete")).toMatchObject({
+      attemptCount: 1,
+      lastAttemptAt: 550,
+      deliveredAt: 600,
+    });
+    expect(restarted.listPendingTurnOutcomes()).toEqual([]);
     restarted.close();
   });
 

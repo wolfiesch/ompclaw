@@ -240,6 +240,7 @@ describe("runtime semantic projections", () => {
     );
     expect(failed.sections.map((section) => section.text).join("\n")).not.toContain("Use /status");
     expect(failed.actions.map((action) => action.command)).toEqual([
+      "/result task-1",
       "/task_retry task-1",
       "/task_details task-1",
       "/tasks",

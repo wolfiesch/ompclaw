@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - Replace Telegram approval prompts with in-message decision cards that visibly settle approved, denied, or expired requests; long OMP clarifications use numbered choices and a correlated typed “Other answer”.
 - Add prompt-backed task-card controls for immediate instructions and queued follow-ups.
 - Replace plain `/tasks` output with an actionable task timeline that persists task, tool, terminal, and restart-interruption events and can retry stopped, failed, or interrupted work.
+- Persist terminal task outcomes before transport delivery, replay undelivered outcomes after restart, and expose them through `/result <task-id>` and terminal task cards.
 - Add paginated Telegram model cards that choose a provider before its models, retain the current selection, and return to the same message on navigation.
 - Add an authorized searchable Telegram command and skill catalog through `/commands` and inline mode, with ranked results, durable per-principal recency, paginated picker cards, and private/group-scoped native menus.
 - Redesign Telegram Home control surface with distinct Idle ("🟢 Ready", hero session title, combined model and reasoning settings, and direct state-exposing Fast toggle) and Busy ("🟡 Working · <elapsed>", active task title, current step, Open task, and single-tap Stop) states, moving context details, auto-compaction, queue size, and session identifiers under a More sub-surface.

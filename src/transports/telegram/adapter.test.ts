@@ -1245,16 +1245,18 @@ describe("Telegram interactive UI", () => {
     expect(card.payload.text).not.toContain("transport.send");
     expect(card.payload.reply_markup).toMatchObject({
       inline_keyboard: [
-        [{ text: "↻ Retry" }, { text: "🔍 View details" }],
-        [{ text: "📋 Open task" }, { text: "✨ Start fresh" }],
+        [{ text: "📄 View result" }, { text: "↻ Retry" }],
+        [{ text: "🔍 View details" }, { text: "📋 Open task" }],
+        [{ text: "✨ Start fresh" }],
       ],
     });
 
     for (const [updateId, label, command] of [
-      [20, "↻ Retry", "/task_retry task-failed"],
-      [21, "🔍 View details", "/task_details task-failed"],
-      [22, "📋 Open task", "/tasks"],
-      [23, "✨ Start fresh", "/new"],
+      [20, "📄 View result", "/result task-failed"],
+      [21, "↻ Retry", "/task_retry task-failed"],
+      [22, "🔍 View details", "/task_details task-failed"],
+      [23, "📋 Open task", "/tasks"],
+      [24, "✨ Start fresh", "/new"],
     ] as const) {
       await adapter.handleUpdate({
         update_id: updateId,
@@ -1272,7 +1274,7 @@ describe("Telegram interactive UI", () => {
     await adapter.presentUi(baseAddress, { type: "semantic_view", view: detailed }, delivery);
     calls.splice(0);
     await adapter.handleUpdate({
-      update_id: 24,
+      update_id: 25,
       callback_query: {
         id: "stale-failure",
         from: { id: 42 },
@@ -1280,7 +1282,7 @@ describe("Telegram interactive UI", () => {
         message: message({ message_id: 201 }),
       },
     });
-    expect(received).toHaveLength(4);
+    expect(received).toHaveLength(5);
     expect(calls.find((entry) => entry.method === "editMessageText")?.payload.text).toContain("Provider socket timed out");
     expect(calls.findLast((entry) => entry.method === "answerCallbackQuery")?.payload.text).toBe(
       "Updated to the latest controls.",

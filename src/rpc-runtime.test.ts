@@ -7,12 +7,19 @@ import type {
   ConversationAddress,
   DeliveryContext,
   InboundMessage,
+  Principal,
   UiRequest,
   UiResponse,
   UiResponseFor,
 } from "./gateway-types";
 import type { GatewayDelivery } from "./gateway-tools";
-import type { GatewayTurnLifecycleStore, TurnLifecycle } from "./gateway-store";
+import type {
+  GatewayPrincipalStore,
+  GatewayTurnLifecycleStore,
+  GatewayTurnOutcomeStore,
+  TurnLifecycle,
+  TurnOutcome,
+} from "./gateway-store";
 import type { GatewayUpdateControl } from "./gateway-update";
 import type { OmpRpcClientOptions, RpcClient, RpcCommandInput, RpcFrameListener } from "./rpc-client";
 import type { RpcRuntimeConfig } from "./rpc-config";
@@ -286,7 +293,8 @@ describe("RpcGatewayRuntime", () => {
         },
       ],
     ]);
-    const turnStore: GatewayTurnLifecycleStore = {
+    const outcomes = new Map<string, TurnOutcome>();
+    const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore & GatewayPrincipalStore = {
       putTurnLifecycle: (turn) => turns.set(turn.id, turn),
       interruptActiveTurns: (interruptedAt) => {
         let changed = 0;
@@ -302,6 +310,20 @@ describe("RpcGatewayRuntime", () => {
           .filter((turn) => JSON.stringify(turn.address) === JSON.stringify(address))
           .sort((left, right) => right.createdAt - left.createdAt)
           .slice(0, limit),
+      getPrincipal: (id): Principal | undefined => ({ id, roles: ["owner"] }),
+      putTurnOutcome: (outcome) => outcomes.set(outcome.turnId, outcome),
+      getTurnOutcome: (id) => outcomes.get(id),
+      listPendingTurnOutcomes: () => [...outcomes.values()].filter((outcome) => outcome.deliveredAt === undefined),
+      recordTurnOutcomeAttempt: (id, attemptedAt) => {
+        const outcome = outcomes.get(id);
+        if (outcome) outcomes.set(id, { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt });
+      },
+      markTurnOutcomeDelivered: (id, deliveredAt) => {
+        const outcome = outcomes.get(id);
+        if (outcome === undefined || outcome.deliveredAt !== undefined) return false;
+        outcomes.set(id, { ...outcome, deliveredAt });
+        return true;
+      },
     };
     let now = 100;
     const runtime = createRuntime({
@@ -400,6 +422,14 @@ describe("RpcGatewayRuntime", () => {
     expect(completedCard).toMatchObject({
       view: { sections: [{ id: "progress", label: "Progress", tone: "success" }] },
     });
+    expect(outcomes.get("lifecycle-Deploy carefully")).toMatchObject({
+      state: "completed",
+      text: "Done",
+      attemptCount: 1,
+      deliveredAt: expect.any(Number),
+    });
+    await runtime.handleInbound(message("lifecycle", "/result lifecycle-Deploy carefully"));
+    expect(deliveries.at(-1)).toMatchObject({ method: "send", content: { text: "Done" } });
 
     expect(turns.get("lifecycle-Deploy carefully")).toMatchObject({
       state: "completed",
@@ -439,6 +469,43 @@ describe("RpcGatewayRuntime", () => {
           call.request.view.sections.some((section) => section.label?.includes("Deploy carefully")),
       ),
     ).toBe(true);
+    await runtime.stop();
+  });
+
+  test("retries an undelivered terminal outcome after runtime restart", async () => {
+    let outcome: TurnOutcome | undefined = {
+      turnId: "turn-recover",
+      principalId: "principal-recover",
+      address: { transport: "test", account: "account", channel: "recover" },
+      state: "completed",
+      text: "Recovered result",
+      createdAt: 100,
+      attemptCount: 0,
+      replyTo: { transport: "test", messageId: "source-recover" },
+    };
+    const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore & GatewayPrincipalStore = {
+      putTurnLifecycle: () => {},
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: () => [],
+      getPrincipal: (id) => (id === "principal-recover" ? { id, roles: ["owner"] } : undefined),
+      putTurnOutcome: (next) => {
+        outcome = next;
+      },
+      getTurnOutcome: () => outcome,
+      listPendingTurnOutcomes: () => (outcome?.deliveredAt === undefined ? [outcome] : []),
+      recordTurnOutcomeAttempt: (_id, attemptedAt) => {
+        if (outcome) outcome = { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt };
+      },
+      markTurnOutcomeDelivered: (_id, deliveredAt) => {
+        if (outcome === undefined || outcome.deliveredAt !== undefined) return false;
+        outcome = { ...outcome, deliveredAt };
+        return true;
+      },
+    };
+    const runtime = createRuntime({ config, delivery: delivery(), turnStore, now: () => 500 });
+    await runtime.start();
+    expect(deliveries.find((call) => call.method === "send" && textFromContent(call.content) === "Recovered result")).toBeDefined();
+    expect(outcome).toMatchObject({ attemptCount: 1, lastAttemptAt: 500, deliveredAt: 500 });
     await runtime.stop();
   });
 
@@ -1501,6 +1568,7 @@ describe("RpcGatewayRuntime", () => {
       "stop",
       "new",
       "tasks",
+      "result",
       "help",
     ]);
     expect(runtimeCommandMenu().map(({ command }) => command)).not.toContain("shell");

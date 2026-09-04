@@ -148,6 +148,10 @@ export function taskSemanticView(
         { id: "fresh", label: "✨ Start fresh", command: "/new" },
       ]
     : [];
+  const terminalActions = [
+    { id: "result", label: "📄 View result", command: `/result ${lifecycle.id}`, style: "primary" as const },
+    ...recoveryActions,
+  ];
   return {
     schemaVersion: 1,
     id: `task_${createHash("sha256").update(lifecycle.id).digest("hex").slice(0, 19)}`,
@@ -189,7 +193,7 @@ export function taskSemanticView(
         : []),
     ],
     actions: terminal
-      ? recoveryActions
+      ? terminalActions
       : [
           {
             id: "steer",
