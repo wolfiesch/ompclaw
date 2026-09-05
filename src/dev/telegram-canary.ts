@@ -17,7 +17,7 @@ export interface TelegramCanaryConfig {
   readonly cleanup: boolean;
 }
 
-export type TelegramCanarySurface = "home" | "decisions" | "quick-lane" | "watches" | "schedules" | "media";
+export type TelegramCanarySurface = "home" | "decisions" | "quick-lane" | "watches" | "schedules" | "media" | "voice";
 
 export interface TelegramCanaryReceipt {
   readonly bot: string;
@@ -96,10 +96,15 @@ const CANARY_SURFACES: readonly TelegramCanarySurface[] = [
   "watches",
   "schedules",
   "media",
+  "voice",
 ];
 
 const CANARY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
+const CANARY_OGG = Buffer.from(
+  "T2dnUwACAAAAAAAAAAAVXceLAAAAAFIS3gsBE09wdXNIZWFkAQE4AYC7AAAAAABPZ2dTAAAAAAAAAAAAABVdx4sBAAAA2ZKpfAE8T3B1c1RhZ3MMAAAATGF2ZjYzLjEuMTAxAQAAABwAAABlbmNvZGVyPUxhdmM2My4xLjEwMSBsaWJvcHVzT2dnUwAEGDAAAAAAAAAVXceLAgAAAP45VNENBwYGBgYGBgYGBgYGBggL5LmgvIQIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsY=",
   "base64",
 );
 
@@ -116,7 +121,7 @@ export async function runTelegramCanary(options: TelegramCanaryOptions): Promise
   const marker = `ompclaw-canary-${(options.now ?? Date.now)()}`;
   const messageIds: number[] = [];
   const sendMessage = async (
-    surface: Exclude<TelegramCanarySurface, "media">,
+    surface: Exclude<TelegramCanarySurface, "media" | "voice">,
     content: TelegramUiScenario,
   ): Promise<void> => {
     const sent = await api<TgMessage>(options.token, "sendMessage", {
@@ -130,7 +135,7 @@ export async function runTelegramCanary(options: TelegramCanaryOptions): Promise
 
   const status = await api<TgMessage>(options.token, "sendMessage", {
     chat_id: options.chatId,
-    text: `OmpClaw handset canary\n${marker}\nStarting six surface checks. Buttons are visual fixtures.`,
+    text: `OmpClaw handset canary\n${marker}\nStarting seven surface checks. Buttons are visual fixtures.`,
     disable_notification: true,
   });
   messageIds.push(status.message_id);
@@ -153,9 +158,11 @@ export async function runTelegramCanary(options: TelegramCanaryOptions): Promise
   try {
     const photoPath = join(directory, "canary.png");
     const documentPath = join(directory, "canary.txt");
+    const voicePath = join(directory, "canary-voice.ogg");
     await Promise.all([
       writeFile(photoPath, CANARY_PNG),
       writeFile(documentPath, `OmpClaw Telegram media canary\n${marker}\n`),
+      writeFile(voicePath, CANARY_OGG),
     ]);
     const photo = await upload<TgMessage>(
       options.token,
@@ -169,7 +176,13 @@ export async function runTelegramCanary(options: TelegramCanaryOptions): Promise
       { chat_id: options.chatId, caption: "CANARY · media document", disable_notification: 1 },
       { field: "document", path: documentPath },
     );
-    messageIds.push(photo.message_id, document.message_id);
+    const voice = await upload<TgMessage>(
+      options.token,
+      "sendVoice",
+      { chat_id: options.chatId, caption: "CANARY · voice", disable_notification: 1 },
+      { field: "voice", path: voicePath },
+    );
+    messageIds.push(photo.message_id, document.message_id, voice.message_id);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

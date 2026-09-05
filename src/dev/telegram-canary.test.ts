@@ -51,9 +51,9 @@ describe("Telegram live canary", () => {
     ).resolves.toEqual({
       bot: "@ompclaw_test_bot",
       chatId: "42",
-      messageIds: [99, 100, 101, 102, 103, 104, 105, 106],
+      messageIds: [99, 100, 101, 102, 103, 104, 105, 106, 107],
       marker: "ompclaw-canary-1800000000000",
-      surfaces: ["home", "decisions", "quick-lane", "watches", "schedules", "media"],
+      surfaces: ["home", "decisions", "quick-lane", "watches", "schedules", "media", "voice"],
       cleanedUp: true,
     });
     expect(calls.map(({ method }) => method)).toEqual([
@@ -67,10 +67,10 @@ describe("Telegram live canary", () => {
       "sendMessage",
       "sendMessage",
       "editMessageText",
-      ...Array.from({ length: 8 }, () => "deleteMessage"),
+      ...Array.from({ length: 9 }, () => "deleteMessage"),
     ]);
     expect(calls.filter(({ method }) => method === "sendMessage").map(({ payload }) => payload.text)).toEqual([
-      expect.stringContaining("Starting six surface checks"),
+      expect.stringContaining("Starting seven surface checks"),
       expect.stringContaining("CANARY · home"),
       expect.stringContaining("CANARY · decisions"),
       expect.stringContaining("CANARY · quick-lane"),
@@ -78,11 +78,12 @@ describe("Telegram live canary", () => {
       expect.stringContaining("CANARY · schedules"),
     ]);
     expect(calls.filter(({ method }) => method === "deleteMessage").map(({ payload }) => payload.message_id)).toEqual([
-      106, 105, 104, 103, 102, 101, 100, 99,
+      107, 106, 105, 104, 103, 102, 101, 100, 99,
     ]);
     expect(uploads).toEqual([
       expect.objectContaining({ method: "sendPhoto", field: "photo", filename: "canary.png" }),
       expect.objectContaining({ method: "sendDocument", field: "document", filename: "canary.txt" }),
+      expect.objectContaining({ method: "sendVoice", field: "voice", filename: "canary-voice.ogg" }),
     ]);
   });
 

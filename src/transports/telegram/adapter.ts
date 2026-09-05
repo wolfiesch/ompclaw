@@ -144,12 +144,7 @@ export interface TelegramTransportAdapterOptions {
     | "getSemanticViewByReceipt"
     | "putSemanticView"
   > &
-    Partial<
-      Pick<
-        GatewayStore,
-        "listOmpAvailableCommands" | "recordCommandUsage" | "listRecentCommandUsage"
-      >
-    >;
+    Partial<Pick<GatewayStore, "listOmpAvailableCommands" | "recordCommandUsage" | "listRecentCommandUsage">>;
   readonly pairing?: Pick<
     GatewayPairingService,
     "requestFromTransport" | "listUnconfirmedApprovals" | "completeConfirmation"
@@ -958,7 +953,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
     address: ConversationAddress,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (message.voice === undefined && message.video_note === undefined) return;
+    if ((message.voice === undefined && message.video_note === undefined) || !this.#transcriptionCommand?.length)
+      return;
     try {
       await this.#telegram(
         "setMessageReaction",
@@ -987,6 +983,30 @@ export class TelegramTransportAdapter implements TransportAdapter {
           } (reaction: ${reactionError instanceof Error ? reactionError.message : String(reactionError)})`,
         );
       }
+    }
+  }
+  async #notifyTranscriptionProblem(
+    message: TgMessage,
+    address: ConversationAddress,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    try {
+      await this.#telegram(
+        "sendMessage",
+        {
+          chat_id: message.chat.id,
+          message_thread_id: address.thread === undefined ? undefined : Number(address.thread),
+          text,
+        },
+        signal,
+      );
+    } catch (error) {
+      this.#log?.warn(
+        `[telegram] transcription notice failed for message ${message.message_id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 
@@ -1071,10 +1091,9 @@ export class TelegramTransportAdapter implements TransportAdapter {
     if (trimmedQuery.length === 0) {
       const text = [
         "Commands",
-        ...catalog.groups().flatMap((group) => [
-          "",
-          `${group.name}: ${group.entries.map((entry) => `/${entry.name}`).join(" ")}`,
-        ]),
+        ...catalog
+          .groups()
+          .flatMap((group) => ["", `${group.name}: ${group.entries.map((entry) => `/${entry.name}`).join(" ")}`]),
         "",
         "Search with /commands <query>.",
       ].join("\n");
@@ -1177,15 +1196,33 @@ export class TelegramTransportAdapter implements TransportAdapter {
       );
       return undefined;
     });
-    const transcript = attachment?.transcribable
-      ? await this.#transcribe(attachment.localPath, context.signal).catch((error) => {
+    let transcript: string | undefined;
+    if (attachment?.transcribable) {
+      if (!this.#transcriptionCommand?.length) {
+        await this.#notifyTranscriptionProblem(
+          message,
+          address,
+          "Voice transcription is not configured. The recording is still attached for the agent.",
+          context.signal,
+        );
+      } else {
+        transcript = await this.#transcribe(attachment.localPath, context.signal).catch(async (error) => {
           if (context.signal?.aborted) throw error;
           this.#log?.warn(
-            `[telegram] transcription failed for message ${message.message_id}: ${error instanceof Error ? error.message : String(error)}`,
+            `[telegram] transcription failed for message ${message.message_id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          await this.#notifyTranscriptionProblem(
+            message,
+            address,
+            "I couldn't transcribe this voice note. The recording is still attached for the agent.",
+            context.signal,
           );
           return undefined;
-        })
-      : undefined;
+        });
+      }
+    }
     const textParts = [message.text ?? message.caption, transcript].filter(
       (part): part is string => typeof part === "string" && part.length > 0,
     );
@@ -1474,17 +1511,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
     }
     if (action === "previous" || action === "next") {
       const pageCount = Math.max(1, Math.ceil(card.entries.length / SELECT_PAGE_SIZE));
-      card.page =
-        action === "previous" ? Math.max(0, card.page - 1) : Math.min(pageCount - 1, card.page + 1);
+      card.page = action === "previous" ? Math.max(0, card.page - 1) : Math.min(pageCount - 1, card.page + 1);
       const rendered = this.#renderCommandCatalogCard(card);
       if (card.receipt !== undefined) {
         await this.#outbound.update(card.address, card.receipt, { text: rendered.text }, card.context);
-        await this.#outbound.setReplyMarkup(
-          card.address,
-          card.receipt,
-          this.#cardReplyMarkup(rendered),
-          card.context,
-        );
+        await this.#outbound.setReplyMarkup(card.address, card.receipt, this.#cardReplyMarkup(rendered), card.context);
       }
       await acknowledge();
       return;
@@ -1627,16 +1658,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
   async #transcribe(path: string, signal?: AbortSignal): Promise<string | undefined> {
     const command = this.#transcriptionCommand;
     if (!command || command.length === 0) return undefined;
-    try {
-      const output = this.#transcriptionOverride
-        ? await this.#transcriptionOverride(command, path, signal)
-        : await this.#runTranscriber(command, path, signal);
-      const trimmed = output.trim();
-      return trimmed.length === 0 ? undefined : `[Voice transcript: ${trimmed}]`;
-    } catch (error) {
-      this.#log?.warn(`[telegram] transcription failed: ${error instanceof Error ? error.message : String(error)}`);
-      return undefined;
-    }
+    const output = this.#transcriptionOverride
+      ? await this.#transcriptionOverride(command, path, signal)
+      : await this.#runTranscriber(command, path, signal);
+    const trimmed = output.trim();
+    if (trimmed.length === 0) throw new Error("Telegram transcription command returned an empty transcript");
+    return `[Voice transcript: ${trimmed}]`;
   }
 
   async #runTranscriber(command: readonly string[], path: string, signal?: AbortSignal): Promise<string> {

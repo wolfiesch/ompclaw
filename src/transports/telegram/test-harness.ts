@@ -62,6 +62,7 @@ export interface FakeTelegramApiOptions {
   readonly setCommandsError?: Error;
   readonly reactionError?: Error;
   readonly transcribe?: boolean;
+  readonly transcribeError?: Error;
   readonly poller?: TelegramTestPoller;
   readonly pairingApprovalMonitorError?: Error;
   readonly botIdentity?: Record<string, unknown>;
@@ -122,7 +123,14 @@ export class FakeTelegramApi {
         return true;
       },
       downloadFileBytes: async () => new Uint8Array([4, 5, 6]),
-      ...(options.transcribe ? { transcribe: async () => "voice transcript" } : {}),
+      ...(options.transcribe || options.transcribeError
+        ? {
+            transcribe: async () => {
+              if (options.transcribeError) throw options.transcribeError;
+              return "voice transcript";
+            },
+          }
+        : {}),
     };
   }
 
@@ -300,7 +308,7 @@ export async function createTelegramAdapterHarness(
       error: () => {},
     },
     api: api.seams,
-    ...(options.transcribe ? { transcribeCommand: ["speech-to-text"] } : {}),
+    ...(options.transcribe || options.transcribeError ? { transcribeCommand: ["speech-to-text"] } : {}),
     uiTimeoutMs: options.uiTimeoutMs ?? 10_000,
   });
   let receiveAttempt = 0;

@@ -272,7 +272,7 @@ A Telegram object is required only when Telegram is configured:
   "enabled": true,
   "account": "default",
   "tokenEnv": "TELEGRAM_BOT_TOKEN",
-  "transcribeCommand": ["whisper", "{file}", "--model", "base", "--output_format", "txt", "--output_dir", "{outputDir}"],
+  "transcribeCommand": ["whisper", "{file}", "--model", "base", "--output_dir", "{outputDir}"],
   "topicSessions": {
     "enabled": false,
     "createFromRoot": false

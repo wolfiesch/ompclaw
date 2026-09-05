@@ -37,7 +37,13 @@ import {
   type JsonValue,
   type ScheduledJob,
 } from "./gateway-store";
-import type { ConversationAddress, InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
+import type {
+  ConversationAddress,
+  InboundMessage,
+  Principal,
+  TransportAdapter,
+  TransportIdentity,
+} from "./gateway-types";
 import { RpcGatewayRuntime, runtimeCommandMenu, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import type { RpcSessionState } from "./rpc-protocol";
 import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
@@ -291,6 +297,9 @@ export class GatewayApplication {
         ...(scheduler === undefined ? {} : { automation: scheduler }),
         ...(updates === undefined ? {} : { updates }),
         readyTimeoutMs: this.#config.updates.healthTimeoutMs,
+        voiceTranscriptionConfigured:
+          this.#config.transports.telegram?.enabled === true &&
+          (this.#config.transports.telegram.transcribeCommand?.length ?? 0) > 0,
         ...(isTurnLifecycleStore(store) ? { turnStore: store } : {}),
       });
       this.#runtime = runtime;

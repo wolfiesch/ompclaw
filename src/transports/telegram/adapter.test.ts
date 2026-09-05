@@ -202,7 +202,6 @@ describe("Telegram transport lifecycle", () => {
   });
 });
 
-
 describe("Telegram command catalog", () => {
   test("registers compact private and group-scoped native menus", async () => {
     const { calls } = await fixture({
@@ -1010,6 +1009,47 @@ describe("Telegram inbound conversion", () => {
     expect(received[0]?.content.text).toBe("[Voice transcript: voice transcript]");
     expect(received[0]?.content.attachments?.[0]?.mediaType).toBe("video/mp4");
   });
+
+  test("notifies the chat when voice transcription is not configured", async () => {
+    const { adapter, calls, received } = await fixture();
+    await adapter.handleUpdate({
+      update_id: 13,
+      message: message({
+        text: undefined,
+        voice: { file_id: "voice", file_unique_id: "voice-stable", file_size: 3, mime_type: "audio/ogg" },
+      }),
+    });
+
+    expect(calls.some((call) => call.method === "setMessageReaction")).toBe(false);
+    expect(calls.find((call) => call.method === "sendMessage")?.payload).toMatchObject({
+      chat_id: 42,
+      text: "Voice transcription is not configured. The recording is still attached for the agent.",
+    });
+    expect(received[0]?.content.text).toBeUndefined();
+    expect(received[0]?.content.attachments?.length).toBe(1);
+  });
+
+  test("notifies the chat and preserves the recording when voice transcription fails", async () => {
+    const { adapter, calls, received, warnings } = await fixture({
+      transcribeError: new Error("transcriber unavailable"),
+    });
+    await adapter.handleUpdate({
+      update_id: 14,
+      message: message({
+        text: undefined,
+        voice: { file_id: "voice", file_unique_id: "voice-stable", file_size: 3, mime_type: "audio/ogg" },
+      }),
+    });
+
+    expect(calls.some((call) => call.method === "setMessageReaction")).toBe(true);
+    expect(calls.find((call) => call.method === "sendMessage")?.payload).toMatchObject({
+      chat_id: 42,
+      text: "I couldn't transcribe this voice note. The recording is still attached for the agent.",
+    });
+    expect(received[0]?.content.text).toBeUndefined();
+    expect(received[0]?.content.attachments?.length).toBe(1);
+    expect(warnings).toContain("[telegram] transcription failed for message 10: transcriber unavailable");
+  });
   test("reuses one forum topic when an authorized root message is retried", async () => {
     const { adapter, calls, received } = await fixture({ createTopicsFromRoot: true, failFirstReceive: true });
     const update = {
@@ -1320,7 +1360,9 @@ describe("Telegram interactive UI", () => {
       },
     });
     expect(received).toHaveLength(5);
-    expect(calls.find((entry) => entry.method === "editMessageText")?.payload.text).toContain("Provider socket timed out");
+    expect(calls.find((entry) => entry.method === "editMessageText")?.payload.text).toContain(
+      "Provider socket timed out",
+    );
     expect(calls.findLast((entry) => entry.method === "answerCallbackQuery")?.payload.text).toBe(
       "Updated to the latest controls.",
     );

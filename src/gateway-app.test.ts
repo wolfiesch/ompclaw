@@ -44,7 +44,12 @@ function gatewayConfig(): GatewayConfig {
     workspace: "/workspace/gateway",
     stateDir,
     transports: {
-      telegram: { enabled: true, account: "bot", tokenEnv: "TELEGRAM_BOT_TOKEN" },
+      telegram: {
+        enabled: true,
+        account: "bot",
+        tokenEnv: "TELEGRAM_BOT_TOKEN",
+        transcribeCommand: ["speech-to-text", "{file}"],
+      },
       websocket: {
         enabled: true,
         hostname: "127.0.0.1",
@@ -537,6 +542,7 @@ describe("GatewayApplication", () => {
 
     expect(runtimeOptions?.sessionFile).toBeUndefined();
     expect(runtimeOptions?.readyTimeoutMs).toBe(180_000);
+    expect(runtimeOptions?.voiceTranscriptionConfigured).toBe(true);
     expect(store.checkpoint.get("omp/session_file")).toBe("/sessions/one");
     expect(store.bindings).toEqual([
       {

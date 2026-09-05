@@ -6,11 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Expand the dedicated live Telegram handset canary to exercise Home, decisions, quick lane, watches, schedules, photo delivery, and document delivery through the real Bot API.
+- Expand the dedicated live Telegram handset canary to exercise Home, decisions, quick lane, watches, schedules, photo delivery, document delivery, and native voice delivery through the real Bot API.
+- Report local voice-transcription readiness through `doctor` and Telegram `/status`.
 
 ### Changed
 
 - Raise the transactional update readiness default from 30 seconds to 180 seconds so full OMP extension initialization does not trigger a false rollback.
+- Use a portable Whisper CLI example that works whether or not the installed command supports `--output_format`.
+
+### Fixed
+
+- Tell Telegram users when voice transcription is unavailable or fails while preserving the recording for the agent.
 
 ## 0.12.0 (2026-09-04)
 

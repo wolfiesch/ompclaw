@@ -316,7 +316,8 @@ describe("RpcGatewayRuntime", () => {
       listPendingTurnOutcomes: () => [...outcomes.values()].filter((outcome) => outcome.deliveredAt === undefined),
       recordTurnOutcomeAttempt: (id, attemptedAt) => {
         const outcome = outcomes.get(id);
-        if (outcome) outcomes.set(id, { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt });
+        if (outcome)
+          outcomes.set(id, { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt });
       },
       markTurnOutcomeDelivered: (id, deliveredAt) => {
         const outcome = outcomes.get(id);
@@ -414,9 +415,7 @@ describe("RpcGatewayRuntime", () => {
     const completedCard = deliveries
       .filter(
         (call) =>
-          call.method === "presentUi" &&
-          call.request?.type === "semantic_view" &&
-          call.request.view.kind === "result",
+          call.method === "presentUi" && call.request?.type === "semantic_view" && call.request.view.kind === "result",
       )
       .at(-1)?.request;
     expect(completedCard).toMatchObject({
@@ -440,9 +439,9 @@ describe("RpcGatewayRuntime", () => {
       .filter((call) => call.method === "presentUi" && call.request?.type === "semantic_view")
       .flatMap((call) => (call.request?.type === "semantic_view" ? [call.request.view] : []))
       .filter((view) => view.id.startsWith("task_"));
-    expect(taskViews.some((view) => view.sections.some((section) => section.text.includes("🖥️ Running a command")))).toBe(
-      true,
-    );
+    expect(
+      taskViews.some((view) => view.sections.some((section) => section.text.includes("🖥️ Running a command"))),
+    ).toBe(true);
     expect(taskViews.at(-1)).toMatchObject({ kind: "result", state: "completed" });
     expect(JSON.stringify(taskViews)).not.toContain("bash");
     expect(JSON.stringify(taskViews)).not.toContain("TOP_SECRET");
@@ -504,7 +503,9 @@ describe("RpcGatewayRuntime", () => {
     };
     const runtime = createRuntime({ config, delivery: delivery(), turnStore, now: () => 500 });
     await runtime.start();
-    expect(deliveries.find((call) => call.method === "send" && textFromContent(call.content) === "Recovered result")).toBeDefined();
+    expect(
+      deliveries.find((call) => call.method === "send" && textFromContent(call.content) === "Recovered result"),
+    ).toBeDefined();
     expect(outcome).toMatchObject({ attemptCount: 1, lastAttemptAt: 500, deliveredAt: 500 });
     await runtime.stop();
   });
@@ -522,7 +523,8 @@ describe("RpcGatewayRuntime", () => {
       listPendingTurnOutcomes: () => [...outcomes.values()].filter((outcome) => outcome.deliveredAt === undefined),
       recordTurnOutcomeAttempt: (id, attemptedAt) => {
         const outcome = outcomes.get(id);
-        if (outcome) outcomes.set(id, { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt });
+        if (outcome)
+          outcomes.set(id, { ...outcome, attemptCount: outcome.attemptCount + 1, lastAttemptAt: attemptedAt });
       },
       markTurnOutcomeDelivered: (id, deliveredAt) => {
         const outcome = outcomes.get(id);
@@ -541,7 +543,11 @@ describe("RpcGatewayRuntime", () => {
     await first.start();
     await first.handleInbound(message("delivery-recovery", "Deliver the result"));
     const rpc = FakeOmpRpcClient.instances[0]!;
-    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Durable result" }] }] });
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Durable result" }] }],
+    });
     await first.waitUntilIdle();
     expect(outcomes.get("delivery-recovery-Deliver the result")).toMatchObject({
       state: "completed",
@@ -556,7 +562,9 @@ describe("RpcGatewayRuntime", () => {
       attemptCount: expect.any(Number),
       deliveredAt: 200,
     });
-    expect(deliveries.some((call) => call.method === "send" && textFromContent(call.content) === "Durable result")).toBe(true);
+    expect(
+      deliveries.some((call) => call.method === "send" && textFromContent(call.content) === "Durable result"),
+    ).toBe(true);
     await second.stop();
   });
 
@@ -574,8 +582,7 @@ describe("RpcGatewayRuntime", () => {
     const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore = {
       putTurnLifecycle: () => {},
       interruptActiveTurns: () => 0,
-      listTurnLifecycles: (address) =>
-        JSON.stringify(address) === JSON.stringify(prior.address) ? [prior] : [],
+      listTurnLifecycles: (address) => (JSON.stringify(address) === JSON.stringify(prior.address) ? [prior] : []),
       putTurnOutcome: () => {},
       getTurnOutcome: (id) =>
         id === prior.id
@@ -595,17 +602,31 @@ describe("RpcGatewayRuntime", () => {
     await runtime.start();
     const rpc = FakeOmpRpcClient.instances[0]!;
     await runtime.handleInbound(message("continuation", "/task_continue prior-task Add deployment notes"));
-    expect(JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content.text).toBe(
+    expect(
+      JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content
+        .text,
+    ).toBe(
       "Continue this prior task. Original request:\nPrepare the release\n\nNew instruction:\nAdd deployment notes",
     );
-    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }] });
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }],
+    });
     await runtime.waitUntilIdle();
 
     await runtime.handleInbound(message("continuation", "/task_revise prior-task Include a rollback plan"));
-    expect(JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content.text).toBe(
+    expect(
+      JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content
+        .text,
+    ).toBe(
       "Revise this prior task. Original request:\nPrepare the release\n\nPrevious result:\nRelease prepared\n\nNew instruction:\nInclude a rollback plan",
     );
-    rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Revised" }] }] });
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Revised" }] }],
+    });
     await runtime.waitUntilIdle();
     await runtime.stop();
   });
@@ -1023,7 +1044,9 @@ describe("RpcGatewayRuntime", () => {
 
     expect(calls).toEqual(["discard"]);
     expect(deliveries.find((call) => call.method === "finalize")).toMatchObject({
-      content: { text: "The task completed, but OMP produced no final summary. Ask for a summary of the completed work." },
+      content: {
+        text: "The task completed, but OMP produced no final summary. Ask for a summary of the completed work.",
+      },
     });
     await runtime.stop();
   });
@@ -1122,16 +1145,12 @@ describe("RpcGatewayRuntime", () => {
     await waitFor(() =>
       deliveries.some(
         (call) =>
-          call.method === "presentUi" &&
-          call.request?.type === "semantic_view" &&
-          call.request.view.state === "failed",
+          call.method === "presentUi" && call.request?.type === "semantic_view" && call.request.view.state === "failed",
       ),
     );
     const failureCard = deliveries.findLast(
       (call) =>
-        call.method === "presentUi" &&
-        call.request?.type === "semantic_view" &&
-        call.request.view.state === "failed",
+        call.method === "presentUi" && call.request?.type === "semantic_view" && call.request.view.state === "failed",
     )?.request;
     expect(failureCard).toMatchObject({
       type: "semantic_view",
@@ -1829,7 +1848,9 @@ describe("RpcGatewayRuntime", () => {
     expect(secondRpc.options.argv).toContain("--resume");
     expect(secondRpc.options.argv).toContain("/sessions/initial.jsonl");
     expect(
-      deliveries.some((call) => call.method === "send" && textFromContent(call.content).includes("Autonomy switched to Autopilot")),
+      deliveries.some(
+        (call) => call.method === "send" && textFromContent(call.content).includes("Autonomy switched to Autopilot"),
+      ),
     ).toBe(true);
 
     // Switch to balanced
@@ -1846,13 +1867,17 @@ describe("RpcGatewayRuntime", () => {
     await runtime.handleInbound(message("commands", "/autonomy balanced"));
     expect(FakeOmpRpcClient.instances).toHaveLength(3);
     expect(
-      deliveries.some((call) => call.method === "send" && textFromContent(call.content).includes("already set to Balanced")),
+      deliveries.some(
+        (call) => call.method === "send" && textFromContent(call.content).includes("already set to Balanced"),
+      ),
     ).toBe(true);
 
     // Invalid mode reports usage
     await runtime.handleInbound(message("commands", "/autonomy invalid"));
     expect(
-      deliveries.some((call) => call.method === "send" && textFromContent(call.content).includes("Unknown autonomy mode")),
+      deliveries.some(
+        (call) => call.method === "send" && textFromContent(call.content).includes("Unknown autonomy mode"),
+      ),
     ).toBe(true);
 
     // Direct API switch to review
@@ -1881,6 +1906,7 @@ describe("RpcGatewayRuntime", () => {
       delivery: delivery(),
       sessionFile: "/sessions/resume.jsonl",
       onSessionState: (state) => sessionStates.push(state),
+      voiceTranscriptionConfigured: true,
     });
     await runtime.start();
     const rpc = FakeOmpRpcClient.instances[0];
@@ -1914,7 +1940,10 @@ describe("RpcGatewayRuntime", () => {
         ?.request,
     ).toMatchObject({
       type: "semantic_view",
-      view: { title: "Session status", summary: expect.stringMatching(/^OmpClaw v/) },
+      view: {
+        title: "Session status",
+        summary: expect.stringContaining("Voice transcription: ready"),
+      },
     });
     await runtime.stop();
   });
