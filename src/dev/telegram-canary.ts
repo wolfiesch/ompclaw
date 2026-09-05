@@ -1,4 +1,9 @@
-import { tg, type TgMessage, type TgUser } from "../transports/telegram/bot-api";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { renderDecisionCard } from "../transports/telegram/cards";
+import { tg, tgUpload, type TgMessage, type TgUser } from "../transports/telegram/bot-api";
+import { telegramUiScenarios, type TelegramUiScenario } from "./telegram-ui-scenario";
 
 const TEST_TOKEN_ENV = "OMPCLAW_TEST_TELEGRAM_TOKEN";
 const TEST_CHAT_ENV = "OMPCLAW_TEST_TELEGRAM_CHAT_ID";
@@ -12,16 +17,20 @@ export interface TelegramCanaryConfig {
   readonly cleanup: boolean;
 }
 
+export type TelegramCanarySurface = "home" | "decisions" | "quick-lane" | "watches" | "schedules" | "media" | "voice";
+
 export interface TelegramCanaryReceipt {
   readonly bot: string;
   readonly chatId: string;
-  readonly messageId: number;
+  readonly messageIds: readonly number[];
   readonly marker: string;
+  readonly surfaces: readonly TelegramCanarySurface[];
   readonly cleanedUp: boolean;
 }
 
 export interface TelegramCanaryOptions extends TelegramCanaryConfig {
   readonly api?: typeof tg;
+  readonly upload?: typeof tgUpload;
   readonly now?: () => number;
 }
 
@@ -46,9 +55,62 @@ export function telegramCanaryConfig(
   }
   return { token, chatId, cleanup: args.includes("--delete") };
 }
+function canaryKeyboard(rows: TelegramUiScenario["buttons"]): {
+  readonly inline_keyboard: readonly (readonly { readonly text: string; readonly callback_data: string }[])[];
+} {
+  return {
+    inline_keyboard: rows.map((row) => row.map((text) => ({ text, callback_data: "ompclaw-canary:noop" }))),
+  };
+}
+
+function requiredScenario(name: string): TelegramUiScenario {
+  const fixture = telegramUiScenarios().find((scenario) => scenario.name === name);
+  if (fixture === undefined) throw new Error(`Telegram canary UI fixture is missing: ${name}`);
+  return fixture;
+}
+
+function decisionScenario(): TelegramUiScenario {
+  const rendered = renderDecisionCard(
+    {
+      title: "Canary approval",
+      preview: "Approve the representative OmpClaw action?",
+      choices: [
+        { id: "approve", label: "Approve once" },
+        { id: "deny", label: "Deny" },
+      ],
+      state: "active",
+    },
+    (action) => action,
+  );
+  return {
+    name: "decision",
+    text: rendered.text,
+    buttons: rendered.inlineKeyboard.map((row) => row.map((button) => button.text)),
+  };
+}
+
+const CANARY_SURFACES: readonly TelegramCanarySurface[] = [
+  "home",
+  "decisions",
+  "quick-lane",
+  "watches",
+  "schedules",
+  "media",
+  "voice",
+];
+
+const CANARY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
+const CANARY_OGG = Buffer.from(
+  "T2dnUwACAAAAAAAAAAAVXceLAAAAAFIS3gsBE09wdXNIZWFkAQE4AYC7AAAAAABPZ2dTAAAAAAAAAAAAABVdx4sBAAAA2ZKpfAE8T3B1c1RhZ3MMAAAATGF2ZjYzLjEuMTAxAQAAABwAAABlbmNvZGVyPUxhdmM2My4xLjEwMSBsaWJvcHVzT2dnUwAEGDAAAAAAAAAVXceLAgAAAP45VNENBwYGBgYGBgYGBgYGBggL5LmgvIQIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsYIB8azDsY=",
+  "base64",
+);
 
 export async function runTelegramCanary(options: TelegramCanaryOptions): Promise<TelegramCanaryReceipt> {
   const api = options.api ?? tg;
+  const upload = options.upload ?? tgUpload;
   const bot = await api<TgUser>(options.token, "getMe");
   if (bot.is_bot !== true || !bot.username) throw new Error("Telegram getMe did not return a bot username");
   const webhook = await api<{ readonly url?: string }>(options.token, "getWebhookInfo");
@@ -57,34 +119,98 @@ export async function runTelegramCanary(options: TelegramCanaryOptions): Promise
   }
 
   const marker = `ompclaw-canary-${(options.now ?? Date.now)()}`;
-  const sent = await api<TgMessage>(options.token, "sendMessage", {
+  const messageIds: number[] = [];
+  const sendMessage = async (
+    surface: Exclude<TelegramCanarySurface, "media" | "voice">,
+    content: TelegramUiScenario,
+  ): Promise<void> => {
+    const sent = await api<TgMessage>(options.token, "sendMessage", {
+      chat_id: options.chatId,
+      text: `CANARY · ${surface}\n\n${content.text}`,
+      disable_notification: true,
+      reply_markup: canaryKeyboard(content.buttons),
+    });
+    messageIds.push(sent.message_id);
+  };
+
+  const status = await api<TgMessage>(options.token, "sendMessage", {
     chat_id: options.chatId,
-    text: `OmpClaw Telegram canary\n${marker}\nStarting live transport checks`,
+    text: `OmpClaw handset canary\n${marker}\nStarting seven surface checks. Buttons are visual fixtures.`,
     disable_notification: true,
   });
+  messageIds.push(status.message_id);
   await api<boolean>(options.token, "sendChatAction", {
     chat_id: options.chatId,
     action: "typing",
   });
+
+  await sendMessage("home", requiredScenario("home"));
+  await sendMessage("decisions", decisionScenario());
+  await sendMessage("quick-lane", requiredScenario("home-busy"));
+  await sendMessage("watches", {
+    name: "watch",
+    text: ["👀 Watch update", "", "PR 100 CI", "", "All required checks are passing."].join("\n"),
+    buttons: [["Pause watch", "Run now"], ["Delete watch"]],
+  });
+  await sendMessage("schedules", requiredScenario("schedules-list"));
+
+  const directory = await mkdtemp(join(tmpdir(), "ompclaw-telegram-canary-"));
+  try {
+    const photoPath = join(directory, "canary.png");
+    const documentPath = join(directory, "canary.txt");
+    const voicePath = join(directory, "canary-voice.ogg");
+    await Promise.all([
+      writeFile(photoPath, CANARY_PNG),
+      writeFile(documentPath, `OmpClaw Telegram media canary\n${marker}\n`),
+      writeFile(voicePath, CANARY_OGG),
+    ]);
+    const photo = await upload<TgMessage>(
+      options.token,
+      "sendPhoto",
+      { chat_id: options.chatId, caption: "CANARY · media photo", disable_notification: 1 },
+      { field: "photo", path: photoPath },
+    );
+    const document = await upload<TgMessage>(
+      options.token,
+      "sendDocument",
+      { chat_id: options.chatId, caption: "CANARY · media document", disable_notification: 1 },
+      { field: "document", path: documentPath },
+    );
+    const voice = await upload<TgMessage>(
+      options.token,
+      "sendVoice",
+      { chat_id: options.chatId, caption: "CANARY · voice", disable_notification: 1 },
+      { field: "voice", path: voicePath },
+    );
+    messageIds.push(photo.message_id, document.message_id, voice.message_id);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+
   await api<TgMessage | boolean>(options.token, "editMessageText", {
     chat_id: options.chatId,
-    message_id: sent.message_id,
-    text: `OmpClaw Telegram canary passed\n${marker}\nBot: @${bot.username}`,
-    reply_markup: {
-      inline_keyboard: [[{ text: "Open OmpClaw", url: "https://github.com/wolfiesch/ompclaw" }]],
-    },
+    message_id: status.message_id,
+    text: [
+      "OmpClaw handset canary passed",
+      marker,
+      `Bot: @${bot.username}`,
+      `Surfaces: ${CANARY_SURFACES.join(", ")}`,
+    ].join("\n"),
   });
   if (options.cleanup) {
-    await api<boolean>(options.token, "deleteMessage", {
-      chat_id: options.chatId,
-      message_id: sent.message_id,
-    });
+    for (const messageId of [...messageIds].reverse()) {
+      await api<boolean>(options.token, "deleteMessage", {
+        chat_id: options.chatId,
+        message_id: messageId,
+      });
+    }
   }
   return {
     bot: `@${bot.username}`,
     chatId: options.chatId,
-    messageId: sent.message_id,
+    messageIds,
     marker,
+    surfaces: CANARY_SURFACES,
     cleanedUp: options.cleanup,
   };
 }

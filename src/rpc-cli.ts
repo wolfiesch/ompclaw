@@ -79,6 +79,7 @@ export interface GatewayCliSeams {
   readonly createStore?: (path: string) => GatewayStore;
   readonly createDoctorRpc?: (options: OmpRpcClientOptions) => GatewayDoctorRpc;
   readonly callTelegram?: GatewayTelegramCall;
+  readonly findExecutable?: (program: string) => string | null | undefined;
   readonly getAvailableBytes?: (path: string) => bigint;
   readonly installService?: (
     config: GatewayConfig,
@@ -418,6 +419,18 @@ export async function doctor(config: GatewayConfig, seams: GatewayCliSeams = {})
       throw new Error(`Telegram webhook is configured at ${webhook.url}; long polling requires it to be removed`);
     write(`Telegram: @${bot.username ?? bot.id}`);
     write(`Webhook: none (${webhook.pending_update_count ?? 0} updates pending)`);
+    const transcriptionProgram = telegram.transcribeCommand?.[0];
+    if (transcriptionProgram === undefined) {
+      write("Voice transcription: disabled");
+    } else {
+      const executable = (seams.findExecutable ?? ((program: string) => Bun.which(program)))(transcriptionProgram);
+      if (executable == null) {
+        throw new Error(
+          `Telegram transcription command "${transcriptionProgram}" was not found; install it or remove transports.telegram.transcribeCommand`,
+        );
+      }
+      write(`Voice transcription: ready (${transcriptionProgram})`);
+    }
   }
 
   const rpcConfig = gatewayRpcRuntimeConfig(config);

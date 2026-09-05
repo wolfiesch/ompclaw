@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { parseGatewayConfig } from "./gateway-config";
 import {
   doctor,
   executeGatewayCommand,
@@ -237,6 +238,7 @@ describe("gateway pairing commands", () => {
     );
 
     expect(lines).toContain("Doctor: ready");
+    expect(lines).toContain("Voice transcription: disabled");
     expect(lines).toContain("Pairing request from Alice (Telegram user 42).");
     const approval = lines.find((line) => line.startsWith("Approve locally (POSIX shell): "));
     expect(approval).toBeDefined();
@@ -282,5 +284,76 @@ describe("gateway doctor", () => {
       `Transactional update staging requires 4.0 GiB free at ${stateDir}; 3.0 GiB is available. Free disk space or move stateDir, then retry`,
     );
     expect(lines).toEqual([`Update storage: 3.0 GiB free at ${stateDir} (4.0 GiB staging minimum)`]);
+  });
+
+  test("reports a configured voice transcriber as ready", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "ompclaw-doctor-transcription-"));
+    directories.push(stateDir);
+    process.env.TELEGRAM_BOT_TOKEN = "test-token";
+    const config = parseGatewayConfig({
+      workspace: stateDir,
+      stateDir,
+      transports: {
+        telegram: {
+          enabled: true,
+          account: "default",
+          tokenEnv: "TELEGRAM_BOT_TOKEN",
+          transcribeCommand: ["speech-to-text", "{file}"],
+        },
+      },
+    });
+    const lines: string[] = [];
+
+    await doctor(config, {
+      write: (line) => lines.push(line),
+      findExecutable: () => "/usr/local/bin/speech-to-text",
+      callTelegram: async (_token, method) =>
+        (method === "getMe" ? { id: 1, username: "test_bot" } : { url: "", pending_update_count: 0 }) as never,
+      createDoctorRpc: () => ({
+        protocolVersion: 2,
+        start: async () => {},
+        stop: async () => {},
+        send: async () => ({
+          type: "response",
+          command: "get_state",
+          success: true,
+          data: { sessionId: "session-1", sessionName: "Doctor Session" },
+        }),
+      }),
+    });
+
+    expect(lines).toContain("Voice transcription: ready (speech-to-text)");
+    expect(lines).toContain("Doctor: ready");
+  });
+
+  test("rejects a configured voice transcriber missing from PATH before starting OMP", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "ompclaw-doctor-transcription-missing-"));
+    directories.push(stateDir);
+    process.env.TELEGRAM_BOT_TOKEN = "test-token";
+    const config = parseGatewayConfig({
+      workspace: stateDir,
+      stateDir,
+      transports: {
+        telegram: {
+          enabled: true,
+          account: "default",
+          tokenEnv: "TELEGRAM_BOT_TOKEN",
+          transcribeCommand: ["missing-transcriber", "{file}"],
+        },
+      },
+    });
+
+    await expect(
+      doctor(config, {
+        findExecutable: () => undefined,
+        callTelegram: async (_token, method) =>
+          (method === "getMe" ? { id: 1, username: "test_bot" } : { url: "", pending_update_count: 0 }) as never,
+        createDoctorRpc: () => {
+          throw new Error("OMP must not start after a failed transcription preflight");
+        },
+      }),
+    ).rejects.toThrow(
+      'Telegram transcription command "missing-transcriber" was not found; install it or remove transports.telegram.transcribeCommand',
+    );
   });
 });

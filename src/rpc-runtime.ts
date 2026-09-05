@@ -114,6 +114,7 @@ export interface RpcGatewayRuntimeOptions {
   readonly updates?: GatewayUpdateControl;
   readonly now?: () => number;
   readonly readyTimeoutMs?: number;
+  readonly voiceTranscriptionConfigured?: boolean;
   readonly createRpcClient?: (options: OmpRpcClientOptions) => RpcClient;
 }
 
@@ -445,8 +446,13 @@ export class RpcGatewayRuntime {
   async statusText(): Promise<string> {
     await this.#refreshState();
     const state = this.#status.state;
+    const voiceTranscription = `Voice transcription: ${
+      this.#options.voiceTranscriptionConfigured === true ? "ready" : "disabled"
+    }`;
     if (!state)
-      return `OmpClaw v${packageVersion}\nOMP offline${this.#status.lastError ? `\n${this.#status.lastError}` : ""}`;
+      return `OmpClaw v${packageVersion}\nOMP offline\n${voiceTranscription}${
+        this.#status.lastError ? `\n${this.#status.lastError}` : ""
+      }`;
     const model = `${state.model?.provider ?? "?"}/${state.model?.id ?? "?"}`;
     const context =
       state.contextUsage?.percent != null
@@ -463,6 +469,7 @@ export class RpcGatewayRuntime {
       `Context: ${context}`,
       `Activity: ${this.#status.currentTool ?? "none"}`,
       `Subagents: ${this.#status.subagents.length}`,
+      voiceTranscription,
       this.#ui?.statusText() ?? "",
       this.#status.lastError ? `Last error: ${this.#status.lastError}` : "",
     ]
@@ -588,7 +595,9 @@ export class RpcGatewayRuntime {
       const detail = frame.error ?? "unknown error";
       this.#status.lastError = `${frame.command}: ${detail}`;
       this.#log.warn(`[ompclaw rpc] ${frame.command} failed: ${detail}`);
-      await this.#sendRuntimeMessage("OMP couldn't complete that operation. The current task card has recovery controls when an action is available.");
+      await this.#sendRuntimeMessage(
+        "OMP couldn't complete that operation. The current task card has recovery controls when an action is available.",
+      );
       return;
     }
     if (frame.type === "available_commands_update" && Array.isArray(frame.commands)) {
@@ -800,8 +809,7 @@ export class RpcGatewayRuntime {
           delivery,
           informationSemanticView("Session status", await this.statusText(), now, now),
         );
-      }
-      else if (name === "stop") {
+      } else if (name === "stop") {
         await this.#sendRpc({ type: "abort" });
         await reply("Stop requested.");
       } else if (name === "new") {
@@ -1325,11 +1333,13 @@ export class RpcGatewayRuntime {
       ompCommands: this.#status.availableCommands,
       allowRpcBash: this.#options.config.allowRpcBash,
     });
-    const lines = catalog.groups().flatMap((group) => [
-      group.name,
-      ...group.entries.map((command) => `/${command.name}${command.description ? ` — ${command.description}` : ""}`),
-      "",
-    ]);
+    const lines = catalog
+      .groups()
+      .flatMap((group) => [
+        group.name,
+        ...group.entries.map((command) => `/${command.name}${command.description ? ` — ${command.description}` : ""}`),
+        "",
+      ]);
     await reply(lines.join("\n").trimEnd());
   }
 
@@ -1836,9 +1846,7 @@ export class RpcGatewayRuntime {
     }
     const outcome = this.#options.turnStore?.getTurnOutcome?.(previous.id);
     const priorResult =
-      mode === "revise"
-        ? `\n\nPrevious result:\n${outcome?.text ?? "No final result was recorded."}`
-        : "";
+      mode === "revise" ? `\n\nPrevious result:\n${outcome?.text ?? "No final result was recorded."}` : "";
     await this.handleInbound({
       id: `task-${mode}:${previous.id}:${this.#now()}`,
       sentAt: this.#now(),
@@ -1854,7 +1862,8 @@ export class RpcGatewayRuntime {
 
   #missingTerminalSummaryText(state: "completed" | "stopped" | "failed"): string {
     if (state === "stopped") return "The task stopped before OMP produced a final summary. Use /tasks to resume it.";
-    if (state === "failed") return "The task failed before OMP produced a final summary. Its task card has recovery controls.";
+    if (state === "failed")
+      return "The task failed before OMP produced a final summary. Its task card has recovery controls.";
     return "The task completed, but OMP produced no final summary. Ask for a summary of the completed work.";
   }
 
@@ -1886,7 +1895,6 @@ export class RpcGatewayRuntime {
         : previous.then(() => this.#reactToSource(delivery, emoji));
     this.#reactionQueues.set(key, queued);
     void queued.finally(() => {
-
       if (this.#reactionQueues.get(key) === queued) this.#reactionQueues.delete(key);
     });
   }

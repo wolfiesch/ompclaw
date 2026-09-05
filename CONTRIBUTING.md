@@ -54,7 +54,7 @@ For an explicit live Telegram transport canary, configure `OMPCLAW_TEST_TELEGRAM
 bun run test:telegram:live
 ```
 
-Use a dedicated private test bot and test chat. The command refuses the configured production `TELEGRAM_BOT_TOKEN`, refuses bots with an active webhook, performs one visible send, typing action, and edit, and prints a receipt. Add `-- --delete` to remove the canary message after the check. Never point the canary at the product bot.
+Use a dedicated private test bot and test chat. The command refuses the configured production `TELEGRAM_BOT_TOKEN` and bots with an active webhook. It sends handset fixtures for Home, decisions, quick lane, watches, and schedules, then uploads a photo and document through the real Bot API. Fixture buttons are visual only because the test bot has no gateway poller. The JSON receipt lists every exercised surface and message ID. Add `-- --delete` to remove all canary messages after the check. Never point the canary at the product bot.
 
 Do not commit generated package tarballs, local databases, session state, environment files, or credentials. Start configuration from `config.example.json`; it contains only credential environment variable names, never credential values.
 
