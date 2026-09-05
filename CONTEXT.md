@@ -1,28 +1,37 @@
 # OmpClaw Architecture
 
 OmpClaw is one gateway service that gives authenticated remote transports access
-to one owned OMP RPC child and its session. The gateway serializes access to the
-child and is the only writer of OmpClaw's durable state.
+to one persistent primary OMP RPC child plus a lazily started, isolated
+quick-answer child. The gateway serializes main-session access, runs quick
+requests FIFO on the second child, and is the only writer of OmpClaw's durable
+state.
 
 ## Runtime
 
 **Gateway service**:
-The OmpClaw process that owns the OMP RPC child, coordinates transport and
-scheduler work, and persists all gateway state.
+The OmpClaw process that owns both OMP RPC children, coordinates transport,
+scheduler, and quick-lane work, and persists all gateway state.
 
-**OMP RPC child**:
-The child process the gateway starts and owns to operate OMP. Transports never
-receive direct access to this process.
+**Primary OMP RPC child**:
+The persistent child process the gateway starts and owns for interactive and
+scheduled work. Transports never receive direct access to this process.
+
+**Quick-answer OMP RPC child**:
+An isolated second child that starts lazily for explicit quick-lane requests.
+Its requests run FIFO and do not steer or modify the primary session. It has no
+durable `GatewayStore` state beyond its own OMP session file.
 
 **OMP session**:
-The OMP conversation operated by the owned RPC child. When topic sessions are
-enabled, the gateway serializes session selection and retains the associated
+The conversation operated by an owned OMP RPC child. The primary session
+persists normal interactive and scheduled work. When topic sessions are enabled,
+the gateway serializes primary-session selection and retains the associated
 bindings.
 
 **Single-writer invariant**:
 Only the gateway service may mutate OmpClaw's SQLite state or operate its owned
-OMP RPC child. Transports, Home, and scheduled jobs submit work through the
-gateway rather than writing state or controlling OMP directly.
+OMP RPC children. Transports, Home, scheduled jobs, and quick-lane controls
+submit work through the gateway rather than writing state or controlling OMP
+directly.
 
 **SQLite state**:
 The durable store for principals, bindings, OMP session checkpoints, inbound
