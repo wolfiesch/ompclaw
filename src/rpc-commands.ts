@@ -19,7 +19,7 @@ export const RUNTIME_COMMANDS: readonly RuntimeCommandDefinition[] = [
   { command: "home", description: "Open the control center", group: "Everyday", native: true },
   { command: "status", description: "Show session and runtime details", group: "Everyday", native: true },
   { command: "stop", description: "Stop the current response", group: "Everyday", native: true },
-  { command: "new", description: "Start a fresh chat", group: "Everyday", native: true },
+  { command: "new", description: "Start a fresh agent session in this chat", group: "Everyday", native: true },
   { command: "steer", description: "Correct the current response", group: "Everyday" },
   { command: "followup", description: "Add work after the current response", group: "Everyday" },
   { command: "compact", description: "Compact context with optional focus", group: "Session" },
@@ -208,7 +208,7 @@ export function assistantWelcome(): string {
     "Quick controls",
     "/home - Open the control center",
     "/stop - Stop the current response",
-    "/new - Start a fresh chat",
+    "/new - Start a fresh agent session in this chat",
     "/status - Show technical session details",
     "/help - Show every command",
   ].join("\n");

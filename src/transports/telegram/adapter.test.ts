@@ -202,7 +202,6 @@ describe("Telegram transport lifecycle", () => {
   });
 });
 
-
 describe("Telegram command catalog", () => {
   test("registers compact private and group-scoped native menus", async () => {
     const { calls } = await fixture({
@@ -1010,6 +1009,36 @@ describe("Telegram inbound conversion", () => {
     expect(received[0]?.content.text).toBe("[Voice transcript: voice transcript]");
     expect(received[0]?.content.attachments?.[0]?.mediaType).toBe("video/mp4");
   });
+  test("keeps root messages and context resets in place when automatic topic creation is off", async () => {
+    const { adapter, calls, received } = await fixture({ createTopicsFromRoot: false });
+    const chat = { id: -100, type: "supergroup", is_forum: true } as const;
+    await adapter.handleUpdate({
+      update_id: 20,
+      message: message({ message_id: 20, chat, text: "Stay in the root conversation" }),
+    });
+    await adapter.handleUpdate({
+      update_id: 21,
+      message: message({
+        message_id: 21,
+        chat,
+        is_topic_message: true,
+        message_thread_id: 19,
+        text: "Use this user-created topic",
+      }),
+    });
+    await adapter.handleUpdate({
+      update_id: 22,
+      message: message({ message_id: 22, chat, is_topic_message: true, message_thread_id: 19, text: "/new" }),
+    });
+    expect(received.map((entry) => entry.address.thread)).toEqual([undefined, "19", "19"]);
+    expect(received.map((entry) => entry.content.text)).toEqual([
+      "Stay in the root conversation",
+      "Use this user-created topic",
+      "/new",
+    ]);
+    expect(calls.some((entry) => entry.method === "createForumTopic")).toBe(false);
+  });
+
   test("reuses one forum topic when an authorized root message is retried", async () => {
     const { adapter, calls, received } = await fixture({ createTopicsFromRoot: true, failFirstReceive: true });
     const update = {
@@ -1282,18 +1311,18 @@ describe("Telegram interactive UI", () => {
     expect(card.payload.reply_markup).toMatchObject({
       inline_keyboard: [
         [{ text: "📄 View result" }, { text: "➕ Continue" }],
-        [{ text: "✏️ Revise" }, { text: "↻ Retry" }],
+        [{ text: "✏️ Revise" }, { text: "↻ Recover" }],
         [{ text: "🔍 View details" }, { text: "📋 Open task" }],
-        [{ text: "✨ Start fresh" }],
+        [{ text: "✨ New session" }],
       ],
     });
 
     for (const [updateId, label, command] of [
       [20, "📄 View result", "/result task-failed"],
-      [21, "↻ Retry", "/task_retry task-failed"],
+      [21, "↻ Recover", "/task_retry task-failed"],
       [22, "🔍 View details", "/task_details task-failed"],
       [23, "📋 Open task", "/tasks"],
-      [24, "✨ Start fresh", "/new"],
+      [24, "✨ New session", "/new"],
     ] as const) {
       await adapter.handleUpdate({
         update_id: updateId,
@@ -1315,12 +1344,14 @@ describe("Telegram interactive UI", () => {
       callback_query: {
         id: "stale-failure",
         from: { id: 42 },
-        data: callbackData(card, "↻ Retry"),
+        data: callbackData(card, "↻ Recover"),
         message: message({ message_id: 201 }),
       },
     });
     expect(received).toHaveLength(5);
-    expect(calls.find((entry) => entry.method === "editMessageText")?.payload.text).toContain("Provider socket timed out");
+    expect(calls.find((entry) => entry.method === "editMessageText")?.payload.text).toContain(
+      "Provider socket timed out",
+    );
     expect(calls.findLast((entry) => entry.method === "answerCallbackQuery")?.payload.text).toBe(
       "Updated to the latest controls.",
     );

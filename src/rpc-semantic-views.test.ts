@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { TaskEvidence, TaskExecutionContext } from "./execution-types";
 import { validateSemanticView, type SemanticView } from "./gateway-views";
 import type { TurnLifecycle } from "./gateway-store";
-import { homeSemanticView, taskHistorySemanticView, taskSemanticView } from "./rpc-semantic-views";
+import { homeSemanticView, moreSemanticView, taskHistorySemanticView, taskSemanticView } from "./rpc-semantic-views";
 import type { AutonomyMode } from "./rpc-config";
 import { renderTelegramSemanticView } from "./transports/telegram/semantic-views";
 
@@ -333,6 +333,23 @@ describe("history and home projections", () => {
     });
     const plain = homeSemanticView(base);
     expect(plain.sections.some((section) => section.id === "project")).toBe(false);
+    expect(plain.sections.find((section) => section.id === "workspace")).toMatchObject({
+      label: "Workspace",
+      text: "Default workspace; no project task is selected.",
+    });
+  });
+  test("more card separates chat history from the agent session", () => {
+    const view = moreSemanticView({
+      autonomyMode: "balanced" as AutonomyMode,
+      autonomyLabel: "Balanced",
+      version: NOW,
+      updatedAt: NOW,
+    });
+    validateSemanticView(view);
+    const history = view.sections.find((section) => section.id === "history");
+    expect(history?.label).toBe("History");
+    expect(history?.text).toContain("Telegram history");
+    expect(history?.text).toContain("/new");
   });
 });
 

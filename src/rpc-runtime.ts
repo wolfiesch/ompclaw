@@ -389,7 +389,7 @@ export class RpcGatewayRuntime {
       if (await this.#handleCommand(delivery, parsed.name, parsed.args)) return;
     }
     if (differentConversation || (active === undefined && this.#queuedConversationCount > 0)) {
-      await this.#send(delivery, "Got it. I’m finishing another conversation, then I’ll handle this next.");
+      await this.#send(delivery, "Queued. This request has not started; it will run after earlier work finishes.");
       return this.#enqueueConversation(message, delivery, parsed);
     }
 
@@ -428,7 +428,7 @@ export class RpcGatewayRuntime {
   async notifyInboundQueued(message: InboundMessage): Promise<void> {
     await this.#send(
       this.#deliveryFor(message),
-      "Got it. I’m finishing another conversation, then I’ll handle this next.",
+      "Queued. This request has not started; it will run after earlier work finishes.",
     );
   }
 
@@ -652,10 +652,12 @@ export class RpcGatewayRuntime {
       `OmpClaw v${packageVersion}`,
       `OMP: ${state.isStreaming ? "streaming" : state.isCompacting ? "compacting" : "idle"}`,
       `Session: ${state.sessionName ?? state.sessionId}`,
+      `Workspace: ${this.#execution ? `${this.#execution.projectName} (${this.#execution.workspace})` : "default (no project task)"}`,
       `Model: ${model}`,
       `Thinking: ${state.thinkingLevel ?? "inherit"}`,
       `Fast: ${state.fastModeEnabled ? "on" : "off"}${state.fastModeActive ? " (active)" : ""}`,
       `Messages: ${state.messageCount ?? "?"} (${state.queuedMessageCount ?? 0} queued)`,
+      "History: chat messages stay; /new resets agent context only",
       `Context: ${context}`,
       `Activity: ${this.#status.currentTool ?? "none"}`,
       `Subagents: ${this.#status.subagents.length}`,
@@ -791,7 +793,9 @@ export class RpcGatewayRuntime {
       const detail = frame.error ?? "unknown error";
       this.#status.lastError = `${frame.command}: ${detail}`;
       this.#log.warn(`[ompclaw rpc] ${frame.command} failed: ${detail}`);
-      await this.#sendRuntimeMessage("OMP couldn't complete that operation. The current task card has recovery controls when an action is available.");
+      await this.#sendRuntimeMessage(
+        "OMP couldn't complete that operation. The current task card has recovery controls when an action is available.",
+      );
       return;
     }
     if (frame.type === "available_commands_update" && Array.isArray(frame.commands)) {
@@ -1033,13 +1037,16 @@ export class RpcGatewayRuntime {
           delivery,
           informationSemanticView("Session status", await this.statusText(), now, now),
         );
-      }
-      else if (name === "stop") {
+      } else if (name === "stop") {
         await this.#sendRpc({ type: "abort" });
         await reply("Stop requested.");
       } else if (name === "new") {
         const created = await this.newSession();
-        await reply(created ? "Started a new chat." : "New chat cancelled.");
+        await reply(
+          created
+            ? "New session started. This chat keeps its history; the agent now starts with fresh context."
+            : "New session cancelled.",
+        );
       } else if (name === "steer" || name === "followup") {
         if (!args) await reply(`Usage: /${name} <message>`);
         else {
@@ -1567,11 +1574,13 @@ export class RpcGatewayRuntime {
       ompCommands: this.#status.availableCommands,
       allowRpcBash: this.#options.config.allowRpcBash,
     });
-    const lines = catalog.groups().flatMap((group) => [
-      group.name,
-      ...group.entries.map((command) => `/${command.name}${command.description ? ` — ${command.description}` : ""}`),
-      "",
-    ]);
+    const lines = catalog
+      .groups()
+      .flatMap((group) => [
+        group.name,
+        ...group.entries.map((command) => `/${command.name}${command.description ? ` — ${command.description}` : ""}`),
+        "",
+      ]);
     await reply(lines.join("\n").trimEnd());
   }
 
@@ -2302,9 +2311,7 @@ export class RpcGatewayRuntime {
     if (execution !== undefined) await this.selectProject(execution, previous.sessionFile);
     const outcome = this.#options.turnStore?.getTurnOutcome?.(previous.id);
     const priorResult =
-      mode === "revise"
-        ? `\n\nPrevious result:\n${outcome?.text ?? "No final result was recorded."}`
-        : "";
+      mode === "revise" ? `\n\nPrevious result:\n${outcome?.text ?? "No final result was recorded."}` : "";
     await this.handleInbound({
       ...previous.request,
       id: `task-${mode}:${previous.id}:${this.#now()}`,
@@ -2320,8 +2327,10 @@ export class RpcGatewayRuntime {
   }
 
   #missingTerminalSummaryText(state: "completed" | "stopped" | "failed"): string {
-    if (state === "stopped") return "The task stopped before OMP produced a final summary. Use /tasks to resume it.";
-    if (state === "failed") return "The task failed before OMP produced a final summary. Its task card has recovery controls.";
+    if (state === "stopped")
+      return "The task stopped before OMP produced a final summary. Use /tasks for recovery controls.";
+    if (state === "failed")
+      return "The task failed before OMP produced a final summary. Its task card has recovery controls.";
     return "The task completed, but OMP produced no final summary. Ask for a summary of the completed work.";
   }
 
@@ -2353,7 +2362,6 @@ export class RpcGatewayRuntime {
         : previous.then(() => this.#reactToSource(delivery, emoji));
     this.#reactionQueues.set(key, queued);
     void queued.finally(() => {
-
       if (this.#reactionQueues.get(key) === queued) this.#reactionQueues.delete(key);
     });
   }

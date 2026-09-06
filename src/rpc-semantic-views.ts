@@ -247,7 +247,7 @@ export function taskSemanticView(
             style: "danger" as const,
           },
         ]
-      : [{ id: "retry", label: "↻ Retry", command: `/task_retry ${lifecycle.id}`, style: "primary" as const }]
+      : [{ id: "retry", label: "↻ Recover", command: `/task_retry ${lifecycle.id}`, style: "primary" as const }]
     : [];
   const recoverySupport = failure
     ? [
@@ -257,7 +257,7 @@ export function taskSemanticView(
           command: `/task_details ${lifecycle.id}${detailsExpanded ? " hide" : ""}`,
         },
         { id: "tasks", label: "📋 Open task", command: "/tasks" },
-        { id: "fresh", label: "✨ Start fresh", command: "/new" },
+        { id: "fresh", label: "✨ New session", command: "/new" },
       ]
     : [];
   const terminalActions = [
@@ -460,7 +460,7 @@ export function taskHistorySemanticView(
           ? [
               {
                 id: entry.lifecycle.execution === undefined ? `retry${index}` : `recover${index}`,
-                label: `${entry.lifecycle.execution === undefined ? "Retry" : "Recover"} · ${boundedSummary(entry.lifecycle.prompt).slice(0, 32)}`,
+                label: `Recover · ${boundedSummary(entry.lifecycle.prompt).slice(0, 32)}`,
                 command:
                   entry.lifecycle.execution === undefined
                     ? `/task_retry ${entry.lifecycle.id}`
@@ -867,7 +867,7 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
     };
   }
 
-  const session = state?.sessionName?.trim() || state?.sessionId || "New chat";
+  const session = state?.sessionName?.trim() || state?.sessionId || "New session";
   const modelName = friendlyModelName(state?.model);
   const reasoning = reasoningLabel(state?.thinkingLevel);
   return {
@@ -880,7 +880,14 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
     summary: session,
     sections: [
       ...(input.execution === undefined
-        ? []
+        ? [
+            {
+              id: "workspace",
+              label: "Workspace",
+              text: "Default workspace; no project task is selected.",
+              tone: "muted" as const,
+            },
+          ]
         : [
             {
               id: "project",
@@ -895,7 +902,7 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
       },
     ],
     actions: [
-      { id: "new", label: "✨ New chat", command: "/new", style: "primary" as const },
+      { id: "new", label: "✨ New session", command: "/new", style: "primary" as const },
       { id: "model", label: "🤖 Model", command: "/model" },
       { id: "permissions", label: "🛡 Permissions", command: "/permissions" },
       { id: "thinking", label: "🧠 Reasoning", command: "/thinking" },
@@ -910,7 +917,7 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
 
 export function moreSemanticView(input: HomeSemanticViewInput): SemanticView {
   const state = input.state;
-  const session = state?.sessionName?.trim() || state?.sessionId || "New chat";
+  const session = state?.sessionName?.trim() || state?.sessionId || "New session";
   const context = state?.contextUsage?.percent;
   const contextPercent =
     typeof context === "number" && Number.isFinite(context) ? `${Math.round(context)}% context` : "Context: unknown";
@@ -931,6 +938,11 @@ export function moreSemanticView(input: HomeSemanticViewInput): SemanticView {
     summary: session,
     sections: [
       { id: "context", label: "Context", text: `${contextPercent}${contextDetails}` },
+      {
+        id: "history",
+        label: "History",
+        text: "This chat keeps its Telegram history; /new starts a fresh agent session here.",
+      },
       { id: "autocompact", label: "Auto-compact", text: state?.autoCompactionEnabled ? "Enabled" : "Disabled" },
       { id: "queue", label: "Queue", text: queueText },
       { id: "session", label: "Session ID", text: state?.sessionId ?? "None" },

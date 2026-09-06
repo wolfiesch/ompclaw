@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Clarify that new sessions reset agent context within the same conversation, and distinguish chat history from the selected project workspace.
+- Describe queued requests as not yet started without promising they are next; label interrupted-task actions as explicit recovery.
+- Document user-created Telegram topics with automatic topic creation disabled, including in-place session resets and shared execution limits.
+
 ## 0.13.0 (2026-09-06)
 
 ### Added
