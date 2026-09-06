@@ -1,6 +1,7 @@
 import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
+import type { ProjectDefinition, SshWorkerDefinition } from "./execution-types";
 import type { AutonomyMode, RpcRuntimeConfig } from "./rpc-config";
 import { isRecord } from "./type-guards";
 
@@ -96,6 +97,8 @@ export interface GatewayConfig {
   readonly quickLane: GatewayQuickLaneConfig;
   readonly learning: GatewayLearningConfig;
   readonly updates: GatewayUpdatesConfig;
+  readonly projects?: readonly ProjectDefinition[];
+  readonly workers?: readonly SshWorkerDefinition[];
 }
 
 export interface GatewaySecrets {
@@ -148,7 +151,19 @@ export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()):
   const root = object(value, "OmpClaw config");
   rejectUnknown(
     root,
-    ["workspace", "stateDir", "profile", "omp", "transports", "automation", "quickLane", "learning", "updates"],
+    [
+      "workspace",
+      "stateDir",
+      "profile",
+      "omp",
+      "transports",
+      "automation",
+      "quickLane",
+      "learning",
+      "updates",
+      "projects",
+      "workers",
+    ],
     "OmpClaw config",
   );
 
@@ -163,8 +178,15 @@ export function parseGatewayConfig(value: unknown, cwd: string = process.cwd()):
   const quickLane = parseQuickLane(root.quickLane);
   const learning = parseLearning(root.learning);
   const updates = parseUpdates(root.updates, cwd);
+  const projects = parseExecutionProjects(root.projects, cwd);
+  const workers = parseExecutionWorkers(root.workers, cwd);
+  for (const project of projects) {
+    if (project.workerId !== "local" && !workers.some((worker) => worker.id === project.workerId)) {
+      throw new Error(`Project ${project.id} references unknown worker ${project.workerId}`);
+    }
+  }
 
-  return { workspace, stateDir, profile, omp, transports, automation, quickLane, learning, updates };
+  return { workspace, stateDir, profile, omp, transports, automation, quickLane, learning, updates, projects, workers };
 }
 
 /** Resolve only the env names carried by config, keeping token values out of it. */
@@ -450,6 +472,78 @@ function parseUpdates(value: unknown, cwd: string): GatewayUpdatesConfig {
     ...(repository === undefined ? {} : { repository }),
     healthTimeoutMs: integer(updates.healthTimeoutMs, "updates.healthTimeoutMs", 5_000, 300_000, 30_000),
   };
+}
+
+/** Shared with the execution worker; roots and grants come from its own private configuration. */
+export function parseExecutionProjects(value: unknown, cwd: string = process.cwd()): ProjectDefinition[] {
+  if (value === undefined) return [];
+  const seen = new Set<string>();
+  return array(value, "projects", 128).map((item, index) => {
+    const label = `projects[${index}]`;
+    const project = object(item, label);
+    rejectUnknown(project, ["id", "name", "workspace", "workerId", "principals", "policy", "model"], label);
+    const id = identifier(project.id, `${label}.id`);
+    if (seen.has(id)) throw new Error(`Duplicate project id ${id}`);
+    seen.add(id);
+    const workerId = project.workerId === undefined ? "local" : identifier(project.workerId, `${label}.workerId`);
+    const configuredWorkspace = nonEmptyString(project.workspace, `${label}.workspace`);
+    if (workerId !== "local" && !configuredWorkspace.startsWith("/") && !configuredWorkspace.startsWith("~/")) {
+      throw new Error(`${label}.workspace must be absolute or home-relative on its worker`);
+    }
+    const workspace = workerId === "local" ? expandGatewayPath(configuredWorkspace, cwd) : configuredWorkspace;
+    const principals = stringArray(project.principals, `${label}.principals`, 128);
+    if (principals.length === 0 || new Set(principals).size !== principals.length) {
+      throw new Error(`${label}.principals must contain distinct authorized principal ids`);
+    }
+    const policy = project.policy === undefined ? {} : object(project.policy, `${label}.policy`);
+    rejectUnknown(policy, ["write", "commands", "network", "maxDurationMs"], `${label}.policy`);
+    const commands = boolean(policy.commands, `${label}.policy.commands`, false);
+    const network = boolean(policy.network, `${label}.policy.network`, false);
+    if (network && !commands) throw new Error(`${label}.policy.network requires commands`);
+    return {
+      id,
+      name: project.name === undefined ? id : nonEmptyString(project.name, `${label}.name`),
+      workspace,
+      workerId,
+      principals,
+      policy: {
+        write: boolean(policy.write, `${label}.policy.write`, false),
+        commands,
+        network,
+        maxDurationMs: integer(policy.maxDurationMs, `${label}.policy.maxDurationMs`, 1_000, 3_600_000, 900_000),
+      },
+      ...(project.model === undefined ? {} : { model: nonEmptyString(project.model, `${label}.model`) }),
+    };
+  });
+}
+
+export function parseExecutionWorkers(value: unknown, cwd: string = process.cwd()): SshWorkerDefinition[] {
+  if (value === undefined) return [];
+  const seen = new Set<string>(["local"]);
+  return array(value, "workers", 32).map((item, index) => {
+    const label = `workers[${index}]`;
+    const worker = object(item, label);
+    rejectUnknown(worker, ["id", "host", "command", "configFile", "knownHostsFile"], label);
+    const id = identifier(worker.id, `${label}.id`);
+    if (seen.has(id)) throw new Error(`Duplicate or reserved worker id ${id}`);
+    seen.add(id);
+    const host = nonEmptyString(worker.host, `${label}.host`);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._@:[\]-]*$/.test(host)) throw new Error(`${label}.host must be an SSH host or alias`);
+    const command = stringArray(worker.command, `${label}.command`, 16);
+    if (command.length === 0 || command[0]?.startsWith("-"))
+      throw new Error(`${label}.command must name a worker executable`);
+    const configFile = nonEmptyString(worker.configFile, `${label}.configFile`);
+    if (!configFile.startsWith("/") && !configFile.startsWith("~/")) {
+      throw new Error(`${label}.configFile must be absolute or home-relative on its worker`);
+    }
+    return {
+      id,
+      host,
+      command,
+      configFile,
+      knownHostsFile: expandGatewayPath(nonEmptyString(worker.knownHostsFile, `${label}.knownHostsFile`), cwd),
+    };
+  });
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {

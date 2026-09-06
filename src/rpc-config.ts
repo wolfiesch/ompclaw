@@ -1,13 +1,8 @@
 import { lstatSync, readFileSync } from "node:fs";
-
+import type { TaskExecutionContext } from "./execution-types";
 export type AutonomyMode = "inherit" | "autopilot" | "balanced" | "review";
 
-export const AUTONOMY_MODES: readonly AutonomyMode[] = [
-  "autopilot",
-  "balanced",
-  "review",
-  "inherit",
-] as const;
+export const AUTONOMY_MODES: readonly AutonomyMode[] = ["autopilot", "balanced", "review", "inherit"] as const;
 
 export function parseAutonomyMode(value: unknown): AutonomyMode | undefined {
   if (typeof value !== "string") return undefined;
@@ -23,9 +18,7 @@ export function parseAutonomyMode(value: unknown): AutonomyMode | undefined {
   }
 }
 
-export function ompApprovalModeForAutonomy(
-  mode: AutonomyMode,
-): "yolo" | "write" | "always-ask" | undefined {
+export function ompApprovalModeForAutonomy(mode: AutonomyMode): "yolo" | "write" | "always-ask" | undefined {
   switch (mode) {
     case "inherit":
       return undefined;
@@ -36,9 +29,7 @@ export function ompApprovalModeForAutonomy(
     case "review":
       return "always-ask";
     default:
-      throw new Error(
-        `Unsupported autonomy mode: ${mode}. Supported values: inherit, autopilot, balanced, review`,
-      );
+      throw new Error(`Unsupported autonomy mode: ${mode}. Supported values: inherit, autopilot, balanced, review`);
   }
 }
 
@@ -58,12 +49,16 @@ export interface RpcRuntimeConfig {
   inheritHarness: boolean;
   autoRestart: boolean;
   busyInputMode: "steer" | "followup";
+  /** Server-derived context activates the restricted project child. */
+  execution?: TaskExecutionContext;
 }
 
 export function buildOmpRpcArgv(config: RpcRuntimeConfig, resume = config.resume): string[] {
+  const scoped = config.execution !== undefined;
   if (
-    config.autonomyMode !== "inherit"
-    && config.ompArgs.some((arg) => arg === "--approval-mode" || arg.startsWith("--approval-mode="))
+    !scoped &&
+    config.autonomyMode !== "inherit" &&
+    config.ompArgs.some((arg) => arg === "--approval-mode" || arg.startsWith("--approval-mode="))
   ) {
     throw new Error("Explicit autonomyMode conflicts with --approval-mode in ompArgs");
   }
@@ -71,6 +66,11 @@ export function buildOmpRpcArgv(config: RpcRuntimeConfig, resume = config.resume
   if (resume) argv.push("--resume", resume);
   if (config.model) argv.push("--model", config.model);
   if (config.sessionDir) argv.push("--session-dir", config.sessionDir);
+  if (scoped) {
+    // These are native OMP flags. Host tools are registered separately over RPC.
+    argv.push("--no-tools", "--no-extensions", "--no-skills", "--no-rules", "--no-lsp");
+    return argv;
+  }
   for (const file of config.configFiles) argv.push("--config", file);
   const approvalMode = ompApprovalModeForAutonomy(config.autonomyMode);
   if (approvalMode !== undefined) argv.push("--approval-mode", approvalMode);

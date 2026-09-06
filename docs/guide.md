@@ -18,6 +18,82 @@ The following operating assumptions are intentional:
 - To enable Telegram inline command discovery, use `@BotFather` → `/setinline`, select this bot, and set its inline placeholder. If this is skipped or Telegram sends no inline updates, ordinary chats and `/commands` continue to work unchanged.
 - WebSocket is intended to bind to loopback by default. The only HTTP route is the unauthenticated health response.
 
+## Scoped projects and execution workers
+
+An empty or omitted `projects` registry preserves the original workspace and harness behavior. A nonempty registry requires every conversation to select an authorized project before sending work. Project selection, queued requests, and session checkpoints are durable and principal-scoped. Switching projects replaces the main OMP child before dispatch; execution remains serialized.
+
+Add projects to the gateway configuration, using principal IDs already bound to authenticated transport identities:
+
+```json
+{
+  "projects": [
+    {
+      "id": "example",
+      "name": "Example project",
+      "workspace": "~/Projects/example",
+      "workerId": "local",
+      "principals": ["operator"],
+      "policy": {
+        "write": true,
+        "commands": true,
+        "network": false,
+        "maxDurationMs": 1800000
+      }
+    }
+  ]
+}
+```
+
+`/projects` opens the authorized project picker; `/project example` selects directly. `/project` reports the selection. The project may also specify a preferred `model`. Every task records its project, worker, and expiring execution grant. Rebinding a conversation does not redirect already queued work: a stale binding is refused visibly. `/quick` in a scoped conversation uses the serialized scoped runtime instead of the unrestricted quick-answer child.
+
+### Task permissions
+
+Project policy is an upper bound. `/scope` reports the current and next-task scope. `/scope read`, `/scope work`, or `/scope network` narrows the next task only; an optional duration in minutes must fit the configured maximum. The one-shot scope is consumed atomically with durable task acceptance.
+
+- `read`: workspace reads and artifact inspection; no writes or commands.
+- `work`: configured writes and commands, with command networking disabled.
+- `network`: configured capabilities including networking, only when the project permits it.
+
+Every shell command still requires a correlated approval card showing the project, host, command, write mode, and network mode. Approval modes such as `autopilot` cannot bypass this check. There is no unrestricted delete tool. Grant writable or network-enabled commands only after reviewing their consequences; network access can permit publication or other external mutations.
+
+Scoped OMP sessions expose only the gateway's constrained filesystem, command, diff, and artifact tools. Native tools, extension tools, skill/rule discovery, and LSP are disabled; raw OMP arguments and configuration overlays cannot restore those capabilities. Startup verifies the actual active tool inventory and refuses unsupported runtimes. This intentionally differs from the inherited harness available in legacy unscoped mode.
+
+Filesystem operations reject traversal, symlinks, and protected paths. Scoped commands require a Linux worker with Bubblewrap and working unprivileged user namespaces. They run with a minimal environment, a read-only workspace by default, private temporary storage, and PID-namespace containment for descendants. macOS workers retain file and artifact operations but refuse scoped commands: configure a Linux SSH worker for command execution. An unavailable or unusable sandbox fails visibly, without an unsandboxed fallback. Tasks expire within the configured maximum, which must be between one second and one hour.
+
+Typed file operations require Bun's FFI and embedded C compiler to be enabled; disabling them fails closed. Workers use descriptor-relative traversal and atomic writes. Use dedicated worker checkouts without outside writers or watchers during scoped commands. The executor serializes its own operations, but its protected-path mounts do not snapshot concurrent host changes. See the [threat model](../SECURITY.md#threat-model) for the named-path and host-trust boundaries.
+
+### Remote execution
+
+The gateway keeps its OMP session, transport credentials, and SQLite state. SSH workers execute typed filesystem/process operations for configured projects; they never poll Telegram. Configure the coordinator's worker entry:
+
+```json
+{
+  "workers": [
+    {
+      "id": "build-worker",
+      "host": "build-worker",
+      "command": ["ompclaw", "worker"],
+      "configFile": "~/.config/ompclaw/worker.json",
+      "knownHostsFile": "~/.ssh/known_hosts"
+    }
+  ]
+}
+```
+
+Set the coordinator project's `workerId` to `build-worker`. On that host, create a private worker configuration containing a `projects` array with the same project ID, its actual local workspace, `workerId: "local"`, explicit principals, and its maximum policy. The worker uses the shared project schema, but authenticates the coordinator through the SSH account rather than trusting a client-supplied end-user identity. Use a dedicated account and a forced command where practical: access to that account authorizes requests for its configured projects.
+
+Install the same OmpClaw implementation and Bun on the worker. Protect its configuration as an owner-only regular file (`0600`). The coordinator invokes `ompclaw worker --config <path>` over noninteractive SSH with strict known-host verification and agent, X11, port forwarding, and local commands disabled. Existing operator-owned SSH aliases remain supported. The worker resolves roots and policy from its own configuration and rejects requests that exceed them. No transport tokens or provider credentials are sent to workers.
+
+For remote projects, the coordinator's OMP child runs from a private local project-session directory. The remote workspace remains execution metadata; it need not exist on the coordinator. Project routing selects a host; it does not copy repositories or synchronize edits between machines. Provision the desired checkout on the selected worker before using it.
+
+### Results and interruption recovery
+
+Result cards show recorded file changes, Git revision, command exit statuses, and registered artifacts. A successful command is not independent proof that a test suite or task is correct. Assistant prose never creates verification receipts. View diff and artifact downloads reauthorize the original task's project; downloads verify recorded size and SHA-256 before delivery. Artifacts are limited to 8 MiB, text reads/writes to 1 MiB, and command input to 64 KiB; use a smaller artifact or a narrower operation when a limit is reached.
+
+Full request content, attachment references, reply context, project/session identity, and execution receipts survive restart. Requests that may already have started require explicit recovery instead of automatic replay. `/task_recover <id> inspect` shows context, `continue` resumes with the full request, and `restart` requires confirmation before starting again. `/task_retry <id>` opens the recovery choice. Legacy history entries without a complete stored request cannot be replayed safely; submit the original request again.
+
+Continuation includes prior execution evidence but cannot guarantee exactly-once external side effects. Inspect external state before repeating an ambiguous send, publication, or deployment. Changing or removing project authorization invalidates stale queued grants. Recovery and result access are checked against the current authorized project configuration.
+
 ## First-use setup and recovery
 
 Run setup from the OMP workspace that the gateway should control:

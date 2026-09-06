@@ -240,4 +240,57 @@ describe("gateway config", () => {
     });
     expect(child).toEqual({ PATH: "/bin" });
   });
+  test("resolves local project roots and requires explicit principals", () => {
+    const config = parseGatewayConfig(
+      { projects: [{ id: "alpha", workspace: "alpha", principals: ["operator"] }] },
+      "/workspace",
+    );
+    expect(config.projects?.[0]).toEqual({
+      id: "alpha",
+      name: "alpha",
+      workspace: "/workspace/alpha",
+      workerId: "local",
+      principals: ["operator"],
+      policy: { write: false, commands: false, network: false, maxDurationMs: 900_000 },
+    });
+    expect(() => parseGatewayConfig({ projects: [{ id: "alpha", workspace: "/workspace" }] })).toThrow("principals");
+    expect(() =>
+      parseGatewayConfig({
+        projects: [{ id: "alpha", workspace: "/workspace", principals: ["operator", "operator"] }],
+      }),
+    ).toThrow("distinct");
+  });
+
+  test("rejects duplicate projects and invalid permission grants", () => {
+    const project = { id: "alpha", workspace: "/workspace", principals: ["operator"] };
+    expect(() => parseGatewayConfig({ projects: [project, project] })).toThrow("Duplicate project");
+    expect(() => parseGatewayConfig({ projects: [{ ...project, policy: { network: true } }] })).toThrow(
+      "requires commands",
+    );
+    expect(() => parseGatewayConfig({ projects: [{ ...project, policy: { maxDurationMs: 0 } }] })).toThrow(
+      "maxDurationMs",
+    );
+    expect(() => parseGatewayConfig({ projects: [{ ...project, policy: { publish: true } }] })).toThrow(
+      "unknown key publish",
+    );
+  });
+
+  test("routes only configured SSH workers and preserves worker-relative roots", () => {
+    const project = { id: "alpha", workspace: "~/projects/alpha", workerId: "worker", principals: ["operator"] };
+    const worker = {
+      id: "worker",
+      host: "operator@worker.test",
+      command: ["/opt/bin/ompclaw"],
+      configFile: "~/.config/ompclaw/worker.json",
+      knownHostsFile: "known_hosts",
+    };
+    const config = parseGatewayConfig({ projects: [project], workers: [worker] }, "/workspace");
+    expect(config.projects?.[0]?.workspace).toBe("~/projects/alpha");
+    expect(config.workers?.[0]?.knownHostsFile).toBe("/workspace/known_hosts");
+    expect(() => parseGatewayConfig({ projects: [project] })).toThrow("unknown worker");
+    expect(() => parseGatewayConfig({ workers: [worker, worker] })).toThrow("Duplicate or reserved");
+    expect(() => parseGatewayConfig({ workers: [{ ...worker, id: "local" }] })).toThrow("reserved");
+    expect(() => parseGatewayConfig({ workers: [{ ...worker, host: "-oProxyCommand=unsafe" }] })).toThrow("host");
+    expect(() => parseGatewayConfig({ workers: [{ ...worker, token: "not-allowed" }] })).toThrow("unknown key token");
+  });
 });

@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync } from "node:fs";
+import { runExecutionWorker } from "./execution-worker";
 import { OmpRpcClient, type OmpRpcClientOptions } from "./rpc-client";
 import { buildOmpChildEnv, loadLiteralEnvFile } from "./rpc-config";
 import {
@@ -35,6 +36,7 @@ import { telegramPollLockPath, tg } from "./transports/telegram/bot-api";
 
 const COMMANDS = [
   "run",
+  "worker",
   "setup",
   "doctor",
   "pairing-listen",
@@ -89,6 +91,7 @@ export interface GatewayCliSeams {
   readonly runSetupWizard?: (options: GatewaySetupWizardOptions) => Promise<GatewaySetupReceipt>;
   readonly listenForFirstTelegramUser?: typeof listenForFirstTelegramUser;
   readonly promptSecret?: (question: string) => Promise<string | undefined>;
+  readonly runExecutionWorker?: (configPath: string) => Promise<void>;
   readonly now?: () => number;
   readonly write?: (line: string) => void;
 }
@@ -98,6 +101,7 @@ const HELP = `ompclaw - authenticated multi-transport gateway for one persistent
 Usage:
   ompclaw setup [--config <path>] [--env-file <path>] [--install-service]
   ompclaw run [--config <path>] [--env-file <path>]
+  ompclaw worker --config <worker-config-path>
   ompclaw doctor [--config <path>] [--env-file <path>]
   ompclaw pairing-listen [--config <path>] [--env-file <path>]
   ompclaw pairing-list [--config <path>]
@@ -493,6 +497,14 @@ export async function executeGatewayCommand(
     await setupGateway(args, seams);
     return;
   }
+  if (args.command === "worker") {
+    requireNoPositionals(args);
+    if (args.configPath === undefined)
+      throw new Error("worker requires --config with a private worker project allowlist");
+    if (args.envFile !== undefined) throw new Error("worker does not accept --env-file or transport credentials");
+    await (seams.runExecutionWorker ?? runExecutionWorker)(expandGatewayPath(args.configPath));
+    return;
+  }
   if (config === undefined) throw new Error(`Configuration is required for ${args.command}`);
 
   switch (args.command) {
@@ -588,7 +600,7 @@ export async function main(
     return;
   }
   const args = parseGatewayCliArgs(argv);
-  const config = args.command === "setup" ? undefined : loadGatewayCliConfig(args);
+  const config = args.command === "setup" || args.command === "worker" ? undefined : loadGatewayCliConfig(args);
   await executeGatewayCommand(args, config, seams);
 }
 
