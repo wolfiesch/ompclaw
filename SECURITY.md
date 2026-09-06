@@ -24,7 +24,7 @@ Please allow maintainers to investigate and prepare a fix before public disclosu
 
 The gateway is designed for one trusted operator environment:
 
-- It runs one OMP RPC child process for one configured workspace and profile.
+- It owns one serialized main OMP RPC child, with an optional isolated quick-answer child in unscoped mode. Configured projects bind authenticated conversations to explicit workspaces, worker identities, and expiring execution policies.
 - A transport identity must resolve to a principal recorded in the local SQLite store before its inbound message reaches OMP.
 - Telegram sender identity is obtained from the Telegram update. WebSocket identity and conversation address are derived from the configured credential, never from client message fields.
 - A live WebSocket connection is limited to one configured conversation origin. Gateway delivery is constrained to the active principal and origin.
@@ -33,6 +33,18 @@ The gateway is designed for one trusted operator environment:
 - Transactional self-update is disabled by default. When enabled, only an authenticated principal with the `operator` role can stage or activate a release, and only from the fixed configured repository.
 
 The gateway does **not** make an OMP workspace safe for untrusted operators. An authorized principal can cause prompts to be processed by OMP with the authority of the configured OMP profile, workspace, tools, and provider credentials. Treat granting a Telegram allowance or binding a WebSocket identity as granting access to that environment.
+
+Configured projects add a constrained execution mode. The coordinator derives project authorization from the authenticated principal, rejects unbound prompts, disables native and discovered OMP tools, and verifies the active tool inventory before dispatch. A project grant is an upper bound: the next-task scope may narrow it, and commands additionally require a correlated approval. Workers enforce canonical workspace paths, reject symlinks and protected paths, and run commands inside an operating-system sandbox with a minimal environment. Missing sandbox prerequisites fail closed.
+
+Protected paths are a name-based policy for configuration and credential locations, not content-based secret detection. Keep credentials outside project workspaces and do not place alternate copies or hard links to sensitive files under allowed names. Runtime system binaries and the explicitly mounted public runtime configuration remain readable inside command sandboxes.
+
+Use dedicated worker accounts and checkouts without outside project writers during scoped commands. The executor serializes its own operations; protected-path mount preparation does not snapshot a workspace against concurrent host processes. Watchers, other coordinators, or same-user processes that mutate these checkouts are outside this isolation boundary.
+
+The SSH account authenticates a remote coordinator. Worker configuration, roots, and maximum policies belong to that host; they are not selected from client-supplied paths. Anyone controlling the worker account can request its configured projects. Use dedicated accounts, restrictive SSH keys/forced commands, and strict known-host verification. Worker responses are trusted execution receipts from that host, not cryptographic attestations against a compromised worker.
+
+Writable commands can delete workspace content; approved network-enabled commands can cause external side effects. These grants require consequence-aware operator review. Interruption recovery preserves complete requests and recorded evidence but cannot guarantee exactly-once behavior for external systems. Requests that may already have acted are not automatically replayed. Result downloads reauthorize the original project and verify the recorded artifact size and SHA-256.
+
+Scoped commands are supported only on Linux workers with Bubblewrap PID-namespace containment. macOS `sandbox-exec` does not contain the lifetime of deliberately detached descendants, so macOS workers refuse scoped commands rather than offering best-effort expiry. File and artifact operations remain available there.
 
 The gateway does not defend against a compromised host, another process running as the same operating-system user, stolen provider credentials, a stolen Telegram account, a stolen WebSocket token, a malicious OMP plugin or MCP server, or a compromised client device. It also does not provide end-to-end encryption beyond the transport guarantees supplied by Telegram or your own network deployment.
 

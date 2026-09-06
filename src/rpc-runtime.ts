@@ -1,4 +1,6 @@
-import { mkdir } from "node:fs/promises";
+import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -9,6 +11,13 @@ import type {
   Principal,
   TransportIdentity,
 } from "./gateway-types";
+import type {
+  ExecutionOperation,
+  ExecutionResult,
+  ProjectExecutor,
+  TaskEvidence,
+  TaskExecutionContext,
+} from "./execution-types";
 import { executeGatewayHostTool, gatewayHostToolDefinitions, type GatewayDelivery } from "./gateway-tools";
 import { ScheduledDispatchBusyError, type GatewayAutomationControl } from "./gateway-scheduler";
 import type { GatewayUpdateControl } from "./gateway-update";
@@ -35,6 +44,7 @@ import { type RpcRuntimeConfig, buildOmpChildEnv, buildOmpRpcArgv } from "./rpc-
 import {
   type RpcExtensionUiRequest,
   type RpcHostToolCall,
+  type RpcHostToolDefinition,
   type RpcRecord,
   type RpcResponse,
   type RpcSessionState,
@@ -112,6 +122,18 @@ export interface RpcGatewayRuntimeOptions {
   readonly automation?: GatewayAutomationControl;
   readonly turnStore?: RpcRuntimeStore;
   readonly updates?: GatewayUpdateControl;
+  readonly executor?: ProjectExecutor;
+  /** Revalidates a durable project context against the current server configuration. */
+  readonly authorizeExecution?: (context: TaskExecutionContext, principal: Principal) => boolean;
+  /**
+   * Resolves a stored project receipt against current server configuration and
+   * the authenticated conversation without accepting client-selected scope.
+   */
+  readonly resolveExecution?: (
+    stored: TaskExecutionContext,
+    principal: Principal,
+    address: ConversationAddress,
+  ) => TaskExecutionContext | undefined;
   readonly now?: () => number;
   readonly readyTimeoutMs?: number;
   readonly createRpcClient?: (options: OmpRpcClientOptions) => RpcClient;
@@ -170,6 +192,77 @@ const packageVersion = (() => {
   }
 })();
 
+const scopedExecutionHostTools: readonly RpcHostToolDefinition[] = [
+  {
+    name: "fs_list",
+    label: "List project files",
+    description: "List files within the selected project workspace.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", minLength: 1 } },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "fs_read",
+    label: "Read project file",
+    description: "Read a file within the selected project workspace.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", minLength: 1 } },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "fs_write",
+    label: "Write project file",
+    description: "Write a file within the selected project workspace when project policy permits it.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", minLength: 1 },
+        content: { type: "string" },
+      },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "cmd_run",
+    label: "Run project command",
+    description: "Run one approved command in the selected project sandbox.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", minLength: 1 },
+        writable: { type: "boolean" },
+        network: { type: "boolean" },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "fs_diff",
+    label: "Inspect project diff",
+    description: "Read the actual Git diff for the selected project.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "artifact_store",
+    label: "Collect project artifact",
+    description: "Collect a bounded artifact from the selected project workspace.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", minLength: 1 } },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+];
+
 function taskTodoPhases(value: unknown): readonly TaskSemanticTodoPhase[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((candidate, phaseIndex) => {
@@ -200,11 +293,13 @@ export class RpcGatewayRuntime {
   readonly #log: RpcRuntimeLogger;
   readonly #viewVersions = new Map<string, number>();
   readonly #status: RuntimeStatus = { availableCommands: [], subagents: [] };
-  readonly #hostTools = new Map<string, HostToolExecution>();
   #rpc: RpcClient | undefined;
   #ui: RpcGatewayUiBroker | undefined;
   #activeTurn: ActiveTurn | undefined;
   #sessionFile: string | undefined;
+  readonly #baseProjectConfig: Readonly<Pick<RpcRuntimeConfig, "cwd" | "profile" | "sessionDir" | "resume" | "model">>;
+  #execution: TaskExecutionContext | undefined;
+  #projectContextApplied = false;
   #stopping = false;
   #recycling = false;
   #restartAttempt = 0;
@@ -214,6 +309,7 @@ export class RpcGatewayRuntime {
   #turnCardQueue: Promise<void> = Promise.resolve();
   #conversationQueue: Promise<void> = Promise.resolve();
   #queuedConversationCount = 0;
+  readonly #hostTools = new Map<string, HostToolExecution>();
   readonly #reactionQueues = new Map<string, Promise<void>>();
   readonly #idleWaiters = new Set<PromiseWithResolvers<void>>();
   static readonly #TURN_CARD_THROTTLE_MS = 1_250;
@@ -225,11 +321,20 @@ export class RpcGatewayRuntime {
     this.#options = options;
     this.#log = logger;
     this.#sessionFile = options.sessionFile;
+    this.#baseProjectConfig = {
+      cwd: options.config.cwd,
+      profile: options.config.profile,
+      sessionDir: options.config.sessionDir,
+      resume: options.config.resume,
+      model: options.config.model,
+    };
+    this.#execution = options.config.execution;
   }
 
   async start(): Promise<void> {
     if (this.#rpc) throw new Error("RPC gateway runtime is already started");
     this.#stopping = false;
+    await this.#applyProjectContext(this.#execution, this.#sessionFile);
     this.#options.turnStore?.interruptActiveTurns(this.#now());
     try {
       await this.#startRpc();
@@ -247,10 +352,9 @@ export class RpcGatewayRuntime {
     this.#restartTimer = undefined;
     this.#ui?.shutdown();
     this.#ui = undefined;
-    for (const execution of this.#hostTools.values()) execution.controller.abort();
+    this.#abortHostTools();
     const stopped = new Error("OMP runtime stopped");
     await this.#setTurnLifecycle("interrupted", { error: stopped.message });
-    this.#hostTools.clear();
     const active = this.#activeTurn;
     if (active) this.#stopTurnPresentation(active);
     this.#activeTurn = undefined;
@@ -262,9 +366,18 @@ export class RpcGatewayRuntime {
     await this.#frameQueue;
     await this.#turnCardQueue;
   }
+  #abortHostTools(): void {
+    for (const execution of this.#hostTools.values()) execution.controller.abort();
+    this.#hostTools.clear();
+  }
 
   async handleInbound(message: InboundMessage): Promise<void> {
     const delivery = this.#deliveryFor(message);
+    const scopedError = this.#scopedInboundError(message);
+    if (scopedError !== undefined) {
+      await this.#send(delivery, scopedError);
+      return;
+    }
     const parsed = parseSlashCommand(message.content.text);
     const active = this.#activeTurn;
     const sameActiveConversation = active !== undefined && this.#sameDelivery(active, delivery);
@@ -374,12 +487,96 @@ export class RpcGatewayRuntime {
 
   async newSession(name?: string): Promise<boolean> {
     const data = await this.#requestData<{ cancelled: boolean }>({ type: "new_session" });
-    this.#activeTurn = undefined;
+    if (!data.cancelled) {
+      this.#abortHostTools();
+      this.#activeTurn = undefined;
+    }
     if (!data.cancelled && name !== undefined) {
       await this.#sendRpc({ type: "set_session_name", name });
     }
     await this.#refreshStateRequired();
     return !data.cancelled;
+  }
+
+  /**
+   * Selects the server-derived project execution context before its next prompt.
+   * A saved session is accepted only while its owning project context is active.
+   */
+  async selectProject(context: TaskExecutionContext | undefined, sessionFile?: string): Promise<void> {
+    if (sessionFile !== undefined && context === undefined) {
+      throw new Error("A saved project session requires its selected project context");
+    }
+    if (this.isBusy()) throw new Error("Cannot switch project while a task is in progress");
+    if (context?.expiresAt !== undefined && context.expiresAt <= this.#now()) {
+      throw new Error(`Project ${context.projectName} execution grant has expired`);
+    }
+    if (
+      this.#projectContextApplied &&
+      this.#sameExecutionContext(this.#execution, context) &&
+      this.#sessionFile === sessionFile &&
+      this.#options.config.execution === context
+    ) {
+      return;
+    }
+
+    await this.#applyProjectContext(context, sessionFile);
+    if (!this.#rpc) return;
+
+    this.#recycling = true;
+    clearTimeout(this.#restartTimer);
+    this.#restartTimer = undefined;
+    try {
+      const oldRpc = this.#rpc;
+      this.#rpc = undefined;
+      this.#ui?.shutdown();
+      this.#ui = undefined;
+      this.#abortHostTools();
+      await oldRpc.stop();
+      await this.#frameQueue;
+      await this.#startRpc();
+    } finally {
+      this.#recycling = false;
+    }
+  }
+
+  async #applyProjectContext(context: TaskExecutionContext | undefined, sessionFile?: string): Promise<void> {
+    const config = this.#options.config;
+    this.#execution = context;
+    config.execution = context;
+    this.#sessionFile = sessionFile;
+    if (context === undefined) {
+      config.cwd = this.#baseProjectConfig.cwd;
+      config.profile = this.#baseProjectConfig.profile;
+      config.sessionDir = this.#baseProjectConfig.sessionDir;
+      config.resume = this.#baseProjectConfig.resume;
+      config.model = this.#baseProjectConfig.model;
+      this.#projectContextApplied = true;
+      return;
+    }
+
+    const projectKey = context.projectId.replace(/[^A-Za-z0-9._-]/g, "_");
+    const sessionDir = join(config.stateDir, "project-sessions", projectKey);
+    config.cwd = context.workerId === "local" ? context.workspace : sessionDir;
+    config.profile = `${this.#baseProjectConfig.profile}-${projectKey}`;
+    config.sessionDir = sessionDir;
+    config.resume = undefined;
+    config.model = context.model ?? this.#baseProjectConfig.model;
+    await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+    this.#projectContextApplied = true;
+  }
+
+  #sameExecutionContext(left: TaskExecutionContext | undefined, right: TaskExecutionContext | undefined): boolean {
+    return (
+      left?.projectId === right?.projectId &&
+      left?.workspace === right?.workspace &&
+      left?.workerId === right?.workerId &&
+      left?.model === right?.model &&
+      left?.expiresAt === right?.expiresAt &&
+      left?.policy.write === right?.policy.write &&
+      left?.policy.commands === right?.policy.commands &&
+      left?.policy.network === right?.policy.network &&
+      left?.policy.maxDurationMs === right?.policy.maxDurationMs
+    );
   }
 
   async switchSession(sessionPath: string): Promise<boolean> {
@@ -411,8 +608,7 @@ export class RpcGatewayRuntime {
       this.#rpc = undefined;
       this.#ui?.shutdown();
       this.#ui = undefined;
-      for (const execution of this.#hostTools.values()) execution.controller.abort();
-      this.#hostTools.clear();
+      this.#abortHostTools();
       await oldRpc?.stop();
       await this.#frameQueue;
 
@@ -472,6 +668,9 @@ export class RpcGatewayRuntime {
 
   async #startRpc(): Promise<void> {
     const config = this.#options.config;
+    if (this.#execution !== undefined && this.#options.executor === undefined) {
+      throw new Error(`Project ${this.#execution.projectName} cannot start without a scoped execution executor`);
+    }
     const argv = buildOmpRpcArgv(config, this.#sessionFile ?? config.resume);
     const childEnv = buildOmpChildEnv(process.env, config);
     for (const key of Object.keys(childEnv)) {
@@ -514,12 +713,16 @@ export class RpcGatewayRuntime {
     await rpc.send({ type: "set_subagent_subscription", level: "progress" });
     await rpc.send({
       type: "set_host_tools",
-      tools: gatewayHostToolDefinitions({
-        automation: this.#options.automation !== undefined,
-        updates: this.#options.updates !== undefined,
-      }),
+      tools:
+        this.#execution === undefined
+          ? gatewayHostToolDefinitions({
+              automation: this.#options.automation !== undefined,
+              updates: this.#options.updates !== undefined,
+            })
+          : scopedExecutionHostTools,
     });
-    const state = await this.#requestData<RpcSessionState>({ type: "get_state" });
+    const state = await this.#requestData<RpcSessionState & { readonly dumpTools?: unknown }>({ type: "get_state" });
+    if (this.#execution !== undefined) this.#validateScopedToolInventory(state.dumpTools);
     this.#status.state = state;
     this.#persistSession(state);
     this.#restartAttempt = 0;
@@ -538,7 +741,7 @@ export class RpcGatewayRuntime {
     this.#status.lastError = error.message;
     this.#ui?.shutdown();
     this.#ui = undefined;
-    await this.#setTurnLifecycle("interrupted", { error: error.message });
+    this.#abortHostTools();
     const active = this.#activeTurn;
     if (active) this.#stopTurnPresentation(active);
     this.#activeTurn = undefined;
@@ -611,9 +814,9 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "agent_start") {
+      if (this.#status.state) this.#status.state.isStreaming = true;
       await this.#setTurnLifecycle("running");
       this.#recordTurnTimeline("started", "Agent started");
-      if (this.#status.state) this.#status.state.isStreaming = true;
       const active = this.#activeTurn;
       if (active) this.#startTypingHeartbeat(active);
       return;
@@ -665,9 +868,9 @@ export class RpcGatewayRuntime {
       return;
     }
     if (frame.type === "prompt_result" && frame.agentInvoked === false) {
+      this.#abortHostTools();
       await this.#setTurnLifecycle("completed");
       const active = this.#activeTurn;
-      if (active) this.#stopTurnPresentation(active);
       this.#activeTurn = undefined;
       if (this.#status.state) this.#status.state.isStreaming = false;
       this.#wakeIdleWaiters();
@@ -678,6 +881,7 @@ export class RpcGatewayRuntime {
     }
     if (frame.type === "agent_end" && frame.isTerminal !== false) {
       const active = this.#activeTurn;
+      this.#abortHostTools();
       const terminalState = this.#terminalState(frame.messages);
       const terminalText = finalAssistantText(frame.messages);
       const visibleTerminalText =
@@ -789,6 +993,35 @@ export class RpcGatewayRuntime {
     const reply = async (text: string): Promise<void> => {
       await this.#send(delivery, text);
     };
+    if (
+      this.#execution !== undefined &&
+      [
+        "bash",
+        "shell",
+        "abortbash",
+        "login",
+        "handoff",
+        "switch",
+        "export",
+        "autonomy",
+        "permissions",
+        "retry",
+        "schedule_create",
+        "schedules",
+        "schedule",
+        "jobs",
+        "job",
+        "job_edit",
+        "job_pause",
+        "job_resume",
+        "job_run",
+        "job_delete",
+        "job_delete_confirm",
+      ].includes(name)
+    ) {
+      await reply("That runtime control is unavailable for scoped project tasks.");
+      return true;
+    }
     try {
       if (name === "start") await reply(assistantWelcome());
       else if (name === "help") await reply(runtimeHelp(this.#options.config.allowRpcBash));
@@ -833,7 +1066,10 @@ export class RpcGatewayRuntime {
       else if (name === "retry") await this.#retryCommand(args, reply);
       else if (name === "queue") await this.#queueCommand(args, reply);
       else if (name === "tasks") await this.#tasksCommand(delivery);
+      else if (name === "task_diff") await this.#taskDiffCommand(delivery, args, reply);
+      else if (name === "task_artifact") await this.#taskArtifactCommand(delivery, args, reply);
       else if (name === "task_retry") await this.#taskRetryCommand(delivery, args, reply);
+      else if (name === "task_recover") await this.#taskRecoverCommand(delivery, args, reply);
       else if (name === "task_continue" || name === "task_revise")
         await this.#taskContinuationCommand(delivery, args, name === "task_revise" ? "revise" : "continue", reply);
       else if (name === "result") await this.#resultCommand(delivery, args, reply);
@@ -929,6 +1165,10 @@ export class RpcGatewayRuntime {
         await this.#sendRpc({ type: "abort_bash" });
         await reply("RPC bash abort requested.");
       } else {
+        if (this.#execution !== undefined) {
+          await reply("That command is unavailable for scoped project tasks.");
+          return true;
+        }
         const available = this.#status.availableCommands.some((command) => command.name === name);
         if (!available) return false;
         this.#activate(delivery);
@@ -970,6 +1210,8 @@ export class RpcGatewayRuntime {
         autonomyLabel: AUTONOMY_MODE_LABELS[this.#options.config.autonomyMode],
         activeTask,
         quickAskArmed: isBusy && this.#options.isQuickAskArmed?.(delivery.address) === true,
+        execution: active?.lifecycle?.execution,
+        evidence: active?.lifecycle?.evidence,
         version: now,
         updatedAt: now,
       }),
@@ -1523,6 +1765,45 @@ export class RpcGatewayRuntime {
       left.thread === right.thread
     );
   }
+
+  #scopedInboundError(message: InboundMessage): string | undefined {
+    const selected = this.#execution;
+    if (selected === undefined) {
+      return message.execution === undefined
+        ? undefined
+        : "Select the authorized project before sending a project task.";
+    }
+    if (message.execution === undefined || !this.#sameExecutionContext(selected, message.execution)) {
+      return "This project task is not bound to the active authorized project.";
+    }
+    if (message.execution.expiresAt <= this.#now()) {
+      return `Project ${message.execution.projectName} execution grant has expired.`;
+    }
+    if (this.#options.authorizeExecution?.(message.execution, message.principal) === false) {
+      return "This project is no longer authorized for this conversation.";
+    }
+    if (message.content.text?.trimStart().startsWith("!")) {
+      return "Direct runtime commands are unavailable for scoped project tasks. Use the project execution tools.";
+    }
+    return undefined;
+  }
+
+  #validateScopedToolInventory(inventory: unknown): void {
+    if (!Array.isArray(inventory)) {
+      throw new Error("Scoped project mode requires OMP tool inventory support; upgrade OMP before enabling projects");
+    }
+    const registered = new Set(scopedExecutionHostTools.map((tool) => tool.name));
+    const active = new Set<string>();
+    for (const tool of inventory) {
+      if (!isRecord(tool) || typeof tool.name !== "string") {
+        throw new Error("Scoped project mode received an invalid OMP tool inventory");
+      }
+      active.add(tool.name);
+    }
+    if (active.size !== registered.size || [...active].some((name) => !registered.has(name))) {
+      throw new Error("Scoped project mode detected an unapproved native or extension tool; refusing to start");
+    }
+  }
   #now(): number {
     return this.#options.now?.() ?? Date.now();
   }
@@ -1556,6 +1837,7 @@ export class RpcGatewayRuntime {
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 240) || "Message";
+    const recoveryMatch = /^task-(?:continue|revise|restart):(.+):\d+$/.exec(message.id);
     const lifecycle: TurnLifecycle = {
       id: message.id,
       principalId: message.principal.id,
@@ -1564,6 +1846,10 @@ export class RpcGatewayRuntime {
       state: "queued",
       createdAt: now,
       updatedAt: now,
+      request: message,
+      ...(this.#sessionFile === undefined ? {} : { sessionFile: this.#sessionFile }),
+      ...(message.execution === undefined ? {} : { execution: message.execution }),
+      ...(recoveryMatch === null ? {} : { recoveryOf: recoveryMatch[1]! }),
     };
     this.#options.turnStore?.putTurnLifecycle(lifecycle);
     this.#activeTurn = {
@@ -1682,6 +1968,8 @@ export class RpcGatewayRuntime {
           lifecycle.updatedAt,
           taskTodoPhases(this.#status.state?.todoPhases),
           heartbeat,
+          false,
+          this.#now(),
         ),
       );
       active.statusVisible = true;
@@ -1781,7 +2069,7 @@ export class RpcGatewayRuntime {
       return;
     }
     const now = this.#now();
-    await this.#presentSemanticView(delivery, taskSemanticView(task, [], now, [], false, mode !== "hide"));
+    await this.#presentSemanticView(delivery, taskSemanticView(task, [], now, [], false, mode !== "hide", this.#now()));
   }
 
   async #taskRetryCommand(
@@ -1795,20 +2083,182 @@ export class RpcGatewayRuntime {
       return;
     }
     if (previous.state !== "failed" && previous.state !== "interrupted" && previous.state !== "stopped") {
-      await reply("Only stopped, failed, or interrupted tasks can be retried.");
+      await reply("Only stopped, failed, or interrupted tasks can be recovered.");
       return;
     }
-    if (this.#currentTurnBusy()) {
-      await reply("Wait for the current task to finish before retrying another task.");
+    if (previous.request === undefined) {
+      await reply("This legacy task has no complete request envelope, so retrying it would be unsafe.");
       return;
     }
+    await reply(`Choose an explicit recovery mode: /task_recover ${previous.id} inspect|continue|restart`);
+  }
+
+  async #taskDiffCommand(
+    delivery: GatewayTurnTarget,
+    id: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const task = this.#ownedTask(delivery, id.trim());
+    if (task?.execution === undefined || task.evidence === undefined) {
+      await reply("That task has no authorized execution receipt to inspect.");
+      return;
+    }
+    const context = this.#options.resolveExecution?.(
+      task.execution,
+      delivery.deliveryContext.principal,
+      delivery.address,
+    );
+    const executor = this.#options.executor;
+    if (context === undefined || executor === undefined) {
+      await reply("That task's project scope is no longer authorized.");
+      return;
+    }
+    const result = await executor.execute({ context, operation: { kind: "diff" }, approved: true });
+    await reply(result.text);
+  }
+
+  async #taskArtifactCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const [taskId, artifactId, extra] = args.trim().split(/\s+/);
+    if (taskId === undefined || artifactId === undefined || extra !== undefined) {
+      await reply("Usage: /task_artifact <task-id> <artifact-id>");
+      return;
+    }
+    const task = this.#ownedTask(delivery, taskId);
+    const artifact = task?.evidence?.artifacts.find((candidate) => candidate.id === artifactId);
+    if (task?.execution === undefined || artifact === undefined) {
+      await reply("That artifact is no longer available for this task.");
+      return;
+    }
+    const context = this.#options.resolveExecution?.(
+      task.execution,
+      delivery.deliveryContext.principal,
+      delivery.address,
+    );
+    const executor = this.#options.executor;
+    if (context === undefined || executor === undefined) {
+      await reply("That task's project scope is no longer authorized.");
+      return;
+    }
+    const result = await executor.execute({
+      context,
+      operation: { kind: "artifact", path: artifact.path },
+      approved: true,
+    });
+    const received = result.artifact;
+    if (
+      received === undefined ||
+      received.id !== artifact.id ||
+      received.sha256 !== artifact.sha256 ||
+      received.size !== artifact.size ||
+      typeof result.artifactBase64 !== "string"
+    ) {
+      throw new Error("Artifact receipt verification failed");
+    }
+    const bytes = Buffer.from(result.artifactBase64, "base64");
+    if (bytes.byteLength !== artifact.size || createHash("sha256").update(bytes).digest("hex") !== artifact.sha256) {
+      throw new Error("Artifact receipt size or hash verification failed");
+    }
+    const taskStagingKey = createHash("sha256").update(task.id).digest("hex");
+    const artifactStagingKey = createHash("sha256").update(artifact.id).digest("hex");
+    const stagingDirectory = join(this.#options.config.stateDir, "task-artifacts", taskStagingKey);
+    const stagedPath = join(stagingDirectory, `${artifactStagingKey}.artifact`);
+    await mkdir(stagingDirectory, { recursive: true, mode: 0o700 });
+    await chmod(stagingDirectory, 0o700);
+    await writeFile(stagedPath, bytes, { mode: 0o600 });
+    await chmod(stagedPath, 0o600);
+    await this.#options.delivery.send(
+      delivery.address,
+      {
+        text: `Artifact: ${artifact.name}`,
+        attachments: [
+          {
+            url: pathToFileURL(stagedPath).toString(),
+            name: artifact.name,
+            ...(artifact.mediaType === undefined ? {} : { mediaType: artifact.mediaType }),
+          },
+        ],
+        format: "text",
+      },
+      delivery.deliveryContext,
+    );
+  }
+
+  async #taskRecoverCommand(
+    delivery: GatewayTurnTarget,
+    args: string,
+    reply: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const [id, mode, extra] = args.trim().split(/\s+/);
+    if (id === undefined || !["inspect", "continue", "restart"].includes(mode ?? "") || extra !== undefined) {
+      await reply("Usage: /task_recover <task-id> <inspect|continue|restart>");
+      return;
+    }
+    const previous = this.#ownedTask(delivery, id);
+    if (previous === undefined) {
+      await reply("That task is no longer available in this conversation.");
+      return;
+    }
+    if (mode === "inspect") {
+      await reply(
+        `Task ${previous.id}\nState: ${previous.state}\nProject: ${previous.execution?.projectName ?? "legacy"}\nHost: ${previous.evidence?.host ?? previous.execution?.workerId ?? "n/a"}\n${previous.error ? `Error: ${previous.error}` : "No error detail recorded."}`,
+      );
+      return;
+    }
+    if (mode === "continue") {
+      await this.#taskContinuationCommand(
+        delivery,
+        `${previous.id} Continue from the last safe point.`,
+        "continue",
+        reply,
+      );
+      return;
+    }
+    if (this.#currentTurnBusy() || previous.request === undefined) {
+      await reply(
+        previous.request === undefined
+          ? "This legacy task has no complete request envelope, so restarting it would be unsafe."
+          : "Wait for the current task to finish before restarting another task.",
+      );
+      return;
+    }
+    const storedExecution = previous.execution;
+    const execution =
+      storedExecution === undefined
+        ? undefined
+        : this.#options.resolveExecution?.(storedExecution, delivery.deliveryContext.principal, delivery.address);
+    if (storedExecution !== undefined && execution === undefined) {
+      await reply(
+        "This project task's scope has expired or is no longer authorized. Select or renew the project explicitly.",
+      );
+      return;
+    }
+    const approval = await this.#options.delivery.presentUi(
+      delivery.address,
+      {
+        type: "confirm",
+        title: `Restart task — ${execution?.projectName ?? "legacy"} on ${execution?.workerId ?? "local"}`,
+        message:
+          "Restart can repeat side effects that may already have started. Continue only if you intend to run the original request again.",
+        confirmLabel: "Restart task",
+        cancelLabel: "Cancel",
+      },
+      delivery.deliveryContext,
+    );
+    if (!approval.confirmed) {
+      await reply("Task restart was not approved.");
+      return;
+    }
+    if (execution !== undefined) await this.selectProject(execution, previous.sessionFile);
     await this.handleInbound({
-      id: `task-retry:${previous.id}:${this.#now()}`,
+      ...previous.request,
+      id: `task-restart:${previous.id}:${this.#now()}`,
       sentAt: this.#now(),
-      identity: delivery.identity,
-      address: delivery.address,
       principal: delivery.deliveryContext.principal,
-      content: { text: `Resume this unfinished task. Original request:\n${previous.prompt}` },
+      execution,
       edited: false,
     });
   }
@@ -1834,19 +2284,36 @@ export class RpcGatewayRuntime {
       await reply("Wait for the current task to finish before continuing another task.");
       return;
     }
+    if (previous.request === undefined) {
+      await reply("This legacy task has no complete request envelope, so continuation would be unsafe.");
+      return;
+    }
+    const storedExecution = previous.execution;
+    const execution =
+      storedExecution === undefined
+        ? undefined
+        : this.#options.resolveExecution?.(storedExecution, delivery.deliveryContext.principal, delivery.address);
+    if (storedExecution !== undefined && execution === undefined) {
+      await reply(
+        "This project task's scope has expired or is no longer authorized. Select or renew the project explicitly.",
+      );
+      return;
+    }
+    if (execution !== undefined) await this.selectProject(execution, previous.sessionFile);
     const outcome = this.#options.turnStore?.getTurnOutcome?.(previous.id);
     const priorResult =
       mode === "revise"
         ? `\n\nPrevious result:\n${outcome?.text ?? "No final result was recorded."}`
         : "";
     await this.handleInbound({
+      ...previous.request,
       id: `task-${mode}:${previous.id}:${this.#now()}`,
       sentAt: this.#now(),
-      identity: delivery.identity,
-      address: delivery.address,
       principal: delivery.deliveryContext.principal,
+      execution,
       content: {
-        text: `${mode === "continue" ? "Continue" : "Revise"} this prior task. Original request:\n${previous.prompt}${priorResult}\n\nNew instruction:\n${instruction}`,
+        ...previous.request.content,
+        text: `${mode === "continue" ? "Continue" : "Revise"} this prior task. Full original request:\n${previous.request.content.text ?? ""}${priorResult}\n\nNew instruction:\n${instruction}`,
       },
       edited: false,
     });
@@ -2040,18 +2507,21 @@ export class RpcGatewayRuntime {
     this.#hostTools.set(call.id, { controller });
     try {
       if (!active) throw new Error("No active delivery context is available for host tools");
-      const result = await executeGatewayHostTool(
-        call,
-        {
-          delivery: this.#options.delivery,
-          address: active.address,
-          deliveryContext: active.deliveryContext,
-          identity: active.identity,
-          automation: this.#options.automation,
-          updates: this.#options.updates,
-        },
-        controller.signal,
-      );
+      const result =
+        active.lifecycle?.execution === undefined
+          ? await executeGatewayHostTool(
+              call,
+              {
+                delivery: this.#options.delivery,
+                address: active.address,
+                deliveryContext: active.deliveryContext,
+                identity: active.identity,
+                automation: this.#options.automation,
+                updates: this.#options.updates,
+              },
+              controller.signal,
+            )
+          : await this.#executeScopedHostTool(call, active, controller.signal);
       if (!controller.signal.aborted) {
         rpc.write({
           type: "host_tool_result",
@@ -2071,5 +2541,129 @@ export class RpcGatewayRuntime {
     } finally {
       this.#hostTools.delete(call.id);
     }
+  }
+
+  #assertScopedExecutionActive(context: TaskExecutionContext, active: ActiveTurn, signal: AbortSignal): void {
+    if (signal.aborted || this.#activeTurn !== active) {
+      throw new Error("The project operation is no longer active");
+    }
+    if (
+      active.lifecycle?.principalId !== active.deliveryContext.principal.id ||
+      active.lifecycle.execution === undefined ||
+      !this.#sameExecutionContext(context, active.lifecycle.execution) ||
+      !this.#sameExecutionContext(context, this.#execution) ||
+      context.expiresAt <= this.#now()
+    ) {
+      throw new Error("The project execution grant is no longer active");
+    }
+    if (this.#options.authorizeExecution?.(context, active.deliveryContext.principal) === false) {
+      throw new Error("The selected project is no longer authorized");
+    }
+  }
+
+  async #executeScopedHostTool(
+    call: RpcHostToolCall,
+    active: ActiveTurn,
+    signal: AbortSignal,
+  ): Promise<ExecutionResult> {
+    const context = active.lifecycle?.execution;
+    const executor = this.#options.executor;
+    if (context === undefined || executor === undefined) throw new Error("Scoped project execution is unavailable");
+    this.#assertScopedExecutionActive(context, active, signal);
+    const text = (name: string): string => {
+      const value = call.arguments[name];
+      if (typeof value !== "string" || value.length === 0) throw new Error(`${call.toolName} requires ${name}`);
+      return value;
+    };
+    const flag = (name: string): boolean => {
+      const value = call.arguments[name];
+      if (value === undefined) return false;
+      if (typeof value !== "boolean") throw new Error(`${call.toolName} ${name} must be boolean`);
+      return value;
+    };
+    let operation: ExecutionOperation;
+    switch (call.toolName) {
+      case "fs_list":
+        operation = { kind: "list", path: text("path") };
+        break;
+      case "fs_read":
+        operation = { kind: "read", path: text("path") };
+        break;
+      case "fs_write":
+        if (!context.policy.write) throw new Error("Project policy does not allow writing files");
+        operation = { kind: "write", path: text("path"), content: text("content") };
+        break;
+      case "cmd_run": {
+        if (!context.policy.commands) throw new Error("Project policy does not allow commands");
+        const writable = flag("writable");
+        const network = flag("network");
+        if (writable && !context.policy.write) throw new Error("Project policy does not allow writable commands");
+        if (network && !context.policy.network) throw new Error("Project policy does not allow network access");
+        const command = text("command");
+        const approval = await this.#options.delivery.presentUi(
+          active.address,
+          {
+            type: "confirm",
+            title: `Run command — ${context.projectName} on ${context.workerId}`,
+            message: `${command}\n\nProject: ${context.projectName}\nHost: ${context.workerId}\nWritable: ${writable ? "yes" : "no"}\nNetwork: ${network ? "yes" : "no"}`,
+            confirmLabel: "Run command",
+            cancelLabel: "Deny",
+          },
+          active.deliveryContext,
+          signal,
+        );
+        if (!approval.confirmed) throw new Error("Command was not approved");
+        this.#assertScopedExecutionActive(context, active, signal);
+        operation = { kind: "run", command, writable, network };
+        break;
+      }
+      case "fs_diff":
+        operation = { kind: "diff" };
+        break;
+      case "artifact_store":
+        operation = { kind: "artifact", path: text("path") };
+        break;
+      default:
+        throw new Error(`Scoped project tool ${call.toolName} is not available`);
+    }
+    const result = await executor.execute({ context, operation, approved: true }, signal);
+    this.#recordExecutionEvidence(active, context, result);
+    return result;
+  }
+
+  #recordExecutionEvidence(active: ActiveTurn, context: TaskExecutionContext, result: ExecutionResult): void {
+    const lifecycle = active.lifecycle;
+    if (lifecycle === undefined) return;
+    const existing = lifecycle.evidence;
+    const revision = result.revision ?? existing?.revision;
+    const receivedArtifact = result.artifact;
+    const artifact =
+      receivedArtifact === undefined
+        ? undefined
+        : {
+            id: receivedArtifact.id,
+            name: receivedArtifact.name,
+            path: receivedArtifact.path,
+            ...(receivedArtifact.mediaType === undefined ? {} : { mediaType: receivedArtifact.mediaType }),
+            size: receivedArtifact.size,
+            sha256: receivedArtifact.sha256,
+          };
+    const evidence: TaskEvidence = {
+      projectId: context.projectId,
+      host: context.workerId,
+      ...(revision === undefined ? {} : { revision }),
+      changedFiles: [...new Set([...(existing?.changedFiles ?? []), ...(result.changedFiles ?? [])])],
+      checks: result.check === undefined ? (existing?.checks ?? []) : [...(existing?.checks ?? []), result.check],
+      artifacts:
+        artifact === undefined
+          ? (existing?.artifacts ?? [])
+          : [
+              ...(existing?.artifacts ?? []).filter((existingArtifact) => existingArtifact.id !== artifact.id),
+              artifact,
+            ],
+    };
+    const updated = { ...lifecycle, updatedAt: this.#now(), evidence };
+    active.lifecycle = updated;
+    this.#options.turnStore?.putTurnLifecycle(updated);
   }
 }

@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+## 0.13.0 (2026-09-06)
+
+### Added
+
+- Add authorized project selection with durable conversation bindings, isolated session checkpoints, preferred models, and one-shot task scopes.
+- Add local and authenticated SSH execution workers with constrained filesystem tools, Linux-isolated commands, approval and expiry enforcement, and server-owned project policies. macOS workers refuse scoped commands and direct operators to a Linux worker.
+- Add execution-backed result receipts, source revision and file-change details, verified artifact downloads, and explicit inspection, continuation, and confirmed restart recovery from complete stored requests.
+
+### Changed
+
+- Route scoped quick requests through the constrained main runtime and refuse unbound work when a project registry is configured.
+- Require explicit recovery for interrupted requests that may already have performed work instead of automatically replaying them.
+- Require Bun 1.3.14 and OMP 17.4.2 or newer, and document project-profile model configuration and worker C-header prerequisites.
+
+### Fixed
+
+- Reject legacy unversioned OMP startup frames with an upgrade instruction instead of waiting for a readiness timeout.
+- Report actionable native filesystem initialization failures for packaged and compiled workers.
+
 ## 0.12.0 (2026-09-04)
 
 ### Added

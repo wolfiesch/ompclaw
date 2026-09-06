@@ -334,6 +334,54 @@ describe("GatewayStore", () => {
     restarted.close();
   });
 
+  test("atomically claims an inbound message only while consuming its exact one-shot checkpoint", () => {
+    const path = temporaryDatabase();
+    const first = new GatewayStore(path);
+    const contender = new GatewayStore(path);
+
+    expect(first.claimInboundMessage(claimedInbound("already-claimed"), 1)).toBe(true);
+    first.setCheckpoint("telegram", "pairing:42", { nonce: "current" });
+    expect(
+      contender.claimInboundMessageConsumingCheckpoint(claimedInbound("already-claimed"), 2, {
+        adapter: "telegram",
+        key: "pairing:42",
+        expectedValue: { nonce: "current" },
+      }),
+    ).toBe("duplicate");
+    expect(first.getCheckpoint("telegram", "pairing:42")).toEqual({ nonce: "current" });
+
+    expect(
+      contender.claimInboundMessageConsumingCheckpoint(claimedInbound("stale-claim"), 3, {
+        adapter: "telegram",
+        key: "pairing:42",
+        expectedValue: { nonce: "stale" },
+      }),
+    ).toBe("checkpoint_changed");
+    expect(first.getCheckpoint("telegram", "pairing:42")).toEqual({ nonce: "current" });
+
+    expect(
+      first.claimInboundMessageConsumingCheckpoint(claimedInbound("consume-once"), 4, {
+        adapter: "telegram",
+        key: "pairing:42",
+        expectedValue: { nonce: "current" },
+      }),
+    ).toBe("claimed");
+    expect(contender.getCheckpoint("telegram", "pairing:42")).toBeUndefined();
+    expect(
+      contender.claimInboundMessageConsumingCheckpoint(claimedInbound("second-consume"), 5, {
+        adapter: "telegram",
+        key: "pairing:42",
+        expectedValue: { nonce: "current" },
+      }),
+    ).toBe("checkpoint_changed");
+    expect(first.listPendingInboundMessages().map(({ message }) => message.id)).toEqual([
+      "already-claimed",
+      "consume-once",
+    ]);
+    contender.close();
+    first.close();
+  });
+
   test("releases only failed inbound claims so deliveries can retry", () => {
     const store = new GatewayStore(temporaryDatabase());
 
@@ -652,7 +700,121 @@ describe("GatewayStore", () => {
       deliveredAt: 600,
     });
     expect(restarted.listPendingTurnOutcomes()).toEqual([]);
+
     restarted.close();
+  });
+  test("retains the complete task request envelope across reopen while keeping the display prompt bounded", () => {
+    const path = temporaryDatabase();
+    const originalText = `First line of the request\n${"x".repeat(280)}\nFinal multiline instruction`;
+    const request = stagedIngress("full-request", {
+      text: originalText,
+      attachments: [{ url: "https://files.example.test/design.pdf", name: "design.pdf", mediaType: "application/pdf" }],
+      replyContext: {
+        messageId: "reply-7",
+        author: "operator",
+        quote: "Preserve the attachment and reply context.",
+        targetKind: "user",
+      },
+    });
+    const first = new GatewayStore(path);
+    first.upsertPrincipal(request.principal);
+    first.putTurnLifecycle({
+      id: "full-request-turn",
+      principalId: request.principal.id,
+      address: request.address,
+      prompt: originalText.slice(0, 240),
+      request,
+      sessionFile: "/sessions/project-a.jsonl",
+      state: "interrupted",
+      createdAt: 100,
+      updatedAt: 200,
+      finishedAt: 200,
+    });
+    first.close();
+
+    const restarted = new GatewayStore(path);
+    expect(restarted.getTurnLifecycle("full-request-turn")).toMatchObject({
+      prompt: originalText.slice(0, 240),
+      sessionFile: "/sessions/project-a.jsonl",
+      request: {
+        content: {
+          text: originalText,
+          attachments: [{ url: "https://files.example.test/design.pdf", name: "design.pdf" }],
+        },
+        replyContext: {
+          messageId: "reply-7",
+          quote: "Preserve the attachment and reply context.",
+        },
+      },
+    });
+    restarted.close();
+  });
+
+  test("migrates pre-recovery lifecycle rows without inventing a request envelope", () => {
+    const path = temporaryDatabase();
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE principals (
+        id TEXT PRIMARY KEY NOT NULL,
+        roles_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE turn_lifecycles (
+        id TEXT PRIMARY KEY NOT NULL,
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+        transport TEXT NOT NULL,
+        account TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        state TEXT NOT NULL,
+        current_tool TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        error TEXT
+      );
+    `);
+    legacy
+      .query("INSERT INTO principals (id, roles_json, created_at, updated_at) VALUES (?, ?, ?, ?)")
+      .run("operator-42", JSON.stringify(["operator"]), 1, 1);
+    legacy
+      .query(
+        `INSERT INTO turn_lifecycles (
+           id, principal_id, transport, account, channel, thread, prompt, state,
+           current_tool, created_at, updated_at, finished_at, error
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "legacy-turn",
+        "operator-42",
+        "telegram",
+        "default",
+        "42",
+        "",
+        "Legacy task",
+        "interrupted",
+        null,
+        1,
+        2,
+        2,
+        null,
+      );
+    legacy.close();
+
+    const store = new GatewayStore(path);
+    expect(store.getTurnLifecycle("legacy-turn")).toEqual({
+      id: "legacy-turn",
+      principalId: "operator-42",
+      address: ownerAddress,
+      prompt: "Legacy task",
+      state: "interrupted",
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+    });
+    store.close();
   });
 
   test("imports legacy Telegram state once without ingesting a token or changing the source files", () => {

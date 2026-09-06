@@ -13,6 +13,13 @@ import {
   type GatewayIngressComposerOptions,
   type GatewayIngressCompositionStore,
 } from "./gateway-ingress-composer";
+import {
+  GatewayProjectRouter,
+  formatProjectList,
+  formatProjectResolution,
+  type GatewayProjectCommand,
+  type GatewayProjectSelection,
+} from "./gateway-projects";
 import { GatewayPairingService, type GatewayPairingPersistence } from "./gateway-pairing";
 import {
   GatewayQuickLane,
@@ -30,15 +37,19 @@ import {
   type GatewaySchedulerOptions,
 } from "./gateway-scheduler";
 import {
+  type InboundCheckpointClaim,
   GatewayStore,
   type ConversationBinding,
   type GatewayCommandCatalogStore,
   type GatewayTurnLifecycleStore,
   type JsonValue,
   type ScheduledJob,
+  type TurnLifecycle,
+  type TurnTimelineEvent,
 } from "./gateway-store";
 import type { ConversationAddress, InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
 import { RpcGatewayRuntime, runtimeCommandMenu, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
+import { createProjectExecutor } from "./execution-worker";
 import type { RpcSessionState } from "./rpc-protocol";
 import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
 import { GatewayUpdateCoordinator, currentGatewayRelease, gatewayUpdatePaths } from "./gateway-update";
@@ -62,12 +73,20 @@ export interface GatewayApplicationStore
   getConversationBinding(address: InboundMessage["address"]): ConversationBinding | undefined;
   getSharedConversationSessionPath?(): string | undefined;
   migrateTelegramTopicSessions?(account: string): number;
+  claimInboundMessageConsumingCheckpoint?: (
+    message: InboundMessage,
+    receivedAt: number,
+    checkpoint: InboundCheckpointClaim,
+    scheduled?: boolean,
+  ) => "claimed" | "duplicate" | "checkpoint_changed";
   migrateTelegramUpdateCheckpoint?(account: string): boolean;
   putPendingInteraction: GatewayStore["putPendingInteraction"];
   deletePendingInteraction: GatewayStore["deletePendingInteraction"];
   listPendingInteractions: GatewayStore["listPendingInteractions"];
   getSemanticView: GatewayStore["getSemanticView"];
   putSemanticView: GatewayStore["putSemanticView"];
+  getTurnLifecycle?(turnId: string): TurnLifecycle | undefined;
+  listTurnTimelineEvents?(turnId: string, limit?: number): TurnTimelineEvent[];
   getSemanticViewByReceipt: GatewayStore["getSemanticViewByReceipt"];
   listOmpAvailableCommands?: GatewayCommandCatalogStore["listOmpAvailableCommands"];
   recordCommandUsage?: GatewayCommandCatalogStore["recordCommandUsage"];
@@ -87,6 +106,7 @@ export interface GatewayRuntime {
   notifyInboundQueued?(message: InboundMessage): Promise<void>;
   newSession?(name?: string): Promise<boolean>;
   switchSession?(sessionPath: string): Promise<boolean>;
+  selectProject?(context: InboundMessage["execution"], sessionFile?: string): Promise<void>;
   showHome?(message: InboundMessage): Promise<void>;
 }
 
@@ -144,6 +164,7 @@ interface PendingInboundCompletion {
   readonly sessionFile: string;
   readonly associateSession: boolean;
   readonly updateSharedSession: boolean;
+  readonly projectSelection?: GatewayProjectSelection;
 }
 
 /**
@@ -168,6 +189,7 @@ export class GatewayApplication {
   #adapters: TransportAdapter[] = [];
   #sessionFile: string | undefined;
   #sharedSessionFile: string | undefined;
+  #projects: GatewayProjectRouter | undefined;
   #dispatchTail: Promise<void> = Promise.resolve();
   #dispatchReady: Promise<void> = Promise.resolve();
   #releaseDispatchReady: (() => void) | undefined;
@@ -212,14 +234,21 @@ export class GatewayApplication {
       if (!lock.ok) throw new Error(`OmpClaw is already running in process ${lock.holder}`);
       lockHeld = true;
       this.#releaseHeartbeat = (this.#seams.startLockHeartbeat ?? startLockHeartbeat)(this.#lockPath);
-
       const store = (this.#seams.createStore ?? ((path: string) => new GatewayStore(path)))(this.#databasePath);
       this.#store = store;
+      const projectsConfigured = (this.#config.projects?.length ?? 0) > 0;
+      this.#projects = projectsConfigured
+        ? new GatewayProjectRouter({
+            projects: this.#config.projects,
+            store,
+            ...(this.#seams.now === undefined ? {} : { now: this.#seams.now }),
+          })
+        : undefined;
       const telegram = this.#config.transports.telegram;
       if (telegram?.enabled) store.migrateTelegramUpdateCheckpoint?.(telegram.account);
-      const topicSessions = telegram?.enabled === true && telegram.topicSessions.enabled;
+      const topicSessions = !projectsConfigured && telegram?.enabled === true && telegram.topicSessions.enabled;
       if (topicSessions) store.migrateTelegramTopicSessions?.(telegram.account);
-      const checkpoint = store.getCheckpoint("omp", "session_file");
+      const checkpoint = projectsConfigured ? undefined : store.getCheckpoint("omp", "session_file");
       if (checkpoint !== undefined && (typeof checkpoint !== "string" || checkpoint.length === 0)) {
         throw new Error("OMP session checkpoint must be a non-empty string");
       }
@@ -270,7 +299,9 @@ export class GatewayApplication {
       const learningOverlay = prepareLearningOverlay(this.#config);
       if (learningOverlay !== undefined)
         rpcConfig = { ...rpcConfig, configFiles: [...rpcConfig.configFiles, learningOverlay] };
-
+      const executor = projectsConfigured
+        ? createProjectExecutor(this.#config.projects ?? [], this.#config.workers ?? [])
+        : undefined;
       const updates = this.#config.updates.enabled
         ? new GatewayUpdateCoordinator({
             config: this.#config.updates,
@@ -292,6 +323,19 @@ export class GatewayApplication {
         ...(updates === undefined ? {} : { updates }),
         readyTimeoutMs: this.#config.updates.healthTimeoutMs,
         ...(isTurnLifecycleStore(store) ? { turnStore: store } : {}),
+        ...(executor === undefined ? {} : { executor }),
+        ...(this.#projects === undefined
+          ? {}
+          : {
+              resolveExecution: (stored, principal, address) =>
+                this.#projects?.renewExecution(stored, principal, address),
+            }),
+        ...(this.#projects === undefined
+          ? {}
+          : {
+              authorizeExecution: (context, principal) =>
+                this.#projects?.authorizeExecution(context, principal) === true,
+            }),
       });
       this.#runtime = runtime;
       this.#ingressComposer = new GatewayIngressComposer({
@@ -308,7 +352,27 @@ export class GatewayApplication {
       this.#checkpointSharedSession();
       this.#ingressComposer.start();
       for (const pending of store.listPendingInboundMessages()) {
-        if (!pending.scheduled) this.#schedulePendingInbound(pending.message, false);
+        if (pending.scheduled) continue;
+        const lifecycle = store.getTurnLifecycle?.(pending.message.id);
+        const timeline = store.listTurnTimelineEvents?.(pending.message.id, 1) ?? [];
+        if (
+          lifecycle?.state === "queued" ||
+          lifecycle?.state === "running" ||
+          lifecycle?.state === "interrupted" ||
+          timeline.length > 0
+        ) {
+          if (
+            !store.completeInboundMessage(
+              pending.message.address.transport,
+              pending.message.address.account,
+              pending.message.id,
+            )
+          ) {
+            throw new Error(`Interrupted inbound ${pending.message.id} disappeared during startup reconciliation`);
+          }
+          continue;
+        }
+        this.#schedulePendingInbound(pending.message, false);
       }
       await core.start(signal);
       this.#state = "started";
@@ -388,18 +452,54 @@ export class GatewayApplication {
   async #handleInbound(message: InboundMessage): Promise<void> {
     const store = this.#requireStore();
     const runtime = this.#requireRuntime();
-    if (!store.claimInboundMessage(message, (this.#seams.now ?? Date.now)())) return;
+    const router = this.#projects;
+    let queuedMessage = message;
+    let scopeClaim: InboundCheckpointClaim | undefined;
+    const principal = store.resolvePrincipal(message.identity);
+    if (router !== undefined && principal !== undefined && principal.id === message.principal.id) {
+      const authorizedMessage = { ...message, principal };
+      if (router.commandFor(authorizedMessage) === undefined) {
+        const capture = router.captureTask(authorizedMessage);
+        if (capture.resolution.kind === "unavailable") {
+          await this.#requireCore().send(
+            authorizedMessage.address,
+            { text: formatProjectResolution(capture.resolution), format: "text" },
+            { principal, origin: authorizedMessage.address },
+          );
+          return;
+        }
+        if (capture.resolution.kind === "selected") {
+          queuedMessage = { ...authorizedMessage, execution: capture.resolution.selection.context };
+          scopeClaim = capture.scopeClaim;
+        }
+      }
+    }
+    const receivedAt = (this.#seams.now ?? Date.now)();
+    if (scopeClaim === undefined) {
+      if (!store.claimInboundMessage(queuedMessage, receivedAt)) return;
+    } else {
+      if (store.claimInboundMessageConsumingCheckpoint === undefined) {
+        throw new Error("Gateway store does not support atomic scoped task claims");
+      }
+      const result = store.claimInboundMessageConsumingCheckpoint(queuedMessage, receivedAt, scopeClaim);
+      if (result !== "claimed") return;
+    }
 
-    const quickRoute = this.#quickLane?.routeFor(message);
-    const immediate = quickRoute !== undefined || runtime.canHandleInboundImmediately?.(message) === true;
+    const projectCommand = router?.commandFor(queuedMessage);
+    const projectScoped =
+      queuedMessage.execution !== undefined ||
+      (router !== undefined && router.resolveCaptured(queuedMessage).kind !== "none");
+    const quickRoute =
+      projectCommand === undefined && !projectScoped ? this.#quickLane?.routeFor(queuedMessage) : undefined;
+    const immediate = quickRoute !== undefined || runtime.canHandleInboundImmediately?.(queuedMessage) === true;
     const delayed = !immediate && (this.#queuedInboundCount > 0 || runtime.isBusy?.() === true);
     const ready =
       delayed && runtime.notifyInboundQueued !== undefined
-        ? runtime.notifyInboundQueued(message).catch((error) => {
-            this.#reportInboundDispatchError(message, error);
+        ? runtime.notifyInboundQueued(queuedMessage).catch((error) => {
+            this.#reportInboundDispatchError(queuedMessage, error);
           })
         : Promise.resolve();
-    this.#schedulePendingInbound(message, immediate, ready);
+    this.#schedulePendingInbound(queuedMessage, immediate, ready);
     await ready;
   }
 
@@ -456,11 +556,60 @@ export class GatewayApplication {
     const runtime = this.#requireRuntime();
     const key = this.#inboundKey(message);
     const quickLane = this.#quickLane;
-    const quickRoute = scheduled ? undefined : quickLane?.routeFor(message);
+    const requestedQuickRoute = scheduled ? undefined : quickLane?.routeFor(message);
+    const principal = this.#resolvePendingPrincipal(store, message);
+    if (principal === undefined) return;
+    let authorizedMessage: InboundMessage = { ...message, principal };
+    const router = this.#projects;
+    const projectCommand = scheduled ? undefined : router?.commandFor(authorizedMessage);
+    if (projectCommand !== undefined && router !== undefined) {
+      await this.#respondToProjectCommand(router, authorizedMessage, projectCommand);
+      if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+        throw new Error(`Project command ${message.id} disappeared before completion`);
+      }
+      return;
+    }
+
+    const projectResolution = router?.resolveCaptured(authorizedMessage);
+    if (router !== undefined && projectResolution?.kind === "none") {
+      await this.#requireCore().send(
+        authorizedMessage.address,
+        { text: "Choose an authorized project with /projects before sending work.", format: "text" },
+        { principal, origin: authorizedMessage.address },
+      );
+      if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+        throw new Error(`Unbound project request ${message.id} disappeared before completion`);
+      }
+      return;
+    }
+    if (projectResolution?.kind === "unavailable") {
+      await this.#requireCore().send(
+        authorizedMessage.address,
+        { text: formatProjectResolution(projectResolution), format: "text" },
+        { principal, origin: authorizedMessage.address },
+      );
+      if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+        throw new Error(`Unavailable project request ${message.id} disappeared before completion`);
+      }
+      return;
+    }
+    const projectSelection = projectResolution?.kind === "selected" ? projectResolution.selection : undefined;
+    if (projectSelection !== undefined && requestedQuickRoute !== undefined && requestedQuickRoute.kind !== "query") {
+      await this.#requireCore().send(
+        authorizedMessage.address,
+        {
+          text: "Quick ask is unavailable while a project is selected. Send the project request directly.",
+          format: "text",
+        },
+        { principal, origin: authorizedMessage.address },
+      );
+      if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
+        throw new Error(`Scoped quick request ${message.id} disappeared before completion`);
+      }
+      return;
+    }
+    const quickRoute = projectSelection === undefined ? requestedQuickRoute : undefined;
     if (quickRoute !== undefined && quickLane !== undefined) {
-      const principal = this.#resolvePendingPrincipal(store, message);
-      if (principal === undefined) return;
-      const authorizedMessage = { ...message, principal };
       try {
         const result = await quickLane.handle(authorizedMessage, quickRoute);
         if (result.armChanged) await runtime.showHome?.(authorizedMessage);
@@ -481,19 +630,31 @@ export class GatewayApplication {
 
     let completion = this.#pendingInboundCompletions.get(key);
     if (completion === undefined) {
-      const dispatchImmediately = immediate || (!scheduled && runtime.canHandleInboundImmediately?.(message) === true);
+      const dispatchImmediately =
+        projectSelection === undefined &&
+        (immediate || (!scheduled && runtime.canHandleInboundImmediately?.(message) === true));
       if (!dispatchImmediately) await this.#waitUntilSessionMutable(runtime, "dispatch the next queued conversation");
+      const currentPrincipal = this.#resolvePendingPrincipal(store, message);
+      if (currentPrincipal === undefined) return;
+      authorizedMessage = { ...authorizedMessage, principal: currentPrincipal };
 
-      let principal = this.#resolvePendingPrincipal(store, message);
-      if (principal === undefined) return;
-      let authorizedMessage: InboundMessage = { ...message, principal };
-      const topicSessions = this.#config.transports.telegram?.topicSessions.enabled === true;
-      const associateSession = !topicSessions || !dispatchImmediately;
-      if (topicSessions && !dispatchImmediately) {
+      const topicSessions =
+        this.#projects === undefined && this.#config.transports.telegram?.topicSessions.enabled === true;
+      const associateSession = projectSelection === undefined && (!topicSessions || !dispatchImmediately);
+      if (projectSelection !== undefined) {
+        if (runtime.selectProject === undefined) throw new Error("OMP runtime does not support project selection");
+        await runtime.selectProject(projectSelection.context, projectSelection.sessionFile);
+        if (requestedQuickRoute?.kind === "query") {
+          authorizedMessage = {
+            ...authorizedMessage,
+            content: { ...authorizedMessage.content, text: requestedQuickRoute.prompt },
+          };
+        }
+      } else if (topicSessions && !dispatchImmediately) {
         await this.#selectConversationSession(store, runtime, authorizedMessage);
-        principal = this.#resolvePendingPrincipal(store, message);
-        if (principal === undefined) return;
-        authorizedMessage = { ...message, principal };
+        const currentPrincipal = this.#resolvePendingPrincipal(store, message);
+        if (currentPrincipal === undefined) return;
+        authorizedMessage = { ...authorizedMessage, principal: currentPrincipal };
       }
       if (scheduled && runtime.handleScheduled !== undefined) await runtime.handleScheduled(authorizedMessage);
       else await runtime.handleInbound(authorizedMessage);
@@ -504,11 +665,15 @@ export class GatewayApplication {
         sessionFile,
         associateSession,
         updateSharedSession: topicSessions && !this.#isTopicAddress(message.address) && associateSession,
+        ...(projectSelection === undefined ? {} : { projectSelection }),
       };
       this.#pendingInboundCompletions.set(key, completion);
     }
 
-    if (completion.associateSession) {
+    if (completion.projectSelection !== undefined) {
+      if (router === undefined) throw new Error("Project selection completed without a project router");
+      router.checkpointSession(message, completion.projectSelection, completion.sessionFile);
+    } else if (completion.associateSession) {
       store.bindConversation({
         address: message.address,
         ompSessionPath: completion.sessionFile,
@@ -519,7 +684,7 @@ export class GatewayApplication {
       this.#sharedSessionFile = completion.sessionFile;
       store.setCheckpoint("omp", "shared_session_file", completion.sessionFile);
     }
-    if (this.#sessionFile === completion.sessionFile) {
+    if (this.#projects === undefined && this.#sessionFile === completion.sessionFile) {
       store.setCheckpoint("omp", "session_file", completion.sessionFile);
     }
     if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
@@ -528,6 +693,67 @@ export class GatewayApplication {
     this.#pendingInboundCompletions.delete(key);
   }
 
+  async #respondToProjectCommand(
+    router: GatewayProjectRouter,
+    message: InboundMessage,
+    command: GatewayProjectCommand,
+  ): Promise<void> {
+    const core = this.#requireCore();
+    let text: string;
+    switch (command.kind) {
+      case "list": {
+        const projects = router.list(message.principal);
+        const current = router.resolve(message);
+        const response = await core.presentUi(
+          message.address,
+          {
+            type: "select",
+            presentation: "picker",
+            title:
+              current.kind === "selected" ? `Projects — current: ${current.selection.context.projectName}` : "Projects",
+            options: projects.map((project) => ({
+              value: `/project ${project.id}`,
+              label: project.name,
+              description: `${project.id} · host ${project.workerId}${current.kind === "selected" && current.selection.context.projectId === project.id ? " · current" : ""}`,
+            })),
+          },
+          { principal: message.principal, origin: message.address },
+        );
+        const selected = response.type === "select" ? response.selected[0] : undefined;
+        const selectedCommand =
+          selected === undefined
+            ? undefined
+            : router.commandFor({ ...message, content: { ...message.content, text: selected } });
+        text =
+          selectedCommand?.kind === "select"
+            ? formatProjectResolution(router.select(message, selectedCommand.projectId))
+            : formatProjectList(projects);
+        break;
+      }
+      case "show":
+        text = formatProjectResolution(router.resolve(message));
+        break;
+      case "select":
+        text = formatProjectResolution(router.select(message, command.projectId));
+        break;
+      case "scope-show":
+        text = router.scopeStatus(message);
+        break;
+      case "scope-set": {
+        const result = router.setNextScope(message, command.mode, command.minutes);
+        text = "text" in result ? result.text : formatProjectResolution(result);
+        break;
+      }
+      case "usage":
+        text = "Usage: /projects, /project <id>, or /scope [read|work|network] [minutes]";
+        break;
+    }
+    await core.send(
+      message.address,
+      { text, format: "text" },
+      { principal: message.principal, origin: message.address },
+    );
+  }
   #resolvePendingPrincipal(store: GatewayApplicationStore, message: InboundMessage): Principal | undefined {
     const principal = store.resolvePrincipal(message.identity);
     if (principal !== undefined && principal.id === message.principal.id) return principal;
@@ -666,7 +892,9 @@ export class GatewayApplication {
   }
 
   #checkpointSession(): void {
-    if (this.#sessionFile !== undefined) this.#requireStore().setCheckpoint("omp", "session_file", this.#sessionFile);
+    if (this.#projects === undefined && this.#sessionFile !== undefined) {
+      this.#requireStore().setCheckpoint("omp", "session_file", this.#sessionFile);
+    }
   }
 
   #checkpointSharedSession(): void {
@@ -783,6 +1011,11 @@ export class GatewayApplication {
   #requireStore(): GatewayApplicationStore {
     if (this.#store === undefined) throw new Error("OmpClaw store is not started");
     return this.#store;
+  }
+
+  #requireCore(): GatewayCoreRuntime {
+    if (this.#core === undefined) throw new Error("OmpClaw core is not started");
+    return this.#core;
   }
 
   #requireRuntime(): GatewayRuntime {

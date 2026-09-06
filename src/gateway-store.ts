@@ -2,7 +2,14 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { OmpAvailableCommand } from "./command-catalog";
-import type { ConversationAddress, InboundMessage, OutboundReceipt, Principal, TransportIdentity } from "./gateway-types";
+import type { TaskEvidence, TaskExecutionContext } from "./execution-types";
+import type {
+  ConversationAddress,
+  InboundMessage,
+  OutboundReceipt,
+  Principal,
+  TransportIdentity,
+} from "./gateway-types";
 import {
   isSemanticViewIdentifier,
   normalizeStoredSemanticView,
@@ -37,6 +44,15 @@ export interface PendingInboundMessage {
   readonly scheduled: boolean;
 }
 
+export interface InboundCheckpointClaim {
+  readonly adapter: string;
+  readonly key: string;
+  /** The exact checkpoint value observed while resolving the one-shot scope. */
+  readonly expectedValue: JsonValue;
+}
+
+export type InboundCheckpointClaimResult = "claimed" | "duplicate" | "checkpoint_changed";
+
 export interface AppendIngressFragmentInput {
   readonly compositionId: string;
   readonly groupKey: string;
@@ -65,6 +81,7 @@ export interface TurnLifecycle {
   readonly id: string;
   readonly principalId: string;
   readonly address: ConversationAddress;
+  /** Display-only task summary. The full envelope is retained in request. */
   readonly prompt: string;
   readonly state: TurnLifecycleState;
   readonly createdAt: number;
@@ -72,6 +89,13 @@ export interface TurnLifecycle {
   readonly currentTool?: string;
   readonly finishedAt?: number;
   readonly error?: string;
+  /** Complete authenticated inbound envelope, including attachments and reply context. */
+  readonly request?: InboundMessage;
+  /** The scoped session file that owns this task, never a client-provided path. */
+  readonly sessionFile?: string;
+  readonly execution?: TaskExecutionContext;
+  readonly evidence?: TaskEvidence;
+  readonly recoveryOf?: string;
 }
 export type TurnTimelineEventKind =
   | "queued"
@@ -122,6 +146,7 @@ export interface GatewayPrincipalStore {
 
 export interface GatewayTurnLifecycleStore {
   putTurnLifecycle(turn: TurnLifecycle): void;
+  getTurnLifecycle(turnId: string): TurnLifecycle | undefined;
   interruptActiveTurns(interruptedAt: number): number;
   listTurnLifecycles(address: ConversationAddress, limit?: number): TurnLifecycle[];
 }
@@ -224,11 +249,16 @@ function isJsonValue(value: unknown): value is JsonValue {
   return (prototype === Object.prototype || prototype === null) && Object.values(value).every(isJsonValue);
 }
 
-function encodeJson(value: JsonValue, context: string): string {
+function encodeJson(value: unknown, context: string): string {
   if (!isJsonValue(value)) throw new Error(`${context} must be a JSON value`);
   const encoded = JSON.stringify(value);
   if (typeof encoded !== "string") throw new Error(`${context} must be a JSON value`);
   return encoded;
+}
+
+function encodeValidatedJson(value: unknown, validate: (value: unknown) => void, context: string): string {
+  validate(value);
+  return encodeJson(value, context);
 }
 
 function decodeJson(raw: unknown, context: string): JsonValue {
@@ -433,6 +463,70 @@ function validateInboundMessage(value: unknown): asserts value is InboundMessage
   if (value.sourceReceipt !== undefined) validateReceipt(value.sourceReceipt, "inbound message sourceReceipt");
   if (value.edited !== undefined && typeof value.edited !== "boolean") {
     throw new Error("inbound message edited must be boolean");
+  }
+  if (value.execution !== undefined) validateTaskExecutionContext(value.execution);
+}
+
+function validateTaskExecutionContext(value: unknown): asserts value is TaskExecutionContext {
+  if (!isRecord(value)) throw new Error("task execution context must be an object");
+  requiredText(value.projectId, "task execution project id");
+  requiredText(value.projectName, "task execution project name");
+  requiredText(value.workspace, "task execution workspace");
+  requiredText(value.workerId, "task execution worker id");
+  if (!isRecord(value.policy)) throw new Error("task execution policy must be an object");
+  const maxDurationMs = value.policy.maxDurationMs;
+  const expiresAt = value.expiresAt;
+  if (
+    typeof value.policy.write !== "boolean" ||
+    typeof value.policy.commands !== "boolean" ||
+    typeof value.policy.network !== "boolean" ||
+    typeof maxDurationMs !== "number" ||
+    !Number.isSafeInteger(maxDurationMs) ||
+    maxDurationMs < 1
+  ) {
+    throw new Error("task execution policy is invalid");
+  }
+  if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || expiresAt < 0) {
+    throw new Error("task execution expiry must be a safe nonnegative integer");
+  }
+}
+
+function validateTaskEvidence(value: unknown): asserts value is TaskEvidence {
+  if (!isRecord(value)) throw new Error("task evidence must be an object");
+  requiredText(value.projectId, "task evidence project id");
+  requiredText(value.host, "task evidence host");
+  if (value.revision !== undefined) requiredText(value.revision, "task evidence revision");
+  if (!Array.isArray(value.changedFiles) || !value.changedFiles.every((file) => typeof file === "string")) {
+    throw new Error("task evidence changed files must be strings");
+  }
+  if (
+    !Array.isArray(value.checks) ||
+    !value.checks.every(
+      (check) =>
+        isRecord(check) &&
+        typeof check.command === "string" &&
+        Number.isSafeInteger(check.exitCode) &&
+        typeof check.output === "string",
+    )
+  ) {
+    throw new Error("task evidence checks are invalid");
+  }
+  if (
+    !Array.isArray(value.artifacts) ||
+    !value.artifacts.every(
+      (artifact) =>
+        isRecord(artifact) &&
+        typeof artifact.id === "string" &&
+        typeof artifact.name === "string" &&
+        typeof artifact.path === "string" &&
+        typeof artifact.size === "number" &&
+        Number.isSafeInteger(artifact.size) &&
+        artifact.size >= 0 &&
+        typeof artifact.sha256 === "string" &&
+        (artifact.mediaType === undefined || typeof artifact.mediaType === "string"),
+    )
+  ) {
+    throw new Error("task evidence artifacts are invalid");
   }
 }
 
@@ -711,6 +805,13 @@ function decodeScheduledJob(row: SqlRow): ScheduledJob {
   };
 }
 
+function optionalLifecycleJson(row: SqlRow, field: string, context: string): unknown | undefined {
+  const value = row[field];
+  if (value === null) return undefined;
+  if (typeof value !== "string") throw new Error(`corrupt ${context}: ${field} is not JSON text`);
+  return decodeJson(value, `${context} ${field}`);
+}
+
 function decodeTurnLifecycle(row: SqlRow): TurnLifecycle {
   const context = "turn lifecycle";
   const state = storedString(row, "state", context);
@@ -720,16 +821,37 @@ function decodeTurnLifecycle(row: SqlRow): TurnLifecycle {
   const thread = storedString(row, "thread", context);
   const currentTool = row.current_tool;
   const error = row.error;
+  const sessionFile = row.session_file;
+  const recoveryOf = row.recovery_of;
   if (currentTool !== null && typeof currentTool !== "string") {
     throw new Error("corrupt stored turn lifecycle: current_tool is not text");
   }
   if (error !== null && typeof error !== "string") {
     throw new Error("corrupt stored turn lifecycle: error is not text");
   }
+  if (sessionFile !== null && typeof sessionFile !== "string") {
+    throw new Error("corrupt stored turn lifecycle: session_file is not text");
+  }
+  if (recoveryOf !== null && typeof recoveryOf !== "string") {
+    throw new Error("corrupt stored turn lifecycle: recovery_of is not text");
+  }
+  const request = optionalLifecycleJson(row, "request_json", context);
+  const execution = optionalLifecycleJson(row, "execution_json", context);
+  const evidence = optionalLifecycleJson(row, "evidence_json", context);
+  if (request !== undefined) validateInboundMessage(request);
+  if (execution !== undefined) validateTaskExecutionContext(execution);
+  if (evidence !== undefined) validateTaskEvidence(evidence);
+  const principalId = storedString(row, "principal_id", context);
+  if (request !== undefined && request.principal.id !== principalId) {
+    throw new Error("corrupt stored turn lifecycle: request principal does not match turn principal");
+  }
+  if (request !== undefined && execution !== undefined && request.execution?.projectId !== execution.projectId) {
+    throw new Error("corrupt stored turn lifecycle: request execution does not match turn execution");
+  }
   const finishedAt = optionalStoredTimestamp(row, "finished_at", context);
   return {
     id: storedString(row, "id", context),
-    principalId: storedString(row, "principal_id", context),
+    principalId,
     address: {
       transport: storedString(row, "transport", context),
       account: storedString(row, "account", context),
@@ -743,13 +865,22 @@ function decodeTurnLifecycle(row: SqlRow): TurnLifecycle {
     ...(currentTool === null ? {} : { currentTool }),
     ...(finishedAt === undefined ? {} : { finishedAt }),
     ...(error === null ? {} : { error }),
+    ...(request === undefined ? {} : { request }),
+    ...(sessionFile === null ? {} : { sessionFile }),
+    ...(execution === undefined ? {} : { execution }),
+    ...(evidence === undefined ? {} : { evidence }),
+    ...(recoveryOf === null ? {} : { recoveryOf }),
   };
 }
 
 function decodeTurnTimelineEvent(row: SqlRow): TurnTimelineEvent {
   const context = "turn timeline event";
   const kind = storedString(row, "kind", context);
-  if (!["queued", "started", "tool_started", "tool_completed", "completed", "stopped", "failed", "interrupted"].includes(kind)) {
+  if (
+    !["queued", "started", "tool_started", "tool_completed", "completed", "stopped", "failed", "interrupted"].includes(
+      kind,
+    )
+  ) {
     throw new Error("corrupt turn timeline event: invalid kind");
   }
   return {
@@ -889,6 +1020,24 @@ function validateTurnLifecycle(turn: TurnLifecycle): void {
   }
   if (turn.currentTool !== undefined) requiredText(turn.currentTool, "turn lifecycle current tool");
   if (turn.error !== undefined) requiredText(turn.error, "turn lifecycle error");
+  if (turn.request !== undefined) {
+    validateInboundMessage(turn.request);
+    if (turn.request.principal.id !== turn.principalId) {
+      throw new Error("turn lifecycle request principal must match lifecycle principal");
+    }
+  }
+  if (turn.sessionFile !== undefined) requiredText(turn.sessionFile, "turn lifecycle session file");
+  if (turn.execution !== undefined) {
+    validateTaskExecutionContext(turn.execution);
+    if (
+      turn.request?.execution?.projectId !== undefined &&
+      turn.request.execution.projectId !== turn.execution.projectId
+    ) {
+      throw new Error("turn lifecycle request execution must match lifecycle execution");
+    }
+  }
+  if (turn.evidence !== undefined) validateTaskEvidence(turn.evidence);
+  if (turn.recoveryOf !== undefined) requiredText(turn.recoveryOf, "turn lifecycle recovery origin");
 }
 
 function validateTurnTimelineEvent(event: TurnTimelineEvent): void {
@@ -947,6 +1096,11 @@ const TURN_LIFECYCLE_FIELDS = [
   "updated_at",
   "finished_at",
   "error",
+  "request_json",
+  "session_file",
+  "execution_json",
+  "evidence_json",
+  "recovery_of",
 ].join(", ");
 
 const TURN_OUTCOME_FIELDS = [
@@ -1279,7 +1433,12 @@ export class GatewayStore implements GatewaySemanticViewStore {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         finished_at INTEGER,
-        error TEXT
+        error TEXT,
+        request_json TEXT,
+        session_file TEXT,
+        execution_json TEXT,
+        evidence_json TEXT,
+        recovery_of TEXT
       );
 
       CREATE INDEX IF NOT EXISTS turn_lifecycles_address_created
@@ -1357,6 +1516,19 @@ export class GatewayStore implements GatewaySemanticViewStore {
         completed_at INTEGER NOT NULL
       );
     `);
+    const lifecycleColumns = this.#database.query("PRAGMA table_info(turn_lifecycles)").all() as SqlRow[];
+    const lifecycleMigrations = [
+      ["request_json", "TEXT"],
+      ["session_file", "TEXT"],
+      ["execution_json", "TEXT"],
+      ["evidence_json", "TEXT"],
+      ["recovery_of", "TEXT"],
+    ] as const;
+    for (const [column, definition] of lifecycleMigrations) {
+      if (!lifecycleColumns.some((row) => row.name === column)) {
+        this.#database.exec(`ALTER TABLE turn_lifecycles ADD COLUMN ${column} ${definition}`);
+      }
+    }
     const pendingInboundColumns = this.#database.query("PRAGMA table_info(pending_inbound_messages)").all() as SqlRow[];
     if (!pendingInboundColumns.some((row) => row.name === "scheduled")) {
       this.#database.exec(
@@ -1707,9 +1879,7 @@ export class GatewayStore implements GatewaySemanticViewStore {
 
   getPrincipal(id: string): Principal | undefined {
     requiredText(id, "principal id");
-    const row = this.#database
-      .query("SELECT id, roles_json FROM principals WHERE id = ?")
-      .get(id) as SqlRow | null;
+    const row = this.#database.query("SELECT id, roles_json FROM principals WHERE id = ?").get(id) as SqlRow | null;
     return row === null ? undefined : decodePrincipal(row);
   }
 
@@ -1872,7 +2042,8 @@ export class GatewayStore implements GatewaySemanticViewStore {
 
   listRecentCommandUsage(principalId: string, limit = 20): readonly string[] {
     requiredText(principalId, "command usage principal id");
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw new Error("command usage limit must be between 1 and 20");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20)
+      throw new Error("command usage limit must be between 1 and 20");
     return (
       this.#database
         .query(
@@ -1945,15 +2116,52 @@ export class GatewayStore implements GatewaySemanticViewStore {
              (transport, account, message_id, payload_json, received_at, scheduled)
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(
-          transport,
-          account,
-          message.id,
-          encodeJson(message as unknown as JsonValue, "inbound message"),
-          receivedAt,
-          scheduled ? 1 : 0,
-        );
+        .run(transport, account, message.id, encodeJson(message, "inbound message"), receivedAt, scheduled ? 1 : 0);
       return true;
+    });
+  }
+
+  /**
+   * Claims a durable inbound message and consumes the exact one-shot checkpoint
+   * in one SQLite transaction. A changed scope cannot be attached to this message.
+   */
+  claimInboundMessageConsumingCheckpoint(
+    message: InboundMessage,
+    receivedAt: number,
+    checkpoint: InboundCheckpointClaim,
+    scheduled = false,
+  ): InboundCheckpointClaimResult {
+    validateInboundMessage(message);
+    if (!Number.isSafeInteger(receivedAt)) {
+      throw new Error("inbound message receivedAt must be an integer timestamp");
+    }
+    requiredText(checkpoint.adapter, "inbound checkpoint adapter");
+    requiredText(checkpoint.key, "inbound checkpoint key");
+    const { transport, account } = message.address;
+    return this.#transaction(() => {
+      const current = this.getCheckpoint(checkpoint.adapter, checkpoint.key);
+      if (current === undefined || JSON.stringify(current) !== JSON.stringify(checkpoint.expectedValue)) {
+        return "checkpoint_changed";
+      }
+      const result = this.#database
+        .query(
+          `INSERT INTO inbound_messages (transport, account, message_id, received_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(transport, account, message_id) DO NOTHING`,
+        )
+        .run(transport, account, message.id, receivedAt);
+      if (result.changes === 0) return "duplicate";
+      this.#database
+        .query(
+          `INSERT INTO pending_inbound_messages
+             (transport, account, message_id, payload_json, received_at, scheduled)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(transport, account, message.id, encodeJson(message, "inbound message"), receivedAt, scheduled ? 1 : 0);
+      this.#database
+        .query("DELETE FROM adapter_checkpoints WHERE adapter = ? AND checkpoint_key = ?")
+        .run(checkpoint.adapter, checkpoint.key);
+      return "claimed";
     });
   }
 
@@ -2050,7 +2258,7 @@ export class GatewayStore implements GatewaySemanticViewStore {
         return composition ?? this.#readIngressComposition(compositionId);
       }
 
-      const payload = encodeJson(message as unknown as JsonValue, "ingress fragment");
+      const payload = encodeJson(message, "ingress fragment");
       if (existingFragment === null) {
         this.#database
           .query(
@@ -2279,8 +2487,9 @@ export class GatewayStore implements GatewaySemanticViewStore {
       .query(
         `INSERT INTO turn_lifecycles (
            id, principal_id, transport, account, channel, thread, prompt, state,
-           current_tool, created_at, updated_at, finished_at, error
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           current_tool, created_at, updated_at, finished_at, error, request_json,
+           session_file, execution_json, evidence_json, recovery_of
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            principal_id = excluded.principal_id,
            transport = excluded.transport,
@@ -2292,7 +2501,12 @@ export class GatewayStore implements GatewaySemanticViewStore {
            current_tool = excluded.current_tool,
            updated_at = excluded.updated_at,
            finished_at = excluded.finished_at,
-           error = excluded.error`,
+           error = excluded.error,
+           request_json = excluded.request_json,
+           session_file = excluded.session_file,
+           execution_json = excluded.execution_json,
+           evidence_json = excluded.evidence_json,
+           recovery_of = excluded.recovery_of`,
       )
       .run(
         turn.id,
@@ -2308,7 +2522,26 @@ export class GatewayStore implements GatewaySemanticViewStore {
         turn.updatedAt,
         turn.finishedAt ?? null,
         turn.error ?? null,
+        turn.request === undefined
+          ? null
+          : encodeValidatedJson(turn.request, validateInboundMessage, "turn lifecycle request"),
+        turn.sessionFile ?? null,
+        turn.execution === undefined
+          ? null
+          : encodeValidatedJson(turn.execution, validateTaskExecutionContext, "turn lifecycle execution"),
+        turn.evidence === undefined
+          ? null
+          : encodeValidatedJson(turn.evidence, validateTaskEvidence, "turn lifecycle evidence"),
+        turn.recoveryOf ?? null,
       );
+  }
+
+  getTurnLifecycle(turnId: string): TurnLifecycle | undefined {
+    requiredText(turnId, "turn lifecycle id");
+    const row = this.#database
+      .query(`SELECT ${TURN_LIFECYCLE_FIELDS} FROM turn_lifecycles WHERE id = ?`)
+      .get(turnId) as SqlRow | null;
+    return row === null ? undefined : decodeTurnLifecycle(row);
   }
 
   interruptActiveTurns(interruptedAt: number): number {

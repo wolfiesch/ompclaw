@@ -147,6 +147,19 @@ class MemoryStore implements GatewayApplicationStore {
     return true;
   }
 
+  claimInboundMessageConsumingCheckpoint(
+    message: InboundMessage,
+    receivedAt: number,
+    checkpoint: { readonly adapter: string; readonly key: string; readonly expectedValue: JsonValue },
+    scheduled = false,
+  ) {
+    const checkpointKey = `${checkpoint.adapter}/${checkpoint.key}`;
+    if (this.checkpoint.get(checkpointKey) !== checkpoint.expectedValue) return "checkpoint_changed" as const;
+    if (!this.claimInboundMessage(message, receivedAt, scheduled)) return "duplicate" as const;
+    this.checkpoint.delete(checkpointKey);
+    return "claimed" as const;
+  }
+
   completeInboundMessage(transport: string, account: string, messageId: string) {
     return this.pending.delete(`${transport}/${account}/${messageId}`);
   }
@@ -1428,5 +1441,86 @@ describe("GatewayApplication", () => {
     } finally {
       store.close();
     }
+  });
+
+  test("serializes scoped project quick work through the main runtime with immutable context", async () => {
+    const store = new MemoryStore();
+    const events: string[] = [];
+    const core = coreHarness(events);
+    const selected: string[] = [];
+    const handled: InboundMessage[] = [];
+    const quickLane: GatewayQuickLaneRuntime = {
+      routeFor(message) {
+        return message.content.text?.startsWith("/quick ")
+          ? { kind: "query", prompt: message.content.text.slice(7), consumesArm: false }
+          : undefined;
+      },
+      async handle() {
+        throw new Error("scoped quick request escaped to the quick lane");
+      },
+      async stop() {},
+      isArmed() {
+        return false;
+      },
+    };
+    const config = {
+      ...gatewayConfig(),
+      projects: [
+        {
+          id: "alpha",
+          name: "Alpha",
+          workspace: "/workspace/alpha",
+          workerId: "local",
+          principals: ["operator"],
+          policy: { write: false, commands: false, network: false, maxDurationMs: 60_000 },
+        },
+      ],
+      workers: [],
+    } satisfies GatewayConfig;
+    const app = new GatewayApplication({
+      config,
+      secrets: {
+        telegramToken: "telegram",
+        webSocketCredentials: [{ token: "web", subject: "web-user", channel: "web-user" }],
+      },
+      seams: {
+        ingressComposer: FAST_INGRESS,
+        createStore: () => store,
+        createCore: core.create,
+        createQuickLane: () => quickLane,
+        createRuntime: (options) => ({
+          async start() {
+            options.onSessionState?.({ isStreaming: false, sessionFile: "/sessions/scoped.jsonl" });
+          },
+          async stop() {},
+          async handleInbound(message) {
+            handled.push(message);
+          },
+          async selectProject(context) {
+            if (context === undefined) throw new Error("missing scoped context");
+            selected.push(context.projectId);
+            options.onSessionState?.({ isStreaming: false, sessionFile: `/sessions/${context.projectId}.jsonl` });
+          },
+        }),
+        createTelegramAdapter: () => adapter("telegram"),
+        createWebSocketAdapter: () => adapter("websocket"),
+        acquireLock: () => ({ ok: true }),
+        releaseLock: () => {},
+        startLockHeartbeat: () => () => {},
+      },
+    });
+    await app.start();
+    await core.options().onInbound({ ...inbound("project"), content: { text: "/project alpha" } });
+    await waitFor(() => store.pending.size === 0);
+    await core.options().onInbound({ ...inbound("scope"), content: { text: "/scope read 1" } });
+    await waitFor(() => store.pending.size === 0);
+    await core.options().onInbound({ ...inbound("quick"), content: { text: "/quick inspect this" } });
+    await waitFor(() => handled.length === 1);
+    expect(selected).toEqual(["alpha"]);
+    expect(handled[0]).toMatchObject({
+      content: { text: "inspect this" },
+      execution: { projectId: "alpha", workspace: "/workspace/alpha" },
+    });
+    await app.stop();
   });
 });

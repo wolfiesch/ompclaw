@@ -1,9 +1,28 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripGatewaySecretsFromChildEnv } from "./gateway-config";
-import { AUTONOMY_MODES, buildOmpChildEnv, buildOmpRpcArgv, loadLiteralEnvFile, parseAutonomyMode, type RpcRuntimeConfig } from "./rpc-config";
+import {
+  AUTONOMY_MODES,
+  buildOmpChildEnv,
+  buildOmpRpcArgv,
+  loadLiteralEnvFile,
+  parseAutonomyMode,
+  type RpcRuntimeConfig,
+} from "./rpc-config";
 import { prepareInheritedHarness, prepareLearningOverlay } from "./rpc-profile";
 
 const directories: string[] = [];
@@ -78,16 +97,53 @@ describe("RPC configuration", () => {
     ]);
   });
 
+  test("starts scoped projects with no native or discovered OMP tools", () => {
+    expect(
+      buildOmpRpcArgv(
+        runtimeConfig({
+          configFiles: ["/operator/mcp.json"],
+          ompArgs: ["--tools", "bash"],
+          execution: {
+            projectId: "scoped",
+            projectName: "Scoped",
+            workspace: "/workspace",
+            workerId: "local",
+            policy: { write: false, commands: false, network: false, maxDurationMs: 60_000 },
+            expiresAt: Date.now() + 60_000,
+          },
+        }),
+      ),
+    ).toEqual([
+      "omp",
+      "--mode",
+      "rpc-ui",
+      "--cwd",
+      "/workspace",
+      "--profile",
+      "gateway",
+      "--no-title",
+      "--no-tools",
+      "--no-extensions",
+      "--no-skills",
+      "--no-rules",
+      "--no-lsp",
+    ]);
+  });
+
   for (const [autonomyMode, approvalMode] of [
     ["autopilot", "yolo"],
     ["balanced", "write"],
     ["review", "always-ask"],
   ] as const) {
     test(`adds the ${approvalMode} approval mode before raw arguments`, () => {
-      expect(buildOmpRpcArgv(runtimeConfig({
-        autonomyMode,
-        ompArgs: ["--color", "never"],
-      }))).toEqual([
+      expect(
+        buildOmpRpcArgv(
+          runtimeConfig({
+            autonomyMode,
+            ompArgs: ["--color", "never"],
+          }),
+        ),
+      ).toEqual([
         "omp",
         "--mode",
         "rpc-ui",
@@ -107,16 +163,21 @@ describe("RPC configuration", () => {
   test("rejects raw approval mode arguments alongside explicit autonomy", () => {
     for (const autonomyMode of ["autopilot", "balanced", "review"] as const) {
       for (const ompArgs of [["--approval-mode", "write"], ["--approval-mode=write"]]) {
-        expect(() => buildOmpRpcArgv(runtimeConfig({ autonomyMode, ompArgs })))
-          .toThrow("Explicit autonomyMode conflicts with --approval-mode in ompArgs");
+        expect(() => buildOmpRpcArgv(runtimeConfig({ autonomyMode, ompArgs }))).toThrow(
+          "Explicit autonomyMode conflicts with --approval-mode in ompArgs",
+        );
       }
     }
   });
 
   test("rejects unknown runtime autonomy modes", () => {
-    expect(() => buildOmpRpcArgv(runtimeConfig({
-      autonomyMode: "unknown" as unknown as RpcRuntimeConfig["autonomyMode"],
-    }))).toThrow("Unsupported autonomy mode: unknown. Supported values: inherit, autopilot, balanced, review");
+    expect(() =>
+      buildOmpRpcArgv(
+        runtimeConfig({
+          autonomyMode: "unknown" as unknown as RpcRuntimeConfig["autonomyMode"],
+        }),
+      ),
+    ).toThrow("Unsupported autonomy mode: unknown. Supported values: inherit, autopilot, balanced, review");
   });
   test("parses valid autonomy modes and rejects unknown strings", () => {
     expect(AUTONOMY_MODES).toEqual(["autopilot", "balanced", "review", "inherit"]);
@@ -129,9 +190,13 @@ describe("RPC configuration", () => {
   });
 
   test("keeps raw approval mode arguments under inherited autonomy", () => {
-    expect(buildOmpRpcArgv(runtimeConfig({
-      ompArgs: ["--approval-mode", "write"],
-    }))).toEqual([
+    expect(
+      buildOmpRpcArgv(
+        runtimeConfig({
+          ompArgs: ["--approval-mode", "write"],
+        }),
+      ),
+    ).toEqual([
       "omp",
       "--mode",
       "rpc-ui",
@@ -218,10 +283,12 @@ describe("RPC configuration", () => {
   test("materializes experimental learning in OmpClaw-owned state only when enabled", () => {
     const directory = mkdtempSync(join(tmpdir(), "ompclaw-learning-"));
     directories.push(directory);
-    expect(prepareLearningOverlay({
-      stateDir: directory,
-      learning: { enabled: false, autoCapture: false, minToolCalls: 5, memoryModel: "online" },
-    })).toBeUndefined();
+    expect(
+      prepareLearningOverlay({
+        stateDir: directory,
+        learning: { enabled: false, autoCapture: false, minToolCalls: 5, memoryModel: "online" },
+      }),
+    ).toBeUndefined();
 
     const path = prepareLearningOverlay({
       stateDir: directory,
@@ -255,7 +322,10 @@ describe("RPC configuration", () => {
     mkdirSync(join(source, "skills", "shared-skill", "logs"));
     writeFileSync(join(source, "skills", "shared-skill", "logs", "runtime.log"), "ignored");
     mkdirSync(join(source, "skills", "shared-skill", "data", "browser_profile_old"), { recursive: true });
-    writeFileSync(join(source, "skills", "shared-skill", "data", "browser_profile_old", "RunningChromeVersion"), "volatile");
+    writeFileSync(
+      join(source, "skills", "shared-skill", "data", "browser_profile_old", "RunningChromeVersion"),
+      "volatile",
+    );
     mkdirSync(join(source, "skills", "shared-skill", "data", "browser_profile_cft146"));
     writeFileSync(join(source, "skills", "shared-skill", "data", "browser_profile_cft146", "Cookies"), "volatile");
     writeFileSync(join(source, "skills", "shared-skill", "data", "fixture.json"), "{}");

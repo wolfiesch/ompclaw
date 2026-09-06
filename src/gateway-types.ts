@@ -1,3 +1,4 @@
+import type { TaskExecutionContext } from "./execution-types";
 import type { SemanticView } from "./gateway-views";
 
 export interface TransportIdentity {
@@ -82,6 +83,8 @@ export interface InboundEnvelope {
 
 export interface InboundMessage extends InboundEnvelope {
   readonly principal: Principal;
+  /** Coordinator-derived project scope; transports cannot select an execution policy. */
+  readonly execution?: TaskExecutionContext;
 }
 
 export type OutboundNotification = "default" | "silent";

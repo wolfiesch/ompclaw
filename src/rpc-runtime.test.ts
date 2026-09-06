@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,13 +14,15 @@ import type {
   UiResponseFor,
 } from "./gateway-types";
 import type { GatewayDelivery } from "./gateway-tools";
-import type {
-  GatewayPrincipalStore,
-  GatewayTurnLifecycleStore,
-  GatewayTurnOutcomeStore,
-  TurnLifecycle,
-  TurnOutcome,
+import {
+  GatewayStore,
+  type GatewayPrincipalStore,
+  type GatewayTurnLifecycleStore,
+  type GatewayTurnOutcomeStore,
+  type TurnLifecycle,
+  type TurnOutcome,
 } from "./gateway-store";
+import type { ProjectExecutor, TaskExecutionContext } from "./execution-types";
 import type { GatewayUpdateControl } from "./gateway-update";
 import type { OmpRpcClientOptions, RpcClient, RpcCommandInput, RpcFrameListener } from "./rpc-client";
 import type { RpcRuntimeConfig } from "./rpc-config";
@@ -40,6 +43,8 @@ class FakeOmpRpcClient implements RpcClient {
   failNextGetState = false;
   failNextPrompt = false;
   promptAgentInvoked = true;
+  dumpToolsOverride: unknown | undefined;
+  #registeredTools: unknown;
   state: RpcSessionState = {
     isStreaming: false,
     isCompacting: false,
@@ -84,7 +89,12 @@ class FakeOmpRpcClient implements RpcClient {
         this.failNextGetState = false;
         throw new Error("state refresh failed");
       }
-      return this.#response(command, this.state);
+      return this.#response(command, {
+        ...this.state,
+        ...(this.dumpToolsOverride !== undefined
+          ? { dumpTools: this.dumpToolsOverride }
+          : { dumpTools: this.#registeredTools }),
+      });
     }
     if (command.type === "get_available_commands")
       return this.#response(command, { commands: [{ name: "custom", description: "Custom command" }] });
@@ -94,6 +104,10 @@ class FakeOmpRpcClient implements RpcClient {
     if (command.type === "new_session") {
       this.state = { ...this.state, sessionId: "new-session", sessionFile: "/sessions/new.jsonl" };
       return this.#response(command, { cancelled: false });
+    }
+    if (command.type === "set_host_tools") {
+      this.#registeredTools = command.tools;
+      return this.#response(command, {});
     }
     if (command.type === "prompt") {
       if (this.failNextPrompt) {
@@ -110,6 +124,9 @@ class FakeOmpRpcClient implements RpcClient {
   }
 
   emit(frame: RpcRecord): void {
+    if (frame.type === "agent_start") this.state = { ...this.state, isStreaming: true };
+    else if (frame.type === "agent_end" || frame.type === "prompt_result")
+      this.state = { ...this.state, isStreaming: false };
     this.#frameListener?.(frame);
   }
 
@@ -310,6 +327,7 @@ describe("RpcGatewayRuntime", () => {
           .filter((turn) => JSON.stringify(turn.address) === JSON.stringify(address))
           .sort((left, right) => right.createdAt - left.createdAt)
           .slice(0, limit),
+      getTurnLifecycle: (id) => turns.get(id),
       getPrincipal: (id): Principal | undefined => ({ id, roles: ["owner"] }),
       putTurnOutcome: (outcome) => outcomes.set(outcome.turnId, outcome),
       getTurnOutcome: (id) => outcomes.get(id),
@@ -487,6 +505,7 @@ describe("RpcGatewayRuntime", () => {
       putTurnLifecycle: () => {},
       interruptActiveTurns: () => 0,
       listTurnLifecycles: () => [],
+      getTurnLifecycle: () => undefined,
       getPrincipal: (id) => (id === "principal-recover" ? { id, roles: ["owner"] } : undefined),
       putTurnOutcome: (next) => {
         outcome = next;
@@ -516,6 +535,7 @@ describe("RpcGatewayRuntime", () => {
       putTurnLifecycle: (turn) => turns.set(turn.id, turn),
       interruptActiveTurns: () => 0,
       listTurnLifecycles: () => [],
+      getTurnLifecycle: (id) => turns.get(id),
       getPrincipal: (id) => ({ id, roles: ["owner"] }),
       putTurnOutcome: (outcome) => outcomes.set(outcome.turnId, outcome),
       getTurnOutcome: (id) => outcomes.get(id),
@@ -566,6 +586,7 @@ describe("RpcGatewayRuntime", () => {
       principalId: "principal-continuation",
       address: { transport: "test", account: "account", channel: "continuation" },
       prompt: "Prepare the release",
+      request: message("continuation", "Prepare the release"),
       state: "completed",
       createdAt: 1,
       updatedAt: 2,
@@ -574,8 +595,8 @@ describe("RpcGatewayRuntime", () => {
     const turnStore: GatewayTurnLifecycleStore & GatewayTurnOutcomeStore = {
       putTurnLifecycle: () => {},
       interruptActiveTurns: () => 0,
-      listTurnLifecycles: (address) =>
-        JSON.stringify(address) === JSON.stringify(prior.address) ? [prior] : [],
+      listTurnLifecycles: (address) => (JSON.stringify(address) === JSON.stringify(prior.address) ? [prior] : []),
+      getTurnLifecycle: (id) => (id === prior.id ? prior : undefined),
       putTurnOutcome: () => {},
       getTurnOutcome: (id) =>
         id === prior.id
@@ -595,15 +616,21 @@ describe("RpcGatewayRuntime", () => {
     await runtime.start();
     const rpc = FakeOmpRpcClient.instances[0]!;
     await runtime.handleInbound(message("continuation", "/task_continue prior-task Add deployment notes"));
-    expect(JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content.text).toBe(
-      "Continue this prior task. Original request:\nPrepare the release\n\nNew instruction:\nAdd deployment notes",
+    expect(
+      JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content
+        .text,
+    ).toBe(
+      "Continue this prior task. Full original request:\nPrepare the release\n\nNew instruction:\nAdd deployment notes",
     );
     rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }] });
     await runtime.waitUntilIdle();
 
     await runtime.handleInbound(message("continuation", "/task_revise prior-task Include a rollback plan"));
-    expect(JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content.text).toBe(
-      "Revise this prior task. Original request:\nPrepare the release\n\nPrevious result:\nRelease prepared\n\nNew instruction:\nInclude a rollback plan",
+    expect(
+      JSON.parse(String(rpc.sent.findLast((command) => command.type === "prompt")?.message).split("\n\n")[0]!).content
+        .text,
+    ).toBe(
+      "Revise this prior task. Full original request:\nPrepare the release\n\nPrevious result:\nRelease prepared\n\nNew instruction:\nInclude a rollback plan",
     );
     rpc.emit({ type: "agent_end", isTerminal: true, messages: [{ role: "assistant", content: [{ type: "text", text: "Revised" }] }] });
     await runtime.waitUntilIdle();
@@ -628,6 +655,7 @@ describe("RpcGatewayRuntime", () => {
       interruptActiveTurns: () => 0,
       listTurnLifecycles: (address) =>
         [...turns.values()].filter((turn) => JSON.stringify(turn.address) === JSON.stringify(address)),
+      getTurnLifecycle: (id) => turns.get(id),
     };
     const runtime = createRuntime({ config, delivery: delivery(), turnStore });
     await runtime.start();
@@ -654,10 +682,10 @@ describe("RpcGatewayRuntime", () => {
       "That task is no longer available.",
     );
     await runtime.handleInbound(message("retry", "/task_retry retryable"));
-    expect(rpc.sent).toContainEqual({
-      type: "prompt",
-      message: expect.stringContaining("Resume this unfinished task. Original request:\\nFinish the deployment"),
-    });
+    expect(textFromContent(deliveries.findLast((call) => call.method === "send")?.content)).toBe(
+      "This legacy task has no complete request envelope, so retrying it would be unsafe.",
+    );
+    expect(rpc.sent.some((command) => command.type === "prompt")).toBe(false);
     await runtime.stop();
   });
 
@@ -1670,6 +1698,8 @@ describe("RpcGatewayRuntime", () => {
       "new",
       "tasks",
       "result",
+      "projects",
+      "project",
       "help",
     ]);
     expect(runtimeCommandMenu().map(({ command }) => command)).not.toContain("shell");
@@ -1917,5 +1947,463 @@ describe("RpcGatewayRuntime", () => {
       view: { title: "Session status", summary: expect.stringMatching(/^OmpClaw v/) },
     });
     await runtime.stop();
+  });
+
+  test("fails closed to the six scoped host tools and rejects shell, direct runtime, and expired task requests", async () => {
+    const execution: TaskExecutionContext = {
+      projectId: "project-a",
+      projectName: "Project A",
+      workspace: "/work/project-a",
+      workerId: "local",
+      policy: { write: true, commands: true, network: false, maxDurationMs: 10_000 },
+      expiresAt: 1_000,
+    };
+    const executor: ProjectExecutor = { execute: async () => ({ text: "unused" }) };
+    let now = 100;
+    const runtime = createRuntime({
+      config: { ...config, execution, allowRpcBash: true },
+      delivery: delivery(),
+      executor,
+      now: () => now,
+    });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    const registration = rpc.sent.find((command) => command.type === "set_host_tools");
+    if (registration === undefined) throw new Error("expected scoped host tool registration");
+    expect((registration.tools as readonly { readonly name: string }[]).map(({ name }) => name)).toEqual([
+      "fs_list",
+      "fs_read",
+      "fs_write",
+      "cmd_run",
+      "fs_diff",
+      "artifact_store",
+    ]);
+
+    const scopedCommand = { ...message("scoped-controls", "/shell echo forbidden"), execution };
+    await runtime.handleInbound(scopedCommand);
+    await runtime.handleInbound({ ...message("scoped-controls", "! enable bash"), execution });
+    now = 1_000;
+    await runtime.handleInbound({
+      ...message("scoped-controls", "Use an expired grant"),
+      execution,
+    });
+
+    expect(rpc.sent.some((command) => command.type === "bash" || command.type === "prompt")).toBe(false);
+    expect(deliveries.map((call) => textFromContent(call.content))).toEqual(
+      expect.arrayContaining([
+        "That runtime control is unavailable for scoped project tasks.",
+        "Direct runtime commands are unavailable for scoped project tasks. Use the project execution tools.",
+        "Project Project A execution grant has expired.",
+      ]),
+    );
+    await runtime.stop();
+  });
+
+  test("refuses a scoped runtime whose OMP inventory contains an unregistered tool", async () => {
+    const execution: TaskExecutionContext = {
+      projectId: "project-a",
+      projectName: "Project A",
+      workspace: "/work/project-a",
+      workerId: "local",
+      policy: { write: false, commands: false, network: false, maxDurationMs: 10_000 },
+      expiresAt: 1_000,
+    };
+    const runtime = new RpcGatewayRuntime({
+      config: { ...config, execution },
+      delivery: delivery(),
+      executor: { execute: async () => ({ text: "unused" }) },
+      now: () => 100,
+      createRpcClient: (options) => {
+        const rpc = new FakeOmpRpcClient(options);
+        rpc.dumpToolsOverride = [{ name: "bash" }];
+        return rpc;
+      },
+    });
+
+    await expect(runtime.start()).rejects.toThrow(
+      "Scoped project mode detected an unapproved native or extension tool",
+    );
+    await runtime.stop();
+  });
+
+  test("uses the complete persisted request only after explicit scoped restart recovery", async () => {
+    const execution: TaskExecutionContext = {
+      projectId: "project-a",
+      projectName: "Project A",
+      workspace: "/work/project-a",
+      workerId: "local",
+      policy: { write: true, commands: true, network: false, maxDurationMs: 10_000 },
+      expiresAt: 1_000,
+    };
+    const originalText = `First instruction\n${"r".repeat(280)}\nFinal instruction`;
+    const original = {
+      ...message("recovery", originalText, [
+        { url: "https://files.example.test/requirements.pdf", name: "requirements.pdf", mediaType: "application/pdf" },
+      ]),
+      replyContext: {
+        messageId: "reply-9",
+        author: "operator",
+        quote: "Keep this context.",
+        targetKind: "user" as const,
+      },
+    };
+    const previous: TurnLifecycle = {
+      id: "recovery-task",
+      principalId: original.principal.id,
+      address: original.address,
+      prompt: originalText.slice(0, 240),
+      request: original,
+      sessionFile: "/sessions/project-a.jsonl",
+      execution,
+      state: "interrupted",
+      currentTool: "cmd_run",
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+    };
+    const turns = new Map<string, TurnLifecycle>([[previous.id, previous]]);
+    const turnStore: GatewayTurnLifecycleStore = {
+      putTurnLifecycle: (turn) => turns.set(turn.id, turn),
+      getTurnLifecycle: (id) => turns.get(id),
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: (address) =>
+        [...turns.values()].filter((turn) => JSON.stringify(turn.address) === JSON.stringify(address)),
+    };
+    const runtime = createRuntime({
+      config: { ...config, execution },
+      delivery: delivery(),
+      turnStore,
+      executor: { execute: async () => ({ text: "unused" }) },
+      resolveExecution: (stored, principal, address) =>
+        stored.projectId === execution.projectId &&
+        principal.id === original.principal.id &&
+        JSON.stringify(address) === JSON.stringify(original.address)
+          ? execution
+          : undefined,
+      now: () => 100,
+    });
+    await runtime.start();
+    expect(FakeOmpRpcClient.instances[0]!.sent.some((command) => command.type === "prompt")).toBe(false);
+    await runtime.handleInbound({ ...message("recovery", "/task_recover recovery-task inspect"), execution });
+    expect(textFromContent(deliveries.findLast((call) => call.method === "send")?.content)).toContain(
+      "State: interrupted",
+    );
+    await runtime.handleInbound({ ...message("recovery", "/task_recover recovery-task continue"), execution });
+    const continuationRpc = FakeOmpRpcClient.instances.at(-1)!;
+    const continuationPrompt = continuationRpc.sent.findLast((command) => command.type === "prompt");
+    expect(JSON.parse(String(continuationPrompt?.message).split("\n\n")[0]!).content.text).toContain(
+      `Continue this prior task. Full original request:\n${originalText}`,
+    );
+    continuationRpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Continuation complete" }] }],
+    });
+    await runtime.waitUntilIdle();
+    await runtime.handleInbound({ ...message("recovery", "/task_recover recovery-task restart"), execution });
+
+    const restartedRpc = FakeOmpRpcClient.instances.at(-1)!;
+    const prompt = restartedRpc.sent.findLast((command) => command.type === "prompt");
+    const envelope = JSON.parse(String(prompt?.message).split("\n\n")[0]!);
+    expect(envelope.content).toEqual({
+      text: originalText,
+      attachments: [
+        { url: "https://files.example.test/requirements.pdf", name: "requirements.pdf", mediaType: "application/pdf" },
+      ],
+      replyContext: { messageId: "reply-9", author: "operator", quote: "Keep this context.", targetKind: "user" },
+    });
+    await runtime.stop();
+  });
+
+  test("downloads only an owner's evidence artifact after verifying its exact receipt", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-artifact-runtime-"));
+    const bytes = Buffer.from("verified artifact");
+    const artifact = {
+      id: "artifact-1",
+      name: "receipt.txt",
+      path: "receipts/receipt.txt",
+      size: bytes.byteLength,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    const execution: TaskExecutionContext = {
+      projectId: "project-a",
+      projectName: "Project A",
+      workspace: "/work/project-a",
+      workerId: "local",
+      policy: { write: false, commands: false, network: false, maxDurationMs: 10_000 },
+      expiresAt: 1_000,
+    };
+    const owner = message("artifact", "owner");
+    const task: TurnLifecycle = {
+      id: "artifact-task",
+      principalId: owner.principal.id,
+      address: owner.address,
+      prompt: "Collect artifact",
+      state: "completed",
+      createdAt: 1,
+      updatedAt: 2,
+      finishedAt: 2,
+      execution,
+      evidence: {
+        projectId: execution.projectId,
+        host: execution.workerId,
+        changedFiles: [],
+        checks: [],
+        artifacts: [artifact],
+      },
+    };
+    const executions: unknown[] = [];
+    const executor: ProjectExecutor = {
+      execute: async (request) => {
+        executions.push(request);
+        return { text: "downloaded", artifact, artifactBase64: bytes.toString("base64") };
+      },
+    };
+    const turnStore: GatewayTurnLifecycleStore = {
+      putTurnLifecycle: () => {},
+      getTurnLifecycle: (id) => (id === task.id ? task : undefined),
+      interruptActiveTurns: () => 0,
+      listTurnLifecycles: (address) => (JSON.stringify(address) === JSON.stringify(task.address) ? [task] : []),
+    };
+    const runtime = createRuntime({
+      config: { ...config, stateDir, execution },
+      delivery: delivery(),
+      turnStore,
+      executor,
+      resolveExecution: (stored, principal) => (principal.id === owner.principal.id ? stored : undefined),
+      now: () => 100,
+    });
+    try {
+      await runtime.start();
+      const other = {
+        ...message("artifact", "/task_artifact artifact-task artifact-1"),
+        principal: { id: "another-principal", roles: ["owner"] },
+        execution,
+      };
+      await runtime.handleInbound(other);
+      expect(executions).toEqual([]);
+      expect(textFromContent(deliveries.findLast((call) => call.method === "send")?.content)).toBe(
+        "That artifact is no longer available for this task.",
+      );
+
+      await runtime.handleInbound({ ...message("artifact", "/task_artifact artifact-task artifact-1"), execution });
+      expect(executions).toEqual([
+        expect.objectContaining({
+          context: execution,
+          operation: { kind: "artifact", path: artifact.path },
+          approved: true,
+        }),
+      ]);
+      expect(deliveries.findLast((call) => call.method === "send")?.content).toMatchObject({
+        attachments: [expect.objectContaining({ name: "receipt.txt" })],
+      });
+    } finally {
+      await runtime.stop();
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test("cancels a delayed scoped command approval when its RPC process exits", async () => {
+    const execution: TaskExecutionContext = {
+      projectId: "project-a",
+      projectName: "Project A",
+      workspace: "/remote/workspace",
+      workerId: "remote-worker",
+      policy: { write: false, commands: true, network: false, maxDurationMs: 10_000 },
+      expiresAt: 1_000,
+    };
+    const approval = Promise.withResolvers<{ readonly type: "confirm"; readonly confirmed: boolean }>();
+    let approvalSignal: AbortSignal | undefined;
+    present = async <Request extends UiRequest>(
+      request: Request,
+      signal?: AbortSignal,
+    ): Promise<UiResponseFor<Request>> => {
+      if (request.type === "confirm") {
+        approvalSignal = signal;
+        return approval.promise as UiResponseFor<Request>;
+      }
+      return defaultUiResponse(request);
+    };
+    const executions: unknown[] = [];
+    const runtime = createRuntime({
+      config: { ...config, execution },
+      delivery: delivery(),
+      executor: {
+        execute: async (request) => {
+          executions.push(request);
+          return { text: "should not execute" };
+        },
+      },
+      now: () => 100,
+    });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    await runtime.handleInbound({ ...message("approval-exit", "Run command"), execution });
+    rpc.emit({
+      type: "host_tool_call",
+      id: "cmd-exit",
+      toolCallId: "tool-exit",
+      toolName: "cmd_run",
+      arguments: { command: "echo should-not-run", writable: false, network: false },
+    });
+    await waitFor(() => approvalSignal !== undefined);
+    rpc.exit(new Error("fake RPC exit"));
+    await waitFor(() => approvalSignal?.aborted === true);
+    approval.resolve({ type: "confirm", confirmed: true });
+    await settle();
+
+    expect(approvalSignal?.aborted).toBe(true);
+    expect(executions).toEqual([]);
+    await runtime.stop();
+  });
+
+  test("cancels a delayed scoped command approval after the task reaches a terminal event", async () => {
+    const execution: TaskExecutionContext = {
+      projectId: "project-a",
+      projectName: "Project A",
+      workspace: "/remote/workspace",
+      workerId: "remote-worker",
+      policy: { write: false, commands: true, network: false, maxDurationMs: 10_000 },
+      expiresAt: 1_000,
+    };
+    const approval = Promise.withResolvers<{ readonly type: "confirm"; readonly confirmed: boolean }>();
+    let approvalSignal: AbortSignal | undefined;
+    present = async <Request extends UiRequest>(
+      request: Request,
+      signal?: AbortSignal,
+    ): Promise<UiResponseFor<Request>> => {
+      if (request.type === "confirm") {
+        approvalSignal = signal;
+        return approval.promise as UiResponseFor<Request>;
+      }
+      return defaultUiResponse(request);
+    };
+    const executions: unknown[] = [];
+    const runtime = createRuntime({
+      config: { ...config, execution },
+      delivery: delivery(),
+      executor: {
+        execute: async (request) => {
+          executions.push(request);
+          return { text: "should not execute" };
+        },
+      },
+      now: () => 100,
+    });
+    await runtime.start();
+    const rpc = FakeOmpRpcClient.instances[0]!;
+    await runtime.handleInbound({ ...message("approval-terminal", "Run command"), execution });
+    rpc.emit({
+      type: "host_tool_call",
+      id: "cmd-terminal",
+      toolCallId: "tool-terminal",
+      toolName: "cmd_run",
+      arguments: { command: "echo should-not-run", writable: false, network: false },
+    });
+    await waitFor(() => approvalSignal !== undefined);
+    rpc.emit({
+      type: "agent_end",
+      isTerminal: true,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "Task completed" }] }],
+    });
+    await waitFor(() => approvalSignal?.aborted === true);
+    approval.resolve({ type: "confirm", confirmed: true });
+    await settle();
+
+    expect(approvalSignal?.aborted).toBe(true);
+    expect(executions).toEqual([]);
+    await runtime.stop();
+  });
+
+  test("starts remote project sessions from private local state while preserving the remote executor workspace", async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), "ompclaw-remote-session-"));
+    const execution: TaskExecutionContext = {
+      projectId: "remote-project",
+      projectName: "Remote Project",
+      workspace: "/definitely/not/a/local/workspace",
+      workerId: "remote-worker",
+      policy: { write: false, commands: false, network: false, maxDurationMs: 10_000 },
+      expiresAt: 1_000,
+    };
+    const runtime = createRuntime({
+      config: { ...config, stateDir, execution },
+      delivery: delivery(),
+      executor: { execute: async () => ({ text: "unused" }) },
+      now: () => 100,
+    });
+    try {
+      await runtime.selectProject(execution);
+      await runtime.start();
+      expect(FakeOmpRpcClient.instances[0]!.options.cwd).toBe(join(stateDir, "project-sessions", "remote-project"));
+    } finally {
+      await runtime.stop();
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test("persists a scoped fs_write receipt without optional evidence fields through real SQLite", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ompclaw-evidence-runtime-"));
+    const databasePath = join(directory, "gateway.sqlite");
+    const store = new GatewayStore(databasePath);
+    const execution: TaskExecutionContext = {
+      projectId: "project-a",
+      projectName: "Project A",
+      workspace: "/workspace/project-a",
+      workerId: "local",
+      policy: { write: true, commands: false, network: false, maxDurationMs: 10_000 },
+      expiresAt: 1_000,
+    };
+    const inbound = { ...message("evidence-write", "Write receipt"), execution };
+    store.upsertPrincipal(inbound.principal);
+    const executorCalls: unknown[] = [];
+    const runtime = createRuntime({
+      config: { ...config, execution },
+      delivery: delivery(),
+      turnStore: store,
+      executor: {
+        execute: async (request) => {
+          executorCalls.push(request);
+          return { text: "Wrote src/receipt.txt", changedFiles: ["src/receipt.txt"] };
+        },
+      },
+      now: () => 100,
+    });
+    try {
+      await runtime.start();
+      const rpc = FakeOmpRpcClient.instances[0]!;
+      await runtime.handleInbound(inbound);
+      rpc.emit({
+        type: "host_tool_call",
+        id: "write-receipt",
+        toolCallId: "write-receipt-call",
+        toolName: "fs_write",
+        arguments: { path: "src/receipt.txt", content: "receipt" },
+      });
+      await waitFor(() =>
+        rpc.writes.some((frame) => frame.type === "host_tool_result" && frame.id === "write-receipt"),
+      );
+
+      expect(executorCalls).toEqual([
+        expect.objectContaining({
+          context: execution,
+          operation: { kind: "write", path: "src/receipt.txt", content: "receipt" },
+          approved: true,
+        }),
+      ]);
+      expect(store.getTurnLifecycle(inbound.id)).toMatchObject({
+        evidence: {
+          projectId: "project-a",
+          host: "local",
+          changedFiles: ["src/receipt.txt"],
+          checks: [],
+          artifacts: [],
+        },
+      });
+      expect(store.getTurnLifecycle(inbound.id)?.evidence).not.toHaveProperty("revision");
+    } finally {
+      await runtime.stop();
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

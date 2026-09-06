@@ -6,6 +6,7 @@ import {
   doctor,
   executeGatewayCommand,
   loadGatewayCliConfig,
+  main,
   pairingApprove,
   pairingClear,
   pairingList,
@@ -82,6 +83,43 @@ describe("gateway CLI environment loading", () => {
       "Environment file does not define required gateway credential OMPCLAW_WS_TOKEN",
     );
     expect(env).toEqual({ OMPCLAW_WS_TOKEN: "ambient-secret" });
+  });
+});
+
+describe("execution worker CLI", () => {
+  test("passes only the private allowlist to the worker without gateway initialization", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-worker-cli-"));
+    directories.push(directory);
+    const path = join(directory, "worker.json");
+    writeFileSync(path, JSON.stringify({ projects: [] }), { mode: 0o600 });
+    const received: string[] = [];
+    await main(["worker", "--config", path], {
+      runExecutionWorker: async (configPath) => {
+        received.push(configPath);
+      },
+      createStore: () => {
+        throw new Error("Worker must not open coordinator state");
+      },
+      createApplication: () => {
+        throw new Error("Worker must not start transports");
+      },
+    });
+    expect(received).toEqual([path]);
+  });
+
+  test("rejects missing allowlist and transport credential loading", async () => {
+    await expect(executeGatewayCommand(parseGatewayCliArgs(["worker"]), undefined)).rejects.toThrow(
+      "requires --config",
+    );
+    await expect(
+      executeGatewayCommand(
+        parseGatewayCliArgs(["worker", "--config", "/fixture/worker.json", "--env-file", "/fixture/credentials"]),
+        undefined,
+      ),
+    ).rejects.toThrow("does not accept --env-file");
+    await expect(
+      executeGatewayCommand(parseGatewayCliArgs(["worker", "extra", "--config", "/fixture/worker.json"]), undefined),
+    ).rejects.toThrow("positional");
   });
 });
 

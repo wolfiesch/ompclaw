@@ -33,7 +33,11 @@ lines.on("line", (line) => {
 
 describe("OmpRpcClient", () => {
   test("negotiates protocol v2 and reassembles chunked responses", async () => {
-    const client = new OmpRpcClient({ argv: [process.execPath, "-e", mockRpcScript()], cwd: process.cwd(), env: process.env });
+    const client = new OmpRpcClient({
+      argv: [process.execPath, "-e", mockRpcScript()],
+      cwd: process.cwd(),
+      env: process.env,
+    });
     clients.push(client);
     client.onFrame(() => new Promise<void>(() => {}));
     await client.start();
@@ -42,15 +46,33 @@ describe("OmpRpcClient", () => {
     expect(response.data).toMatchObject({ sessionId: "mock-session", isStreaming: false });
   });
 
+  test("rejects an unversioned readiness frame with an upgrade instruction", async () => {
+    const client = new OmpRpcClient({
+      argv: [process.execPath, "-e", 'console.log(JSON.stringify({type:"ready"})); process.stdin.resume();'],
+      cwd: process.cwd(),
+      env: process.env,
+      readyTimeoutMs: 1_000,
+    });
+    clients.push(client);
+    await expect(client.start()).rejects.toThrow("Install OMP 17.4.2 or newer");
+    expect(client.running).toBe(false);
+  });
+
   test("returns typed command errors", async () => {
-    const client = new OmpRpcClient({ argv: [process.execPath, "-e", mockRpcScript()], cwd: process.cwd(), env: process.env });
+    const client = new OmpRpcClient({
+      argv: [process.execPath, "-e", mockRpcScript()],
+      cwd: process.cwd(),
+      env: process.env,
+    });
     clients.push(client);
     await client.start();
-    await expect(client.send({ type: "fail" })).rejects.toEqual(expect.objectContaining<RpcCommandError>({
-      name: "RpcCommandError",
-      message: "expected failure",
-      command: "fail",
-      code: "TEST",
-    }));
+    await expect(client.send({ type: "fail" })).rejects.toEqual(
+      expect.objectContaining<RpcCommandError>({
+        name: "RpcCommandError",
+        message: "expected failure",
+        command: "fail",
+        code: "TEST",
+      }),
+    );
   });
 });

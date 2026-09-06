@@ -8,7 +8,7 @@
 
 Use it when you want to work with an OMP workspace from Telegram or a local authenticated WebSocket client without giving either transport direct access to OMP. Telegram and WebSocket are authenticated adapters around the same serialized runtime. HTTP is health-only.
 
-- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.12.0`
+- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.13.0`
 - **Repository:** [`wolfiesch/ompclaw`](https://github.com/wolfiesch/ompclaw)
 - **License:** [MIT](LICENSE)
 
@@ -16,8 +16,9 @@ Use it when you want to work with an OMP workspace from Telegram or a local auth
 
 ### Prerequisites
 
-- [Bun](https://bun.sh/)
-- `omp` 17.0.0 or newer, authenticated for the provider you intend to use
+- [Bun](https://bun.sh/) 1.3.14 or newer
+- `omp` 17.4.2 or newer, authenticated for the provider you intend to use
+- Scoped project operations support macOS and Linux workers. Shell commands additionally require a Linux worker with Bubblewrap and unprivileged user namespaces; see the [operator guide](docs/guide.md#scoped-projects-and-execution-workers).
 - A Telegram bot token if Telegram is enabled
 
 Install the package:
@@ -166,14 +167,15 @@ The command reports `Installed and started <manager> service: <path>`. It instal
 
 ## What the gateway provides
 
-- **One durable main session, plus an explicit quick-answer lane.** The primary OMP child remains the only persistent session owner. `/quick <question>` lazily starts an isolated second child for concise, unrelated questions. Quick requests are FIFO and never steer or modify the main task. While a task is working, its Telegram card can arm one plain-text quick question with **Quick ask**.
+- **One durable main session, plus an explicit quick-answer lane.** The primary OMP child remains the only persistent session owner. In unscoped mode, `/quick <question>` lazily starts an isolated second child for concise, unrelated questions. Quick requests are FIFO and never steer or modify the main task. Scoped projects route quick requests through their constrained main runtime instead.
 - **A durable Telegram Home control surface.** Home presents `Ready` with the current session, model, reasoning, and Fast controls. During work it changes to `Working`, shows the active task and current step, and offers Open task, Quick ask, and Stop. Context details, auto-compaction, queue size, and session identifiers live under More.
 - **Decision and picker cards that settle in place.** OMP prompts appear as correlated Telegram controls for confirmations, choices, text input, and editors. Model selection is provider-first and paginated. Old cards visibly show their approved, denied, expired, or replaced state instead of lingering as active controls.
 - **Searchable commands and skills.** `/commands` offers ranked command and skill results with durable recent choices, paginated picker cards, and private or group-scoped native menus. Telegram inline mode provides the same discovery flow after enabling inline queries for the bot in BotFather.
-- **Actionable task outcomes.** Telegram task cards show active work and final outcomes. The task timeline records task, tool, terminal, and restart-interruption events, while failure cards explain the problem in plain language and offer retry, bounded details, history, and fresh-start controls.
+- **Evidence-backed task outcomes and explicit recovery.** Result cards show recorded file changes, command exit statuses, source revision, and downloadable artifacts. Full requests and attachment references survive interruption; inspect, continue, and confirmed restart controls avoid automatically replaying work that may already have acted.
 - **Reply-aware, native Telegram delivery.** Deep replies retain quoted text, external-origin metadata, and useful descriptions for captionless media. Outgoing attachments use Telegram's native audio, voice note, video, animation, photo, document, and supported media-album methods when their media type is identifiable.
 - **Humanized schedules and agent-authored watches.** The Schedules surface renders common cron rules and next runs in local language, supports pause, resume, run now, edit, and confirmed deletion, and retains durable retry state. With automation enabled, OMP can author conversation-bound `ompclaw_watch` jobs for recurring check-and-notify work. See [Ask your agent to watch things](docs/guide.md#ask-your-agent-to-watch-things).
 - **Authenticated transport boundaries and durable state.** Telegram identities and WebSocket credentials resolve to server-side principals before work enters the session. SQLite persists bindings, inbound deduplication, controls, task outcomes, scheduled jobs, and session checkpoints. Telegram topic sessions can keep separate transcripts while the gateway still serializes access.
+- **Project-bound sessions and scoped workers.** `/projects` selects an authorized workspace and execution host. One-shot `/scope` grants narrow the next task, commands require approval, and filesystem/network boundaries fail closed. Local and SSH workers share typed execution operations behind one coordinator. See [Scoped projects and execution workers](docs/guide.md#scoped-projects-and-execution-workers).
 - **Transactional self-update.** An opt-in update flow stages one exact commit from a fixed trusted checkout, verifies an isolated build, completes the active Telegram response, and switches through an external supervisor. Failed startup automatically rolls back and records the outcome for later delivery. Read [Transactional self-update](docs/guide.md#transactional-self-update) before enabling it.
 
 Read the [operator guide](docs/guide.md) for configuration, migration, operations, and security boundaries. Read the [RPC and transport reference](docs/rpc-service.md) for the command and protocol matrix.

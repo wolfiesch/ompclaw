@@ -3,11 +3,20 @@ import { formatFriendlyNextRun, formatHumanSchedule } from "./gateway-scheduler"
 import type { AutonomyMode } from "./rpc-config";
 import type { RpcSessionState } from "./rpc-protocol";
 import type { ScheduledJob, TurnLifecycle, TurnTimelineEvent } from "./gateway-store";
-import type { SemanticView, SemanticViewState } from "./gateway-views";
+import type { ExecutionArtifact, ExecutionCheck, TaskEvidence, TaskExecutionContext } from "./execution-types";
+import type { SemanticView, SemanticViewAction, SemanticViewSection, SemanticViewState } from "./gateway-views";
 
 const MAX_SUMMARY_CHARS = 512;
 const MAX_ACTIVITY_ITEMS = 4;
 const MAX_FAILURE_DETAIL_CHARS = 480;
+const MAX_EVIDENCE_FILES = 6;
+const MAX_EVIDENCE_CHECKS = 3;
+const MAX_EVIDENCE_ARTIFACTS = 3;
+const MAX_EVIDENCE_LINE_CHARS = 96;
+const MAX_RECEIPT_COMMAND_CHARS = 64;
+const MAX_IDENTITY_CHARS = 80;
+const MAX_ARTIFACT_NAME_CHARS = 48;
+const MAX_ARTIFACT_LABEL_CHARS = 24;
 
 export interface TaskSemanticActivity {
   readonly text: string;
@@ -37,6 +46,8 @@ export interface HomeSemanticViewInput {
   readonly autonomyLabel: string;
   readonly activeTask?: HomeActiveTask;
   readonly quickAskArmed?: boolean;
+  readonly execution?: TaskExecutionContext;
+  readonly evidence?: TaskEvidence;
   readonly version: number;
   readonly updatedAt: number;
 }
@@ -66,9 +77,94 @@ function failureSummary(error: string | undefined): string {
   if (/abort|interrupt|restart/.test(detail)) return "The OMP session was interrupted.";
   if (/timed? out|timeout/.test(detail)) return "The task took longer than expected.";
   if (/network|connection|socket|econn|enotfound/.test(detail)) return "The connection to OMP was interrupted.";
-  if (/permission|forbidden|not.authorized|unauthor/.test(detail)) return "OmpClaw did not have permission to finish this task.";
+  if (/permission|forbidden|not.authorized|unauthor/.test(detail))
+    return "OmpClaw did not have permission to finish this task.";
   if (/unavailable|provider/.test(detail)) return "The OMP service was unavailable.";
   return "This task could not finish.";
+}
+
+function boundedLine(value: string, max = MAX_EVIDENCE_LINE_CHARS): string {
+  const normalized = value.trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, max - 1).trimEnd()}…`;
+}
+
+function projectIdentity(execution: TaskExecutionContext, evidence?: TaskEvidence): string {
+  const target = evidence?.host !== undefined ? `host ${evidence.host}` : `worker ${execution.workerId}`;
+  return boundedLine(`${execution.projectName} (${execution.projectId}) · ${target}`, MAX_IDENTITY_CHARS);
+}
+
+function humanSize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function changedFilesText(files: readonly string[]): string | undefined {
+  if (files.length === 0) return undefined;
+  const lines = files.slice(0, MAX_EVIDENCE_FILES).map((file) => `• ${boundedLine(file)}`);
+  const remaining = files.length - lines.length;
+  if (remaining > 0) lines.push(`+${remaining} more file${remaining === 1 ? "" : "s"}`);
+  return lines.join("\n");
+}
+
+function commandReceiptsText(checks: readonly ExecutionCheck[]): string | undefined {
+  if (checks.length === 0) return undefined;
+  const lines = checks
+    .slice(-MAX_EVIDENCE_CHECKS)
+    .map(
+      (check) =>
+        `${check.exitCode === 0 ? "✓" : "⚠"} ${boundedLine(check.command, MAX_RECEIPT_COMMAND_CHARS)} · exit ${check.exitCode}`,
+    );
+  const omitted = checks.length - lines.length;
+  if (omitted > 0) lines.unshift(`+${omitted} earlier command${omitted === 1 ? "" : "s"}`);
+  return lines.join("\n");
+}
+
+function artifactsText(artifacts: readonly ExecutionArtifact[]): string {
+  const lines = artifacts
+    .slice(0, MAX_EVIDENCE_ARTIFACTS)
+    .map((artifact) => `• ${boundedLine(artifact.name, MAX_ARTIFACT_NAME_CHARS)} · ${humanSize(artifact.size)}`);
+  const remaining = artifacts.length - lines.length;
+  if (remaining > 0) lines.push(`+${remaining} more artifact${remaining === 1 ? "" : "s"}`);
+  return lines.join("\n");
+}
+
+function evidenceSections(evidence: TaskEvidence): readonly SemanticViewSection[] {
+  const sections: SemanticViewSection[] = [];
+  const changeLines = [
+    evidence.revision === undefined
+      ? undefined
+      : `Revision ${boundedLine(evidence.revision, MAX_RECEIPT_COMMAND_CHARS)}`,
+    changedFilesText(evidence.changedFiles),
+  ].filter((line): line is string => line !== undefined);
+  if (changeLines.length > 0) {
+    sections.push({ id: "changes", label: "Changes", text: changeLines.join("\n"), tone: "default" });
+  }
+  const receipts = commandReceiptsText(evidence.checks);
+  if (receipts !== undefined) {
+    sections.push({ id: "checks", label: "Command receipts", text: receipts, tone: "default" });
+  }
+  if (evidence.artifacts.length > 0) {
+    sections.push({ id: "artifacts", label: "Artifacts", text: artifactsText(evidence.artifacts), tone: "default" });
+  }
+  return sections;
+}
+
+function evidenceTerminalActions(taskId: string, evidence: TaskEvidence): readonly SemanticViewAction[] {
+  const actions: SemanticViewAction[] = [];
+  if (evidence.changedFiles.length > 0 || evidence.revision !== undefined) {
+    actions.push({ id: "diff", label: "🪶 View diff", command: `/task_diff ${taskId}` });
+  }
+  evidence.artifacts.slice(0, MAX_EVIDENCE_ARTIFACTS).forEach((artifact, index) => {
+    actions.push({
+      id: `artifact${index}`,
+      label: `⬇️ ${boundedLine(artifact.name, MAX_ARTIFACT_LABEL_CHARS)}`,
+      command: `/task_artifact ${taskId} ${artifact.id}`,
+    });
+  });
+  return actions;
 }
 
 function taskState(state: TurnLifecycle["state"]): SemanticViewState {
@@ -103,6 +199,7 @@ export function taskSemanticView(
   todoPhases: readonly TaskSemanticTodoPhase[] = [],
   heartbeat = false,
   detailsExpanded = false,
+  now: number = Date.now(),
 ): SemanticView {
   const terminal =
     lifecycle.state === "completed" ||
@@ -137,9 +234,23 @@ export function taskSemanticView(
   const collapsedSuccess = lifecycle.state === "completed";
   const failure = lifecycle.state === "failed" || lifecycle.error !== undefined;
   const detail = failureDetail(lifecycle.error);
+  const scoped = lifecycle.execution !== undefined;
   const recoveryActions = failure
+    ? scoped
+      ? [
+          { id: "recover_inspect", label: "🔎 Inspect", command: `/task_recover ${lifecycle.id} inspect` },
+          { id: "recover_continue", label: "▶️ Continue", command: `/task_recover ${lifecycle.id} continue` },
+          {
+            id: "recover_restart",
+            label: "↻ Restart",
+            command: `/task_recover ${lifecycle.id} restart`,
+            style: "danger" as const,
+          },
+        ]
+      : [{ id: "retry", label: "↻ Retry", command: `/task_retry ${lifecycle.id}`, style: "primary" as const }]
+    : [];
+  const recoverySupport = failure
     ? [
-        { id: "retry", label: "↻ Retry", command: `/task_retry ${lifecycle.id}`, style: "primary" as const },
         {
           id: "details",
           label: detailsExpanded ? "Hide details" : "🔍 View details",
@@ -171,7 +282,44 @@ export function taskSemanticView(
         argument: lifecycle.id,
       },
     },
+    ...(lifecycle.evidence !== undefined ? evidenceTerminalActions(lifecycle.id, lifecycle.evidence) : []),
     ...recoveryActions,
+    ...recoverySupport,
+  ];
+  const identitySections: readonly SemanticViewSection[] =
+    lifecycle.execution === undefined
+      ? []
+      : [
+          {
+            id: "project",
+            label: "Project",
+            text: projectIdentity(lifecycle.execution, lifecycle.evidence),
+            tone: "default",
+          },
+        ];
+  const receiptSections: readonly SemanticViewSection[] =
+    lifecycle.evidence === undefined ? [] : evidenceSections(lifecycle.evidence);
+  const recoverySections: readonly SemanticViewSection[] = [
+    ...(lifecycle.recoveryOf === undefined
+      ? []
+      : [
+          {
+            id: "recovery",
+            label: "Recovery",
+            text: `Recovered from task ${boundedLine(lifecycle.recoveryOf, 48)}.`,
+            tone: "muted" as const,
+          },
+        ]),
+    ...(lifecycle.execution !== undefined && lifecycle.state !== "completed" && now > lifecycle.execution.expiresAt
+      ? [
+          {
+            id: "expired",
+            label: "Authorization",
+            text: "Project authorization expired — recovery needs a new grant.",
+            tone: "warning" as const,
+          },
+        ]
+      : []),
   ];
   return {
     schemaVersion: 1,
@@ -182,6 +330,7 @@ export function taskSemanticView(
     title: taskTitle(lifecycle, heartbeat),
     summary: boundedSummary(lifecycle.prompt),
     sections: [
+      ...identitySections,
       ...(collapsedSuccess
         ? [
             {
@@ -206,6 +355,8 @@ export function taskSemanticView(
                   },
                 ]),
           ]),
+      ...receiptSections,
+      ...recoverySections,
       ...(failure
         ? [{ id: "error", label: "What happened", text: failureSummary(lifecycle.error), tone: "danger" as const }]
         : []),
@@ -275,11 +426,18 @@ export function taskHistorySemanticView(
         : `${entries.length} recent task${entries.length === 1 ? "" : "s"}`,
     sections: visible.map((entry, index) => {
       const eventLines = entry.events.slice(-3).map((event) => `• ${event.text}`);
+      const execution = entry.lifecycle.execution;
+      const host = entry.lifecycle.evidence?.host;
       return {
         id: `task${index}`,
         label: `${taskHistoryState(entry.lifecycle.state)} · ${boundedSummary(entry.lifecycle.prompt).slice(0, 80)}`,
         text:
           [
+            execution === undefined
+              ? undefined
+              : `Project · ${boundedLine(execution.projectName, 48)}${
+                  host === undefined ? "" : ` · host ${boundedLine(host, 48)}`
+                }`,
             entry.lifecycle.currentTool ? `Current activity · ${entry.lifecycle.currentTool}` : undefined,
             ...eventLines,
             entry.lifecycle.error ? `Recovery · ${boundedSummary(entry.lifecycle.error)}` : undefined,
@@ -301,9 +459,12 @@ export function taskHistorySemanticView(
         entry.lifecycle.state === "stopped"
           ? [
               {
-                id: `retry${index}`,
-                label: `Retry · ${boundedSummary(entry.lifecycle.prompt).slice(0, 32)}`,
-                command: `/task_retry ${entry.lifecycle.id}`,
+                id: entry.lifecycle.execution === undefined ? `retry${index}` : `recover${index}`,
+                label: `${entry.lifecycle.execution === undefined ? "Retry" : "Recover"} · ${boundedSummary(entry.lifecycle.prompt).slice(0, 32)}`,
+                command:
+                  entry.lifecycle.execution === undefined
+                    ? `/task_retry ${entry.lifecycle.id}`
+                    : `/task_recover ${entry.lifecycle.id} inspect`,
                 style: "primary" as const,
               },
             ]
@@ -680,7 +841,19 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
       state: "active",
       title: `🟡 Working · ${elapsed}`,
       summary: title,
-      sections: input.activeTask?.currentStep ? [{ id: "step", text: input.activeTask.currentStep }] : [],
+      sections: [
+        ...(input.execution === undefined
+          ? []
+          : [
+              {
+                id: "project",
+                label: "Project",
+                text: projectIdentity(input.execution, input.evidence),
+                tone: "default" as const,
+              },
+            ]),
+        ...(input.activeTask?.currentStep ? [{ id: "step", text: input.activeTask.currentStep }] : []),
+      ],
       actions: [
         { id: "tasks", label: "📋 Open task", command: "/tasks" },
         {
@@ -706,6 +879,16 @@ export function homeSemanticView(input: HomeSemanticViewInput): SemanticView {
     title: "🟢 Ready",
     summary: session,
     sections: [
+      ...(input.execution === undefined
+        ? []
+        : [
+            {
+              id: "project",
+              label: "Project",
+              text: projectIdentity(input.execution, input.evidence),
+              tone: "default" as const,
+            },
+          ]),
       {
         id: "settings",
         text: `${modelName} · ${reasoning}\nPermissions: ${input.autonomyLabel}`,

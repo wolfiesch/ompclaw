@@ -19,6 +19,10 @@ describe("rpc-commands", () => {
     expect(parseSlashCommand("/help")).toEqual({ name: "help", args: "" });
     expect(parseSlashCommand("/model openai/gpt-4o")).toEqual({ name: "model", args: "openai/gpt-4o" });
     expect(parseSlashCommand("/thinking high")).toEqual({ name: "thinking", args: "high" });
+    expect(parseSlashCommand("/task_recover task-42 restart")).toEqual({
+      name: "task_recover",
+      args: "task-42 restart",
+    });
     expect(parseSlashCommand("not a command")).toBeUndefined();
     expect(parseSlashCommand(undefined)).toBeUndefined();
   });
@@ -37,6 +41,9 @@ describe("rpc-commands", () => {
     const help = runtimeHelp(false);
     expect(help).toContain("/home - Open the control center");
     expect(help).toContain("/model - List or select provider/model");
+    expect(help).toContain("/task_recover - Inspect, continue, or explicitly restart a task");
+    expect(help).toContain("/task_diff - View the authorized task project diff");
+    expect(help).toContain("/task_artifact - Download an authorized task artifact");
 
     const welcome = assistantWelcome();
     expect(welcome).toContain("Hi. I’m your OMP assistant.");
@@ -83,9 +90,9 @@ describe("rpc-commands", () => {
     expect(activityForFrame({ toolName: "browser", args: { url: "https://example.com/private/path" } })).toBe(
       "🌐 Browsing the web · example.com",
     );
-    expect(activityForFrame({ toolName: "bash", args: { i: "Running echo TOP_SECRET", command: "echo TOP_SECRET" } })).toBe(
-      "🖥️ Running a command",
-    );
+    expect(
+      activityForFrame({ toolName: "bash", args: { i: "Running echo TOP_SECRET", command: "echo TOP_SECRET" } }),
+    ).toBe("🖥️ Running a command");
     expect(activityForFrame({ toolName: "read" })).toBe("📖 Reviewing context");
   });
 
