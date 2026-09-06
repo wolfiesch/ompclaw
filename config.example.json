@@ -65,7 +65,6 @@
   },
   "updates": {
     "enabled": false,
-    "repository": "~/Projects/ompclaw",
     "healthTimeoutMs": 30000
   }
 }

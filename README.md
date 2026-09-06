@@ -8,7 +8,7 @@
 
 Use it when you want to work with an OMP workspace from Telegram or a local authenticated WebSocket client without giving either transport direct access to OMP. Telegram and WebSocket are authenticated adapters around the same serialized runtime. HTTP is health-only.
 
-- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.12.0`
+- **Package:** [`ompclaw`](https://www.npmjs.com/package/ompclaw) `0.13.0`
 - **Repository:** [`wolfiesch/ompclaw`](https://github.com/wolfiesch/ompclaw)
 - **License:** [MIT](LICENSE)
 
@@ -18,6 +18,7 @@ Use it when you want to work with an OMP workspace from Telegram or a local auth
 
 - [Bun](https://bun.sh/) 1.3.14 or newer
 - `omp` 17.4.2 or newer, authenticated for the provider you intend to use
+- Scoped project operations support macOS and Linux workers. Shell commands additionally require a Linux worker with Bubblewrap and unprivileged user namespaces; see the [operator guide](docs/guide.md#scoped-projects-and-execution-workers).
 - A Telegram bot token if Telegram is enabled
 
 Install the package:

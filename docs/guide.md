@@ -206,6 +206,8 @@ The JSON document never contains a token value. It names environment variables t
 | `automation` | object | optional durable unattended job runner |
 | `learning` | object | optional experimental gateway-scoped memory and managed-skill capture |
 | `updates` | object | optional transactional self-update from one fixed repository |
+| `projects` | array, `[]` | authorized scoped-project registry; when empty or omitted, the gateway retains legacy unscoped behavior |
+| `workers` | array, `[]` | coordinator-side SSH worker registry used by projects with a non-`local` `workerId` |
 
 ### `omp`
 
@@ -311,7 +313,7 @@ Self-update is off by default. Enable it only for a trusted local checkout:
 {
   "updates": {
     "enabled": true,
-    "repository": "~/Projects/ompclaw",
+    "repository": "/absolute/path/to/ompclaw-checkout",
     "healthTimeoutMs": 30000
   }
 }

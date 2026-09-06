@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.13.0 (2026-09-06)
+
 ### Added
 
 - Add authorized project selection with durable conversation bindings, isolated session checkpoints, preferred models, and one-shot task scopes.
