@@ -47,7 +47,13 @@ import {
   type TurnLifecycle,
   type TurnTimelineEvent,
 } from "./gateway-store";
-import type { ConversationAddress, InboundMessage, Principal, TransportAdapter, TransportIdentity } from "./gateway-types";
+import type {
+  ConversationAddress,
+  InboundMessage,
+  Principal,
+  TransportAdapter,
+  TransportIdentity,
+} from "./gateway-types";
 import { RpcGatewayRuntime, runtimeCommandMenu, type RpcGatewayRuntimeOptions } from "./rpc-runtime";
 import { createProjectExecutor } from "./execution-worker";
 import type { RpcSessionState } from "./rpc-protocol";
@@ -370,6 +376,9 @@ export class GatewayApplication {
           ) {
             throw new Error(`Interrupted inbound ${pending.message.id} disappeared during startup reconciliation`);
           }
+          console.warn(
+            `[ompclaw] dropped inbound ${pending.message.address.transport}/${pending.message.address.account}/${pending.message.id} interrupted by a previous run; it will not rerun automatically`,
+          );
           continue;
         }
         this.#schedulePendingInbound(pending.message, false);
@@ -619,7 +628,9 @@ export class GatewayApplication {
         if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {
           throw new Error(`Interrupted quick inbound message ${message.id} disappeared before completion`);
         }
-        console.warn(`[ompclaw quick] dropped interrupted quick request ${message.id} during gateway shutdown`);
+        console.warn(
+          `[ompclaw quick] dropped interrupted quick request ${message.id} during gateway shutdown; quick requests are not replayed`,
+        );
         return;
       }
       if (!store.completeInboundMessage(message.address.transport, message.address.account, message.id)) {

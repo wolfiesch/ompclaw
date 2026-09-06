@@ -44,10 +44,12 @@ describe("rpc-commands", () => {
     expect(help).toContain("/task_recover - Inspect, continue, or explicitly restart a task");
     expect(help).toContain("/task_diff - View the authorized task project diff");
     expect(help).toContain("/task_artifact - Download an authorized task artifact");
+    expect(help).toContain("/new - Start a fresh agent session in this chat");
 
     const welcome = assistantWelcome();
     expect(welcome).toContain("Hi. I’m your OMP assistant.");
     expect(welcome).toContain("/home - Open the control center");
+    expect(welcome).toContain("/new - Start a fresh agent session in this chat");
   });
 
   test("formats autonomy display text and parses modes", () => {

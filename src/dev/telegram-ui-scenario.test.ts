@@ -11,11 +11,14 @@ describe("Telegram UI scenario golden", () => {
           "",
           "Release planning",
           "",
+          "Workspace",
+          "Default workspace; no project task is selected.",
+          "",
           "GPT-5 · High reasoning",
           "Permissions: Balanced",
         ].join("\n"),
         buttons: [
-          ["✨ New chat", "🤖 Model"],
+          ["✨ New session", "🤖 Model"],
           ["🛡 Permissions", "🧠 Reasoning"],
           ["📋 Tasks", "🗓 Schedules"],
           ["⚡ Fast: Off", "⚙️ More"],
@@ -23,17 +26,8 @@ describe("Telegram UI scenario golden", () => {
       },
       {
         name: "home-busy",
-        text: [
-          "🟡 Working · 35s",
-          "",
-          "Prepare the release",
-          "",
-          "Running focused tests",
-        ].join("\n"),
-        buttons: [
-          ["📋 Open task", "⚡ Quick ask armed — send your question"],
-          ["🛑 Stop"],
-        ],
+        text: ["🟡 Working · 35s", "", "Prepare the release", "", "Running focused tests"].join("\n"),
+        buttons: [["📋 Open task", "⚡ Quick ask armed — send your question"], ["🛑 Stop"]],
       },
       {
         name: "more",
@@ -45,6 +39,9 @@ describe("Telegram UI scenario golden", () => {
           "Context",
           "25% context (32,000 / 128,000 tokens)",
           "",
+          "History",
+          "This chat keeps its Telegram history; /new starts a fresh agent session here.",
+          "",
           "Auto-compact",
           "Enabled",
           "",
@@ -54,10 +51,7 @@ describe("Telegram UI scenario golden", () => {
           "Session ID",
           "session-42",
         ].join("\n"),
-        buttons: [
-          ["🗜 Auto-compact: On"],
-          ["← Home"],
-        ],
+        buttons: [["🗜 Auto-compact: On"], ["← Home"]],
       },
       {
         name: "reasoning",
@@ -145,11 +139,7 @@ describe("Telegram UI scenario golden", () => {
           "⚠️ Next: Paused",
           "Last error: Gateway unavailable",
         ].join("\n"),
-        buttons: [
-          ["Morning brief", "Exotic sync"],
-          ["Create schedule"],
-          ["← Home"],
-        ],
+        buttons: [["Morning brief", "Exotic sync"], ["Create schedule"], ["← Home"]],
       },
       {
         name: "schedule-detail",
@@ -167,12 +157,7 @@ describe("Telegram UI scenario golden", () => {
           "Status",
           "Active · 4 succeeded, 0 failed",
         ].join("\n"),
-        buttons: [
-          ["Run now", "Pause"],
-          ["Edit"],
-          ["⚠️ Delete"],
-          ["← Back"],
-        ],
+        buttons: [["Run now", "Pause"], ["Edit"], ["⚠️ Delete"], ["← Back"]],
       },
       {
         name: "schedule-detail-exotic",
@@ -193,40 +178,23 @@ describe("Telegram UI scenario golden", () => {
           "Last error",
           "⚠️ Gateway unavailable",
         ].join("\n"),
-        buttons: [
-          ["Run now", "Resume"],
-          ["Edit"],
-          ["⚠️ Delete"],
-          ["← Back"],
-        ],
+        buttons: [["Run now", "Resume"], ["Edit"], ["⚠️ Delete"], ["← Back"]],
       },
       {
         name: "schedule-delete-confirm",
         text: [
           "Delete schedule?",
           "",
-          "Delete \"Morning brief\" permanently?",
+          'Delete "Morning brief" permanently?',
           "",
           "⚠️ This schedule will be permanently deleted.",
         ].join("\n"),
-        buttons: [
-          ["⚠️ Delete schedule"],
-          ["Cancel"],
-        ],
+        buttons: [["⚠️ Delete schedule"], ["Cancel"]],
       },
       {
         name: "schedule-delete-settled",
-        text: [
-          "Delete schedule?",
-          "",
-          "\"Morning brief\" has been deleted.",
-          "",
-          "✅ ✅ Deleted",
-        ].join("\n"),
-        buttons: [
-          ["🗓 Schedules"],
-          ["Back to Home"],
-        ],
+        text: ["Delete schedule?", "", '"Morning brief" has been deleted.', "", "✅ ✅ Deleted"].join("\n"),
+        buttons: [["🗓 Schedules"], ["Back to Home"]],
       },
       {
         name: "active-task",
@@ -244,10 +212,7 @@ describe("Telegram UI scenario golden", () => {
           "✓ Checking release gates",
           "→ Running focused tests",
         ].join("\n"),
-        buttons: [
-          ["✏️ Add instruction", "➕ Add follow-up"],
-          ["🛑 Stop"],
-        ],
+        buttons: [["✏️ Add instruction", "➕ Add follow-up"], ["🛑 Stop"]],
       },
       {
         name: "failed-task",
@@ -264,9 +229,9 @@ describe("Telegram UI scenario golden", () => {
         ].join("\n"),
         buttons: [
           ["📄 View result", "➕ Continue"],
-          ["✏️ Revise", "↻ Retry"],
+          ["✏️ Revise", "↻ Recover"],
           ["🔍 View details", "📋 Open task"],
-          ["✨ Start fresh"],
+          ["✨ New session"],
         ],
       },
       {
@@ -287,9 +252,9 @@ describe("Telegram UI scenario golden", () => {
         ].join("\n"),
         buttons: [
           ["📄 View result", "➕ Continue"],
-          ["✏️ Revise", "↻ Retry"],
+          ["✏️ Revise", "↻ Recover"],
           ["Hide details", "📋 Open task"],
-          ["✨ Start fresh"],
+          ["✨ New session"],
         ],
       },
       {
@@ -304,9 +269,13 @@ describe("Telegram UI scenario golden", () => {
       },
       {
         name: "decision-expired",
-        text: ["Approve deployment", "", "Deploy the selected build?", "", "⌛ Expired — the agent is still waiting"].join(
-          "\n",
-        ),
+        text: [
+          "Approve deployment",
+          "",
+          "Deploy the selected build?",
+          "",
+          "⌛ Expired — the agent is still waiting",
+        ].join("\n"),
         buttons: [],
       },
     ]);

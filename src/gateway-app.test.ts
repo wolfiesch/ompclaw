@@ -573,7 +573,7 @@ describe("GatewayApplication", () => {
           enabled: true,
           account: "bot",
           tokenEnv: "TELEGRAM_BOT_TOKEN",
-          topicSessions: { enabled: true, createFromRoot: true },
+          topicSessions: { enabled: true, createFromRoot: false },
         },
       },
     });

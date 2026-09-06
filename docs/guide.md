@@ -411,7 +411,20 @@ principal and binds the exact Telegram identity for the configured account. To
 use a custom principal ID, pass it after the code. Use `principal-add` and
 `identity-bind` for custom roles or non-Telegram identities.
 
-Existing forum topics get separate sessions when `topicSessions.enabled` is true. Non-topic Telegram chats and WebSocket credentials continue to share the gateway's root OMP session. Set `createFromRoot` to true to turn an authorized root message into a newly named topic and route that same turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Telegram requires the bot to be a supergroup administrator with permission to manage topics. Topic creation is idempotent across update retries.
+For user-created forum topics, enable session binding and leave automatic topic creation off:
+
+```json
+"topicSessions": {
+  "enabled": true,
+  "createFromRoot": false
+}
+```
+
+Create a topic in Telegram, then send its first message. OmpClaw binds an OMP session to that topic and resumes it on later messages. `/new` starts fresh agent context in the same topic; earlier Telegram messages remain visible. Creating or resetting a session does not create another Telegram topic.
+
+Topics separate conversation history. They do not select a project or establish filesystem and permission boundaries. Use `/project` to inspect or choose an authorized project when the gateway has a project registry. Without one, topic sessions use the gateway's configured workspace and runtime permissions. The main runtime processes one task at a time, so a request in another topic can wait for active work to finish.
+
+Non-topic Telegram chats and WebSocket credentials continue to share the gateway's root OMP session. With `createFromRoot` off, ordinary root messages stay there; the root is not a command-only lobby. To opt into automatic topic creation instead, set `createFromRoot` to true: each authorized non-command root message creates a newly named topic and routes that turn into it. Root commands remain in the root conversation. Unauthorized messages never create topics. Automatic topic creation requires the bot to be a supergroup administrator with permission to manage topics and is idempotent across update retries.
 
 The private-chat native Telegram command menu exposes the everyday controls: `/start`, `/home`, `/status`, `/stop`, `/new`, `/tasks`, `/jobs`, and `/help`; group chats receive a focused `/help`, `/status`, `/stop`, `/new`, and `/start` menu. `/commands` shows the full normalized gateway, OMP, and skill catalog; `/commands <query>` renders ranked, paginated command choices that submit the selected slash command through normal ingress. Inline search uses the same catalog for authorized users, promotes their recent choices, and inserts the selected slash command into the chat for ordinary command parsing. `/start` explains the assistant without invoking the model. `/home` is a single-message control center: its inline actions edit that same Telegram message while navigating status, model, reasoning, fast mode, auto-compaction, autonomy mode, tasks, and scheduled jobs. Decision prompts provide approve, reject, clarify, and pause-task controls; clarification is sent back as a correction instead of approving the pending action. Scheduled-job cards expose pause, resume, run-now, and delete actions. `/help` groups the complete supported OMP RPC command surface into Everyday, Session, Work, and Advanced sections.
 
