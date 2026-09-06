@@ -10,7 +10,7 @@ Use the [user quickstart](../README.md#user-quickstart) for package installation
 
 The following operating assumptions are intentional:
 
-- OMP is version 17.0.0 or newer and is already authenticated for the provider you intend to use.
+- Bun is version 1.3.14 or newer. OMP is version 17.4.2 or newer and is already authenticated for the provider you intend to use.
 - One process owns one gateway state directory and one active OMP RPC session at a time.
 - Every incoming transport identity must be bound to a local principal before it is admitted.
 - A token authorizes a WebSocket credential only after that credential's identity resolves to a principal.
@@ -46,6 +46,8 @@ Add projects to the gateway configuration, using principal IDs already bound to 
 
 `/projects` opens the authorized project picker; `/project example` selects directly. `/project` reports the selection. The project may also specify a preferred `model`. Every task records its project, worker, and expiring execution grant. Rebinding a conversation does not redirect already queued work: a stale binding is refused visibly. `/quick` in a scoped conversation uses the serialized scoped runtime instead of the unrestricted quick-answer child.
 
+Projects use a separate OMP profile named `<gateway-profile>-<project-id>`. Configure provider authentication and any custom models in that profile before starting work. For example, gateway profile `telegram` and project `example` use `~/.omp/profiles/telegram-example/agent/models.yml` for custom model definitions. A profile with no available model cannot complete the RPC handshake, even before a prompt is sent. The coordinator owns these model settings; SSH workers need neither OMP nor provider credentials.
+
 ### Task permissions
 
 Project policy is an upper bound. `/scope` reports the current and next-task scope. `/scope read`, `/scope work`, or `/scope network` narrows the next task only; an optional duration in minutes must fit the configured maximum. The one-shot scope is consumed atomically with durable task acceptance.
@@ -60,7 +62,7 @@ Scoped OMP sessions expose only the gateway's constrained filesystem, command, d
 
 Filesystem operations reject traversal, symlinks, and protected paths. Scoped commands require a Linux worker with Bubblewrap and working unprivileged user namespaces. They run with a minimal environment, a read-only workspace by default, private temporary storage, and PID-namespace containment for descendants. macOS workers retain file and artifact operations but refuse scoped commands: configure a Linux SSH worker for command execution. An unavailable or unusable sandbox fails visibly, without an unsandboxed fallback. Tasks expire within the configured maximum, which must be between one second and one hour.
 
-Typed file operations require Bun's FFI and embedded C compiler to be enabled; disabling them fails closed. Workers use descriptor-relative traversal and atomic writes. Use dedicated worker checkouts without outside writers or watchers during scoped commands. The executor serializes its own operations, but its protected-path mounts do not snapshot concurrent host changes. See the [threat model](../SECURITY.md#threat-model) for the named-path and host-trust boundaries.
+Typed file operations require Bun 1.3.14 or newer with FFI and its embedded C compiler enabled, a writable temporary directory, and system C headers. On Debian/Ubuntu, install `libc6-dev`; on macOS, install the Command Line Tools. This applies to both the npm package and compiled executable: the bundled C helper is compiled lazily on the worker. Missing prerequisites fail closed with a diagnostic. Workers use descriptor-relative traversal and atomic writes. Use dedicated worker checkouts without outside writers or watchers during scoped commands. The executor serializes its own operations, but its protected-path mounts do not snapshot concurrent host changes. See the [threat model](../SECURITY.md#threat-model) for the named-path and host-trust boundaries.
 
 ### Remote execution
 

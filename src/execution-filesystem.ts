@@ -124,6 +124,11 @@ function createNativeFilesystem(): NativeFilesystem {
       directoryRecords: (parentFd, output) =>
         library.symbols.omp_list_directory_records(parentFd, output, output.length),
     };
+  } catch (error) {
+    throw new Error(
+      `Native filesystem initialization failed. Use Bun 1.3.14 or newer with FFI and its embedded C compiler enabled, a writable temporary directory, and system C headers (libc6-dev on Debian/Ubuntu; Command Line Tools on macOS). ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

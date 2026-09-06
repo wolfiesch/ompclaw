@@ -14,6 +14,13 @@ All notable changes to this project will be documented in this file.
 
 - Route scoped quick requests through the constrained main runtime and refuse unbound work when a project registry is configured.
 - Require explicit recovery for interrupted requests that may already have performed work instead of automatically replaying them.
+- Require Bun 1.3.14 and OMP 17.4.2 or newer, and document project-profile model configuration and worker C-header prerequisites.
+
+### Fixed
+
+- Reject legacy unversioned OMP startup frames with an upgrade instruction instead of waiting for a readiness timeout.
+- Report actionable native filesystem initialization failures for packaged and compiled workers.
+
 ## 0.12.0 (2026-09-04)
 
 ### Added

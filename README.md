@@ -16,8 +16,8 @@ Use it when you want to work with an OMP workspace from Telegram or a local auth
 
 ### Prerequisites
 
-- [Bun](https://bun.sh/)
-- `omp` 17.0.0 or newer, authenticated for the provider you intend to use
+- [Bun](https://bun.sh/) 1.3.14 or newer
+- `omp` 17.4.2 or newer, authenticated for the provider you intend to use
 - A Telegram bot token if Telegram is enabled
 
 Install the package:

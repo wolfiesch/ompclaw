@@ -1,6 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
-import { RpcFrameDecoder, type RpcCommand, type RpcInboundFrame, type RpcResponse, isRpcReady, isRpcResponse } from "./rpc-protocol";
+import {
+  RpcFrameDecoder,
+  type RpcCommand,
+  type RpcInboundFrame,
+  type RpcResponse,
+  isRpcReady,
+  isRpcResponse,
+} from "./rpc-protocol";
 import { isRecord } from "./type-guards";
 
 export interface OmpRpcClientOptions {
@@ -50,7 +57,8 @@ export class RpcCommandError extends Error {
 
 /** Process-backed OMP RPC client with v2 negotiation, lossless frames, and restart-safe teardown. */
 export class OmpRpcClient implements RpcClient {
-  readonly #options: Required<Pick<OmpRpcClientOptions, "readyTimeoutMs" | "commandTimeoutMs" | "maxStderrBytes">> & OmpRpcClientOptions;
+  readonly #options: Required<Pick<OmpRpcClientOptions, "readyTimeoutMs" | "commandTimeoutMs" | "maxStderrBytes">> &
+    OmpRpcClientOptions;
   readonly #frameListeners = new Set<RpcFrameListener>();
   readonly #exitListeners = new Set<RpcExitListener>();
   readonly #pending = new Map<string, PendingRequest>();
@@ -130,7 +138,9 @@ export class OmpRpcClient implements RpcClient {
     const exited = Promise.withResolvers<void>();
     this.#exited = exited.promise;
     child.once("close", (code, signal) => {
-      const error = new Error(`OMP RPC process exited with ${signal ? `signal ${signal}` : `code ${code}`}${this.#stderr ? `: ${this.#stderr}` : ""}`);
+      const error = new Error(
+        `OMP RPC process exited with ${signal ? `signal ${signal}` : `code ${code}`}${this.#stderr ? `: ${this.#stderr}` : ""}`,
+      );
       rejectReady(error);
       if (!this.#stopping) void this.#handleUnexpectedExit(error);
       exited.resolve();
@@ -153,7 +163,8 @@ export class OmpRpcClient implements RpcClient {
       const versions = Array.isArray(frame.supportedProtocolVersions) ? frame.supportedProtocolVersions : [];
       if (versions.includes(2)) {
         const advertised = frame.maxReassembledFrameBytes;
-        if (!Number.isSafeInteger(advertised) || Number(advertised) <= 0) throw new Error("OMP advertised an invalid RPC reassembly limit");
+        if (!Number.isSafeInteger(advertised) || Number(advertised) <= 0)
+          throw new Error("OMP advertised an invalid RPC reassembly limit");
         const response = await this.send({ type: "negotiate_protocol", protocolVersion: 2 });
         if (!response.success || !isRecord(response.data) || response.data.protocolVersion !== 2) {
           throw new Error("OMP RPC protocol-v2 negotiation failed");
@@ -199,7 +210,9 @@ export class OmpRpcClient implements RpcClient {
     const pending = Promise.withResolvers<RpcResponse>();
     const timer = setTimeout(() => {
       this.#pending.delete(id);
-      pending.reject(new Error(`Timed out waiting for OMP RPC ${command.type}${this.#stderr ? `: ${this.#stderr}` : ""}`));
+      pending.reject(
+        new Error(`Timed out waiting for OMP RPC ${command.type}${this.#stderr ? `: ${this.#stderr}` : ""}`),
+      );
     }, timeoutMs);
     timer.unref?.();
     this.#pending.set(id, {
@@ -224,7 +237,10 @@ export class OmpRpcClient implements RpcClient {
     child.stdin.write(`${JSON.stringify(frame)}\n`);
   }
 
-  async #readStdout(child: ChildProcessWithoutNullStreams, onReady: (frame: Record<string, unknown>) => void): Promise<void> {
+  async #readStdout(
+    child: ChildProcessWithoutNullStreams,
+    onReady: (frame: Record<string, unknown>) => void,
+  ): Promise<void> {
     const textDecoder = new TextDecoder();
     const frameDecoder = new RpcFrameDecoder();
     let buffer = "";
@@ -237,11 +253,16 @@ export class OmpRpcClient implements RpcClient {
         const line = buffer.slice(0, newline).trim();
         buffer = buffer.slice(newline + 1);
         if (!line) continue;
-        if (Buffer.byteLength(line) > maxFrameBytes) throw new Error("OMP RPC physical frame exceeded the advertised limit");
+        if (Buffer.byteLength(line) > maxFrameBytes)
+          throw new Error("OMP RPC physical frame exceeded the advertised limit");
         const parsed: unknown = JSON.parse(line);
         if (!isRecord(parsed)) throw new Error("OMP RPC frame is not an object");
         if (isRpcReady(parsed)) {
-          if (typeof parsed.maxFrameBytes === "number" && Number.isSafeInteger(parsed.maxFrameBytes) && parsed.maxFrameBytes > 0) {
+          if (
+            typeof parsed.maxFrameBytes === "number" &&
+            Number.isSafeInteger(parsed.maxFrameBytes) &&
+            parsed.maxFrameBytes > 0
+          ) {
             maxFrameBytes = parsed.maxFrameBytes;
           }
           if (
@@ -254,6 +275,9 @@ export class OmpRpcClient implements RpcClient {
           onReady(parsed);
           continue;
         }
+        if (parsed.type === "ready") {
+          throw new Error("Unsupported OMP RPC readiness frame. Install OMP 17.4.2 or newer.");
+        }
         if (parsed.type === "rpc_chunk" && this.#protocolVersion !== 2) {
           throw new Error("OMP sent an RPC chunk before protocol-v2 negotiation");
         }
@@ -262,7 +286,8 @@ export class OmpRpcClient implements RpcClient {
         if (!isRecord(decoded)) throw new Error("Decoded OMP RPC frame is not an object");
         this.#handleFrame(decoded);
       }
-      if (Buffer.byteLength(buffer) > maxFrameBytes) throw new Error("OMP RPC unterminated frame exceeded the advertised limit");
+      if (Buffer.byteLength(buffer) > maxFrameBytes)
+        throw new Error("OMP RPC unterminated frame exceeded the advertised limit");
     }
     buffer += textDecoder.decode();
     if (buffer.trim().length > 0) throw new Error("OMP RPC stdout ended with an incomplete frame");
