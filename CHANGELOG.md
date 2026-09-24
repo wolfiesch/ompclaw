@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
 - Describe queued requests as not yet started without promising they are next; label interrupted-task actions as explicit recovery.
 - Document user-created Telegram topics with automatic topic creation disabled, including in-place session resets and shared execution limits.
 
+### Fixed
+
+- Remove inherited harness snapshots left behind by interrupted or concurrent gateway starts, so the profile no longer accumulates full copies of the desktop skills folder.
+
 ## 0.13.0 (2026-09-06)
 
 ### Added

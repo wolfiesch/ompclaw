@@ -10,6 +10,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  type Stats,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -37,6 +38,12 @@ const SNAPSHOT_IGNORED_DIRECTORIES = new Set([
   "chrome_profile",
   "chrome-profile",
 ]);
+
+/**
+ * Snapshots younger than this may still be mid-copy in a concurrently starting
+ * gateway, so the orphan sweep leaves them for a later start.
+ */
+const ORPHANED_SNAPSHOT_GRACE_MS = 10 * 60 * 1000;
 
 /** Materialize OMP's experimental memory and auto-learn settings in OmpClaw-owned state. */
 export function prepareLearningOverlay(config: Pick<GatewayConfig, "stateDir" | "learning">): string | undefined {
@@ -96,6 +103,7 @@ export function prepareInheritedHarness(config: RpcRuntimeConfig): string | unde
     if (!existsSync(from)) continue;
     snapshotFile(from, to);
   }
+  sweepOrphanedSnapshots(target, snapshotRoot);
   return target;
 }
 
@@ -144,6 +152,40 @@ function snapshotDirectory(from: string, to: string, snapshotRoot: string, name:
   if (previousSnapshot !== undefined) {
     makeTreeRemovable(previousSnapshot);
     rmSync(previousSnapshot, { force: true, recursive: true });
+  }
+}
+
+/**
+ * Remove snapshots no profile link points to. A start interrupted mid-copy, or
+ * two gateways starting at once, leaves a full snapshot behind that the
+ * previous-snapshot cleanup in `snapshotDirectory` never sees.
+ */
+function sweepOrphanedSnapshots(target: string, snapshotRoot: string): void {
+  const linked = new Set<string>();
+  for (const name of SNAPSHOT_DIRECTORIES) {
+    const link = join(target, name);
+    try {
+      if (lstatSync(link).isSymbolicLink()) linked.add(resolve(target, readlinkSync(link)));
+    } catch (error) {
+      if (!isMissingPath(error)) throw error;
+    }
+  }
+
+  const cutoff = Date.now() - ORPHANED_SNAPSHOT_GRACE_MS;
+  for (const entry of readdirSync(snapshotRoot)) {
+    if (!SNAPSHOT_DIRECTORIES.some((name) => entry.startsWith(`${name}-`))) continue;
+    const path = join(snapshotRoot, entry);
+    if (linked.has(path)) continue;
+    let info: Stats;
+    try {
+      info = lstatSync(path);
+    } catch (error) {
+      if (isMissingPath(error)) continue;
+      throw error;
+    }
+    if (!info.isDirectory() || info.mtimeMs > cutoff) continue;
+    makeTreeRemovable(path);
+    rmSync(path, { force: true, recursive: true });
   }
 }
 
