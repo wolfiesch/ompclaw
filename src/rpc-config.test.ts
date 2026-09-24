@@ -10,6 +10,7 @@ import {
   readdirSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -371,6 +372,39 @@ describe("RPC configuration", () => {
       expect(existsSync(join(target, "hooks"))).toBe(false);
       expect(existsSync(join(target, ".env"))).toBe(false);
       expect(existsSync(join(target, "agent.db"))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.OMP_HOME;
+      else process.env.OMP_HOME = previous;
+    }
+  });
+
+  test("sweeps stale unlinked harness snapshots but keeps linked and possibly in-flight ones", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ompclaw-profile-"));
+    directories.push(directory);
+    const source = join(directory, "agent");
+    mkdirSync(join(source, "skills", "shared-skill"), { recursive: true });
+    writeFileSync(join(source, "skills", "shared-skill", "SKILL.md"), "desktop");
+    const snapshotRoot = join(directory, "profiles", "phone", "agent", ".gateway-inherited");
+    const staleOrphan = join(snapshotRoot, "skills-stale-orphan");
+    const freshOrphan = join(snapshotRoot, "skills-fresh-orphan");
+    const unrelated = join(snapshotRoot, "unrelated-old");
+    for (const path of [staleOrphan, freshOrphan, unrelated]) {
+      mkdirSync(join(path, "nested"), { recursive: true });
+      writeFileSync(join(path, "nested", "SKILL.md"), "leftover");
+      chmodSync(join(path, "nested"), 0o555);
+    }
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    utimesSync(staleOrphan, old, old);
+    utimesSync(unrelated, old, old);
+    const previous = process.env.OMP_HOME;
+    process.env.OMP_HOME = directory;
+    try {
+      const target = prepareInheritedHarness(runtimeConfig({ profile: "phone", inheritHarness: true }))!;
+      const linked = join(target, readlinkSync(join(target, "skills")));
+      expect(readFileSync(join(linked, "shared-skill", "SKILL.md"), "utf8")).toBe("desktop");
+      expect(existsSync(staleOrphan)).toBe(false);
+      expect(existsSync(freshOrphan)).toBe(true);
+      expect(existsSync(unrelated)).toBe(true);
     } finally {
       if (previous === undefined) delete process.env.OMP_HOME;
       else process.env.OMP_HOME = previous;
